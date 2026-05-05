@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovo-ligand"
+version = "0.0.1"
+description = "OVO plugin for Docker-backed ligand modelling workflows"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "ovo",
+  "mdtraj",
+  "pandas",
+  "py3Dmol",
+]
+
+[project.scripts]
+ovo-ligand = "ovo_ligand.cli:main"
+
+[project.entry-points."ovo.plugins"]
+plugin = "ovo_ligand:plugin"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["ovo_ligand*"]
+
+[tool.setuptools.package-data]
+"*" = ["*"]

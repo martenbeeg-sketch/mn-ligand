@@ -1,0 +1,9 @@
+name: ovo-ligand
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - mdtraj
+  - pandas
+  - py3dmol
+  - pip

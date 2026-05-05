@@ -1,0 +1,38 @@
+name: biochem-boltz2
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  
+  # Scientific computing (shared by most services)
+  # Pin NumPy to <=2.1 for numba compatibility (required by boltz)
+  - numpy<2.2
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  
+  # Chemistry and molecular processing (core)
+  - rdkit
+  - biopython
+  
+  # Utilities
+  - requests
+  - pillow
+  - pyyaml
+  
+  # Pip packages
+  - pip:
+    # Core web framework (for service API)
+    - fastapi>=0.104.1
+    - uvicorn[standard]>=0.24.0
+    - httpx>=0.25.0
+    - pydantic>=2.5.0
+    - python-multipart>=0.0.6
+    # Machine learning for binding affinity prediction with CUDA support
+    # Note: PyTorch with CUDA must be installed via pip with --index-url
+    # Run after env creation: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    # Boltz-2 binding affinity prediction
+    - boltz[cuda]

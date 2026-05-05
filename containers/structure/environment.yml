@@ -1,0 +1,49 @@
+name: biochem-base
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  
+  # Core web framework
+  - flask
+  - flask-cors
+  - werkzeug
+  
+  # Scientific computing (shared by most services)
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  
+  # Chemistry and molecular processing (core)
+  - rdkit
+  - biopython
+  
+  # Protein structure cleaning (required for structure service)
+  - openmm
+  - pdbfixer
+  
+  # Utilities
+  - requests
+  - pillow
+  - pyyaml
+  
+  # Pip packages (core)
+  - pip:
+    - fastapi>=0.104.1
+    - uvicorn[standard]>=0.24.0
+    - httpx>=0.25.0
+    - pydantic>=2.5.0
+    - python-multipart>=0.0.6
+    # Database
+    - asyncpg>=0.29.0
+    # Task queue
+    - celery>=5.3.0
+    - redis>=5.0.0
+    # Development and Testing (optional)
+    - pytest>=7.4.0
+    - black>=23.7.0
+    - flake8>=6.0.0
+

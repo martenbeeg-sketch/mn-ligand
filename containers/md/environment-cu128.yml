@@ -1,0 +1,68 @@
+name: biochem-md
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  # CUDA 12.8 target for NVIDIA Blackwell-class GPUs
+  - cuda-version=12.8
+  
+  # Core web framework (for service API)
+  - flask
+  - flask-cors
+  - werkzeug
+  
+  # Scientific computing (shared by most services)
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  
+  # Chemistry and molecular processing (core)
+  - rdkit
+  - biopython
+  
+  # Utilities
+  - requests
+  - pillow
+  - pyyaml
+  # setuptools constraint: <78 (MD-specific requirement for OpenFE ecosystem compatibility)
+  # ADMET uses <72 instead; each service's constraint is tuned to its upstream dependencies
+  - setuptools<78
+  
+  # Molecular dynamics and force fields
+  # OpenMM with GPU support (CUDA will be auto-detected if available)
+  # To specify a specific CUDA version, use: openmm cuda-version=12
+  # For CUDA 11: openmm cuda-version=11
+  # For CUDA 12: openmm cuda-version=12
+  # For CUDA 13: openmm cuda-version=13
+  - openmm
+  - openmmforcefields
+  - pdbfixer
+  - mdtraj
+  - mdanalysis
+  - openff-toolkit
+  - openff-interchange
+  
+  # Free energy calculations (OpenFE ecosystem)
+  # OpenFE for ABFE and RBFE calculations
+  - openfe
+  - gufe  # General Unified Free Energy framework
+  - cinnabar  # Free energy analysis and visualization
+  - kartograf
+  
+  # PDBQT handling (used by RBFE docking-resume workflow)
+  - meeko
+
+  # Pip packages
+  - pip:
+    - fastapi>=0.104.1
+    - uvicorn[standard]>=0.24.0
+    - httpx>=0.25.0
+    - pydantic>=2.5.0
+    - python-multipart>=0.0.6
+    # Task queue (for worker-gpu)
+    - celery>=5.3.0
+    - redis>=5.0.0
+

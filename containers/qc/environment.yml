@@ -1,0 +1,44 @@
+name: biochem-qc
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python 3.11 is required for orca-pi (quantum chemistry integration).
+  # Other services remain on Python 3.10 to minimize environment rebuild size.
+  # This divergence is intentional and documented here for maintainability.
+  - python=3.11
+  - pip  # Required for pip-installed packages
+  
+  # Core web framework (for service API)
+  - flask
+  - flask-cors
+  - werkzeug
+  
+  # Scientific computing (shared by most services)
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  
+  # Chemistry and molecular processing (core)
+  - rdkit
+  - biopython
+  
+  # Utilities
+  - requests
+  - pillow
+  - pyyaml
+  
+  # Pip packages for quantum chemistry
+  - pip:
+    - fastapi>=0.104.1
+    - uvicorn[standard]>=0.24.0
+    - httpx>=0.25.0
+    - pydantic>=2.5.0
+    - python-multipart>=0.0.6
+    - celery>=5.3.0
+    - redis>=5.0.0
+    - orca-pi>=0.1.0  # Requires Python 3.11+ (now supported)
+    - orca-parser>=0.1.0
+    - cclib>=1.8

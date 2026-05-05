@@ -1,0 +1,8 @@
+recursive-include ovo_ligand *
+prune ovo_ligand/pipelines/*/work
+prune ovo_ligand/pipelines/*/.nextflow
+global-exclude *~
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude .DS_Store
+

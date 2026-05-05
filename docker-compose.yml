@@ -1,0 +1,56 @@
+name: ovo-ligand
+
+services:
+  structure:
+    image: ovolig-structure:latest
+    build:
+      context: ./containers/structure
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  docking:
+    image: ovolig-docking:latest
+    build:
+      context: ./containers/docking
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  md:
+    image: ovolig-md-cu128:latest
+    build:
+      context: ./containers/md
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  admet:
+    image: ovolig-admet:latest
+    build:
+      context: ./containers/admet
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  boltz2:
+    # Existing Blackwell/CUDA 12.8 image. This service intentionally has no
+    # build block so `docker compose build` does not replace your local image.
+    image: ovoex-boltz2:latest
+
+  qc:
+    image: ovolig-qc:latest
+    build:
+      context: ./containers/qc
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  abfe:
+    image: ovolig-abfe-cu128:latest
+    build:
+      context: ./containers/abfe
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  rbfe:
+    image: ovolig-rbfe-cu128:latest
+    build:
+      context: ./containers/rbfe
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]

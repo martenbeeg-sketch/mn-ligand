@@ -1,0 +1,44 @@
+name: biochem-admet
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  
+  # Core web framework (for service API)
+  - flask
+  - flask-cors
+  - werkzeug
+  
+  # Scientific computing (shared by most services)
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  
+  # Chemistry and molecular processing (core)
+  - rdkit
+  - biopython
+  
+  # Utilities
+  - requests
+  - pillow
+  - pyyaml
+  # setuptools constraint: <72 (pkg_resources removed in 72+, required by admet-ai)
+  - setuptools<72
+
+  # Machine learning for ADMET predictions
+  - pytorch
+  - torchvision
+
+  # Pip packages
+  - pip:
+    - admet-ai
+    - fastapi>=0.104.1
+    - uvicorn[standard]>=0.24.0
+    - httpx>=0.25.0
+    - pydantic>=2.5.0
+    - python-multipart>=0.0.6
+    - asyncpg>=0.29.0
