@@ -295,6 +295,7 @@ class EquilibrationAnalytics:
             "backbone_rmsd_angstrom": [],
             "ligand_rmsd_angstrom": [],
             "phase_boundaries": [],
+            "per_phase_local": {},
             "warnings": [],
         }
 
@@ -345,6 +346,7 @@ class EquilibrationAnalytics:
             all_backbone_rmsd = []
             all_ligand_rmsd = []
             phase_boundaries = []
+            per_phase_local: dict[str, Any] = {}
             
             current_time_offset_ps = 0.0
             reference_traj = None
@@ -448,6 +450,9 @@ class EquilibrationAnalytics:
                 else:
                     rmsd_bb_nm = md.rmsd(traj, reference_traj, 0, atom_indices=backbone_sel)
                 backbone_rmsd_phase = [round(float(r) * 10.0, 4) for r in rmsd_bb_nm]
+                # Local per-phase backbone RMSD (reference = frame 0 of this phase)
+                rmsd_bb_local_nm = md.rmsd(traj, traj, 0, atom_indices=backbone_sel)
+                backbone_rmsd_local_phase = [round(float(r) * 10.0, 4) for r in rmsd_bb_local_nm]
                 
                 # Ligand RMSD
                 ligand_rmsd_phase = []
@@ -469,6 +474,15 @@ class EquilibrationAnalytics:
                     rmsd_lig_nm = np.sqrt(mean_dist_sq)
                     
                     ligand_rmsd_phase = [round(float(r) * 10.0, 4) for r in rmsd_lig_nm]
+                    # Local per-phase ligand RMSD (reference = phase frame 0)
+                    local_ref_ligand_xyz = traj.xyz[0, ligand_sel, :]
+                    local_diff = ligand_xyz - local_ref_ligand_xyz
+                    local_dist_sq = np.sum(local_diff**2, axis=2)
+                    local_mean_dist_sq = np.mean(local_dist_sq, axis=1)
+                    local_rmsd_lig_nm = np.sqrt(local_mean_dist_sq)
+                    ligand_rmsd_local_phase = [round(float(r) * 10.0, 4) for r in local_rmsd_lig_nm]
+                else:
+                    ligand_rmsd_local_phase = []
 
                 # 5. Calculate time axis for this phase
                 # Each kept frame is spaced by stride * report_interval integration steps.
@@ -478,6 +492,7 @@ class EquilibrationAnalytics:
                     round(current_time_offset_ps + (i * time_per_frame_ps), 3)
                     for i in range(n_frames)
                 ]
+                local_time_ps_phase = [round(i * time_per_frame_ps, 3) for i in range(n_frames)]
 
                 # Record phase boundary (nominal span from configured step counts)
                 phase_start_ps = current_time_offset_ps
@@ -487,6 +502,11 @@ class EquilibrationAnalytics:
                     "start_ps": round(phase_start_ps, 1),
                     "end_ps": round(phase_end_ps, 1)
                 })
+                per_phase_local[phase_name] = {
+                    "time_ps": local_time_ps_phase,
+                    "backbone_rmsd_angstrom": backbone_rmsd_local_phase,
+                    "ligand_rmsd_angstrom": ligand_rmsd_local_phase,
+                }
 
                 # Append to combined arrays
                 all_time_ps.extend(time_ps_phase)
@@ -526,6 +546,7 @@ class EquilibrationAnalytics:
                 "backbone_rmsd_angstrom": all_backbone_rmsd,
                 "ligand_rmsd_angstrom": all_ligand_rmsd,
                 "phase_boundaries": phase_boundaries,
+                "per_phase_local": per_phase_local,
                 "warnings": warnings_list,
             }
 
@@ -616,9 +637,32 @@ class EquilibrationAnalytics:
                     f"mean={density_mean:.3f} g/cm³ (expected ~{_DENSITY_TARGET_GCM3:.1f})"
                 )
 
+        def phase_series(series_key: str, phase_name: str) -> list[float]:
+            """Extract a phase-specific RMSD series from global RMSD arrays via phase boundaries."""
+            values = rmsd.get(series_key, []) or []
+            times = rmsd.get("time_ps", []) or []
+            boundaries = rmsd.get("phase_boundaries", []) or []
+            if not values or not times or not boundaries or len(values) != len(times):
+                return []
+            phase = next((p for p in boundaries if str(p.get("phase", "")).lower() == phase_name.lower()), None)
+            if not phase:
+                return []
+            start = float(phase.get("start_ps", 0.0))
+            end = float(phase.get("end_ps", start))
+            selected = [
+                v for t, v in zip(times, values)
+                if (t >= start) and (t <= end)
+            ]
+            return selected
+
+        # Prefer production-only RMSD for KPI status; fallback to full combined series.
+        backbone_series_for_kpi = phase_series("backbone_rmsd_angstrom", "production") or rmsd.get("backbone_rmsd_angstrom", [])
+        ligand_series_for_kpi = phase_series("ligand_rmsd_angstrom", "production") or rmsd.get("ligand_rmsd_angstrom", [])
+        rmsd_kpi_source = "production" if phase_series("backbone_rmsd_angstrom", "production") else "combined"
+
         # Backbone RMSD
         backbone_status = None
-        bb_mean = last20_mean(rmsd.get("backbone_rmsd_angstrom", []))
+        bb_mean = last20_mean(backbone_series_for_kpi)
         if bb_mean is not None:
             all_none = False
             if bb_mean < _BACKBONE_RMSD_PASS_A:
@@ -638,7 +682,7 @@ class EquilibrationAnalytics:
 
         # Ligand RMSD
         ligand_status = None
-        lig_mean = last20_mean(rmsd.get("ligand_rmsd_angstrom", []))
+        lig_mean = last20_mean(ligand_series_for_kpi)
         if lig_mean is not None:
             all_none = False
             if lig_mean < _LIGAND_RMSD_PASS_A:
@@ -675,4 +719,5 @@ class EquilibrationAnalytics:
             "warnings": warnings,
             "backbone_rmsd_pass_a": _BACKBONE_RMSD_PASS_A,
             "ligand_rmsd_pass_a": _LIGAND_RMSD_PASS_A,
+            "rmsd_kpi_source": rmsd_kpi_source,
         }

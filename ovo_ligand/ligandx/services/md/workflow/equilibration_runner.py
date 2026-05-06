@@ -432,9 +432,15 @@ class EquilibrationRunner:
         nvt_steps: int = 25000,
         npt_steps: int = 175000,
         heating_steps_per_stage: int = 2500,
+        heating_start_temperature: float = 50.0,
+        heating_stages: int = 6,
         report_interval: int = 1000,
         production_steps: int = 0,
         production_report_interval: int = 2500,
+        minimization_max_iterations: int = 5000,
+        minimization_tolerance_kjmol_nm: float = 10.0,
+        npt_restraint_release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
+        npt_release_enabled: bool = True,
         temperature: float = 300.0,
         pressure: float = 1.0
     ) -> Dict[str, Any]:
@@ -528,6 +534,8 @@ class EquilibrationRunner:
             if not skip_minimization:
                 min_result = self._run_minimization(
                     simulation, minimized_pdb_path, unit, temperature,
+                    max_iterations=minimization_max_iterations,
+                    tolerance_kjmol_nm=minimization_tolerance_kjmol_nm,
                     progress_start=ranges['minimization'][0],
                     progress_end=ranges['minimization'][1],
                 )
@@ -572,6 +580,8 @@ class EquilibrationRunner:
             heating_result = self._run_thermal_heating(
                 simulation, unit,
                 target_temperature=temperature,
+                start_temperature=heating_start_temperature,
+                n_stages=heating_stages,
                 steps_per_stage=heating_steps_per_stage,
                 progress_start=ranges['heating'][0],
                 progress_end=ranges['heating'][1],
@@ -590,6 +600,8 @@ class EquilibrationRunner:
             npt_result = self._run_npt(
                 simulation, npt_steps, report_interval,
                 npt_traj_path, log_path, npt_pdb_path, unit,
+                release_scales_csv=npt_restraint_release_scales_csv,
+                release_enabled=bool(npt_release_enabled),
                 progress_start=ranges['npt'][0],
                 progress_end=ranges['npt'][1],
             )
@@ -668,6 +680,8 @@ class EquilibrationRunner:
 
     def _run_minimization(
         self, simulation, output_path: str, unit, temperature: float = 300.0,
+        max_iterations: int = 5000,
+        tolerance_kjmol_nm: float = 10.0,
         progress_start: int = 5, progress_end: int = 9,
     ) -> Dict[str, Any]:
         """
@@ -748,8 +762,8 @@ class EquilibrationRunner:
         logger.info("Performing L-BFGS energy minimization...")
         try:
             simulation.minimizeEnergy(
-                maxIterations=5000,
-                tolerance=10 * unit.kilojoule_per_mole / unit.nanometer
+                maxIterations=int(max_iterations),
+                tolerance=float(tolerance_kjmol_nm) * unit.kilojoule_per_mole / unit.nanometer
             )
             logger.info("L-BFGS minimization succeeded")
         except Exception as err:
@@ -761,7 +775,7 @@ class EquilibrationRunner:
             saved = simulation.context.getState(getPositions=True)
             simulation.context.setPositions(saved.getPositions())
             try:
-                self._minimize_on_cpu(simulation, unit, maxIterations=5000)
+                self._minimize_on_cpu(simulation, unit, maxIterations=int(max_iterations))
             except Exception as cpu_err:
                 logger.warning(
                     f"CPU L-BFGS also failed ({cpu_err}), "
@@ -801,6 +815,8 @@ class EquilibrationRunner:
     def _run_thermal_heating(
         self, simulation, unit,
         target_temperature: float = 300.0,
+        start_temperature: float = 50.0,
+        n_stages: int = 6,
         steps_per_stage: int = 2500,
         progress_start: int = 9,
         progress_end: int = 12,
@@ -832,8 +848,15 @@ class EquilibrationRunner:
         logger.info("=== STAGE 2: THERMAL HEATING ===")
         emit_progress(progress_start, "Starting thermal heating...", ["preparation", "minimization"])
 
-        # Temperature stages (50K increments up to target)
-        temp_stages = [50.0, 100.0, 150.0, 200.0, 250.0, target_temperature]
+        # Temperature stages (evenly spaced from start to target)
+        if n_stages < 1:
+            n_stages = 1
+        if n_stages == 1:
+            temp_stages = [float(target_temperature)]
+        else:
+            delta = (float(target_temperature) - float(start_temperature)) / float(n_stages - 1)
+            temp_stages = [float(start_temperature) + i * delta for i in range(n_stages - 1)]
+            temp_stages.append(float(target_temperature))
         num_stages = len(temp_stages)
 
         # Get current positions and box vectors from main simulation
@@ -1069,6 +1092,8 @@ class EquilibrationRunner:
     def _run_npt(
         self, simulation, steps: int, report_interval: int,
         traj_path: str, log_path: str, pdb_path: str, unit,
+        release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
+        release_enabled: bool = True,
         progress_start: int = 15,
         progress_end: int = 95,
     ) -> Dict[str, Any]:
@@ -1105,6 +1130,18 @@ class EquilibrationRunner:
         logger.info(f"Running NPT equilibration for {steps} steps ({steps * 0.004 / 1000:.1f} ns)")
         context = simulation.context
         release_scales = list(self.NPT_RESTRAINT_RELEASE_SCALES)
+        if not release_enabled:
+            release_scales = [1.0]
+        try:
+            custom = [float(x.strip()) for x in str(release_scales_csv).split(",") if x.strip()]
+            if custom and release_enabled:
+                release_scales = custom
+        except Exception:
+            logger.warning(
+                "Invalid NPT restraint release scales '%s'; using defaults %s",
+                release_scales_csv,
+                release_scales,
+            )
         try:
             param_names = set(context.getParameters().keys())
         except Exception:

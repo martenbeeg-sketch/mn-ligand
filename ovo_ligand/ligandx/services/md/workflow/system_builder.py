@@ -32,6 +32,9 @@ class SolvatedSystemBuilder:
         self.output_dir = output_dir
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+        self.enable_ligand_restraints = str(
+            os.getenv("OVO_LIGAND_ENABLE_LIGAND_RESTRAINTS", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
     def create_forcefield_with_ligand(self, prepared_ligand, forcefield_method: str = "openff-2.2.0") -> Any:
         """
@@ -798,20 +801,24 @@ class SolvatedSystemBuilder:
                     constraints=None,
                     rigidWater=False,
                 )
-                pre_lock_restraint = self._add_ligand_positional_restraints(
-                    pre_system,
-                    modeller.topology,
-                    modeller.positions,
-                    added_ligand_atom_indices,
-                    self.LIGAND_LOCK_K_KJMOL_NM2,
-                )
-                pre_planarity_restraint = self._add_ligand_planarity_restraints(
-                    pre_system,
-                    modeller.topology,
-                    ligand_pdb_path,
-                    added_ligand_atom_indices,
-                    self.LIGAND_PLANARITY_K_KJMOL_NM2,
-                )
+                if self.enable_ligand_restraints:
+                    pre_lock_restraint = self._add_ligand_positional_restraints(
+                        pre_system,
+                        modeller.topology,
+                        modeller.positions,
+                        added_ligand_atom_indices,
+                        self.LIGAND_LOCK_K_KJMOL_NM2,
+                    )
+                    pre_planarity_restraint = self._add_ligand_planarity_restraints(
+                        pre_system,
+                        modeller.topology,
+                        ligand_pdb_path,
+                        added_ligand_atom_indices,
+                        self.LIGAND_PLANARITY_K_KJMOL_NM2,
+                    )
+                else:
+                    pre_lock_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
+                    pre_planarity_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
                 pre_integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
                 pre_platform = Platform.getPlatformByName('CPU')
                 pre_sim = Simulation(
@@ -844,20 +851,24 @@ class SolvatedSystemBuilder:
                 rigidWater=True,
                 hydrogenMass=4.0 * unit.amu,
             )
-            setup_lock_restraint = self._add_ligand_positional_restraints(
-                openmm_system,
-                modeller.topology,
-                modeller.positions,
-                added_ligand_atom_indices,
-                self.LIGAND_LOCK_K_KJMOL_NM2,
-            )
-            setup_planarity_restraint = self._add_ligand_planarity_restraints(
-                openmm_system,
-                modeller.topology,
-                ligand_pdb_path,
-                added_ligand_atom_indices,
-                self.LIGAND_PLANARITY_K_KJMOL_NM2,
-            )
+            if self.enable_ligand_restraints:
+                setup_lock_restraint = self._add_ligand_positional_restraints(
+                    openmm_system,
+                    modeller.topology,
+                    modeller.positions,
+                    added_ligand_atom_indices,
+                    self.LIGAND_LOCK_K_KJMOL_NM2,
+                )
+                setup_planarity_restraint = self._add_ligand_planarity_restraints(
+                    openmm_system,
+                    modeller.topology,
+                    ligand_pdb_path,
+                    added_ligand_atom_indices,
+                    self.LIGAND_PLANARITY_K_KJMOL_NM2,
+                )
+            else:
+                setup_lock_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
+                setup_planarity_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
 
             # Enable long-range dispersion correction
             for force in openmm_system.getForces():

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import urllib.request
 import warnings
 from pathlib import Path
@@ -507,79 +508,183 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
     from ovo_ligand.ligandx.services.md.config import MDOptimizationConfig
     from ovo_ligand.ligandx.services.md.service import MDOptimizationService
 
-    pdb_data = config.get("pdb_data") or download_pdb(config["pdb_id"])
+    pdb_data = config.get("pdb_data")
+    if not pdb_data:
+        input_complex_pdb_path = str(config.get("input_complex_pdb_path", "")).strip()
+        if input_complex_pdb_path:
+            pdb_data = Path(input_complex_pdb_path).read_text()
+    if not pdb_data:
+        pdb_data = download_pdb(config["pdb_id"])
     selected_key = config["ligand_key"]
     selected = next((lig for lig in parse_bound_ligands(pdb_data) if lig["key"] == selected_key), None)
-    if not selected:
+    provided_refined_sdf = str(config.get("ligand_refined_sdf_data", "") or "")
+    strict_refined = bool(config.get("strict_refined_ligand", False))
+    if not selected and not (strict_refined and provided_refined_sdf):
         raise ValueError(f"Could not find selected ligand {selected_key}")
+    if not selected:
+        parts = selected_key.split("|")
+        selected = {
+            "key": selected_key,
+            "resname": parts[0] if len(parts) > 0 else "LIG",
+            "chain": parts[1] if len(parts) > 1 else "_",
+            "resseq": parts[2] if len(parts) > 2 else "?",
+            "icode": parts[3] if len(parts) > 3 else "_",
+            "atom_count": 0,
+            "heavy_atom_count": 0,
+            "center": [0.0, 0.0, 0.0],
+        }
 
-    ligand_pdb = extract_ligand_pdb(pdb_data, selected_key)
+    ligand_pdb = ""
+    try:
+        ligand_pdb = extract_ligand_pdb(pdb_data, selected_key)
+    except Exception:
+        if not (strict_refined and provided_refined_sdf):
+            raise
     output_dir = Path(config.get("output_dir", "/output/md_outputs"))
     output_dir.mkdir(parents=True, exist_ok=True)
     job_id = config.get("job_id") or f"{config.get('pdb_id', 'pdb').lower()}_{selected['resname'].lower()}"
     file_prefix = f"{config.get('pdb_id', 'pdb').lower()}_{selected['resname'].lower()}"
 
-    # HiQBind-style preparation artifacts for transparency and reproducibility.
-    downloaded_pdb_path = output_dir / f"{file_prefix}_downloaded.pdb"
-    downloaded_pdb_path.write_text(pdb_data if pdb_data.endswith("\n") else pdb_data + "\n")
-    prep_artifacts = _build_ligand_sdf_artifacts(
-        ligand_pdb,
-        selected["resname"],
-        output_dir,
-        file_prefix,
-        reference_smiles=str(config.get("reference_smiles", "") or config.get("ref_smi", "")),
-    )
+    strict_refined = bool(config.get("strict_refined_ligand", False))
+    provided_refined_sdf = str(config.get("ligand_refined_sdf_data", "") or "")
+    prep_artifacts: dict[str, str] = {}
+    downloaded_pdb_path: Path | None = None
+    # If strict refined ligand is provided by structure-prep, do not regenerate prep artifacts in MD run folder.
+    if not (strict_refined and provided_refined_sdf):
+        downloaded_pdb_path = output_dir / f"{file_prefix}_downloaded.pdb"
+        downloaded_pdb_path.write_text(pdb_data if pdb_data.endswith("\n") else pdb_data + "\n")
+        prep_artifacts = _build_ligand_sdf_artifacts(
+            ligand_pdb,
+            selected["resname"],
+            output_dir,
+            file_prefix,
+            reference_smiles=str(config.get("reference_smiles", "") or config.get("ref_smi", "")),
+        )
 
     ligand_structure_data = ligand_pdb
     ligand_data_format = "pdb"
-    refined_sdf_path = prep_artifacts.get("ligand_refined_sdf")
-    if refined_sdf_path:
-        try:
-            ligand_structure_data = Path(refined_sdf_path).read_text()
-            ligand_data_format = "sdf"
-        except Exception:
-            pass
+    ligand_input_source = "extracted_ligand_pdb"
+    # Prefer caller-provided refined SDF data from structure-preparation jobs.
+    # This keeps MD input consistent with already prepared ligand artifacts.
+    if provided_refined_sdf.strip():
+        # Ligand-X structure parser for `sdf` currently consumes a single MOL block.
+        # Normalize SDF payloads to first record to avoid parse failures on trailing "$$$$".
+        ligand_structure_data = provided_refined_sdf
+        if "$$$$" in ligand_structure_data:
+            ligand_structure_data = ligand_structure_data.split("$$$$", 1)[0].rstrip() + "\n"
+        ligand_data_format = "sdf"
+        ligand_input_source = "provided_refined_sdf_data"
+    else:
+        refined_sdf_path = prep_artifacts.get("ligand_refined_sdf")
+        if refined_sdf_path:
+            try:
+                ligand_structure_data = Path(refined_sdf_path).read_text()
+                if "$$$$" in ligand_structure_data:
+                    ligand_structure_data = ligand_structure_data.split("$$$$", 1)[0].rstrip() + "\n"
+                ligand_data_format = "sdf"
+                ligand_input_source = "generated_refined_sdf"
+            except Exception:
+                pass
 
-    md_config = MDOptimizationConfig.from_dict(
-        {
-            "protein_pdb_data": pdb_data,
-            "ligand_structure_data": ligand_structure_data,
-            "ligand_data_format": ligand_data_format,
-            "preserve_ligand_pose": True,
-            "generate_conformer": False,
-            "protein_id": config.get("pdb_id", "protein").lower(),
-            "ligand_id": selected["resname"],
-            "system_id": config.get("system_id", f"{config.get('pdb_id', 'complex').lower()}_{selected['resname'].lower()}"),
-            "job_id": job_id,
-            "charge_method": config.get("charge_method", "gasteiger"),
-            "forcefield_method": config.get("forcefield_method", "openff-2.2.0"),
-            "box_shape": config.get("box_shape", "dodecahedron"),
-            "nvt_steps": int(config.get("nvt_steps", 2500)),
-            "npt_steps": int(config.get("npt_steps", 2500)),
-            "heating_steps_per_stage": int(config.get("heating_steps_per_stage", 250)),
-            "production_steps": int(config.get("production_steps", 0)),
-            "production_report_interval": int(config.get("production_report_interval", 2500)),
-            "temperature": float(config.get("temperature", 300.0)),
-            "pressure": float(config.get("pressure", 1.0)),
-            "ionic_strength": float(config.get("ionic_strength", 0.15)),
-            "padding_nm": float(config.get("padding_nm", 1.0)),
-            "minimization_only": bool(config.get("minimization_only", False)),
-        }
-    )
+    def _build_md_config(_ligand_structure_data: str, _ligand_data_format: str) -> MDOptimizationConfig:
+        return MDOptimizationConfig.from_dict(
+            {
+                "protein_pdb_data": pdb_data,
+                "ligand_structure_data": _ligand_structure_data,
+                "ligand_data_format": _ligand_data_format,
+                "preserve_ligand_pose": True,
+                "generate_conformer": False,
+                "protein_id": config.get("pdb_id", "protein").lower(),
+                "ligand_id": selected["resname"],
+                "system_id": config.get("system_id", f"{config.get('pdb_id', 'complex').lower()}_{selected['resname'].lower()}"),
+                "job_id": job_id,
+                "charge_method": config.get("charge_method", "gasteiger"),
+                "forcefield_method": config.get("forcefield_method", "openff-2.2.0"),
+                "box_shape": config.get("box_shape", "dodecahedron"),
+                "nvt_steps": int(config.get("nvt_steps", 2500)),
+                "npt_steps": int(config.get("npt_steps", 2500)),
+                "heating_steps_per_stage": int(config.get("heating_steps_per_stage", 250)),
+                "production_steps": int(config.get("production_steps", 0)),
+                "production_report_interval": int(config.get("production_report_interval", 2500)),
+                "temperature": float(config.get("temperature", 300.0)),
+                "pressure": float(config.get("pressure", 1.0)),
+                "ionic_strength": float(config.get("ionic_strength", 0.15)),
+                "padding_nm": float(config.get("padding_nm", 1.0)),
+                "minimization_max_iterations": int(config.get("minimization_max_iterations", 5000)),
+                "minimization_tolerance_kjmol_nm": float(config.get("minimization_tolerance_kjmol_nm", 10.0)),
+                "heating_start_temperature": float(config.get("heating_start_temperature", 50.0)),
+                "heating_stages": int(config.get("heating_stages", 6)),
+                "npt_restraint_release_scales": str(config.get("npt_restraint_release_scales", "1.0,0.5,0.2,0.05,0.0")),
+                "npt_release_enabled": bool(config.get("npt_release_enabled", True)),
+                "minimization_only": bool(config.get("minimization_only", False)),
+            }
+        )
+
+    # Optional runtime overrides for ligand restraints in system construction.
+    os.environ["OVO_LIGAND_ENABLE_LIGAND_RESTRAINTS"] = "1" if bool(config.get("ligand_restraints_enabled", True)) else "0"
+    if "ligand_lock_k_kjmol_nm2" in config:
+        os.environ["OVO_LIGAND_LOCK_K_KJMOL_NM2"] = str(config.get("ligand_lock_k_kjmol_nm2"))
+    if "ligand_planarity_k_kjmol_nm2" in config:
+        os.environ["OVO_LIGAND_PLANARITY_K_KJMOL_NM2"] = str(config.get("ligand_planarity_k_kjmol_nm2"))
 
     service = MDOptimizationService(output_dir=str(output_dir), job_id=job_id)
-    result = service.optimize(md_config)
+    attempt_sources: list[tuple[str, str, str]] = []
+    # Strict mode: do not fall back away from refined ligand input.
+    if strict_refined and ligand_input_source == "provided_refined_sdf_data":
+        attempt_sources.append(("provided_refined_sdf_data", ligand_structure_data, "sdf"))
+    else:
+        # Priority: caller-provided refined SDF -> generated refined SDF -> extracted ligand PDB
+        if ligand_input_source == "provided_refined_sdf_data":
+            attempt_sources.append(("provided_refined_sdf_data", ligand_structure_data, "sdf"))
+        if prep_artifacts.get("ligand_refined_sdf"):
+            try:
+                attempt_sources.append(("generated_refined_sdf", Path(prep_artifacts["ligand_refined_sdf"]).read_text(), "sdf"))
+            except Exception:
+                pass
+        attempt_sources.append(("extracted_ligand_pdb", ligand_pdb, "pdb"))
+
+    result = {}
+    used_source = ligand_input_source
+    used_format = ligand_data_format
+    attempt_log: list[dict[str, str]] = []
+    for source_name, source_data, source_format in attempt_sources:
+        md_config = _build_md_config(source_data, source_format)
+        result = service.optimize(md_config)
+        used_source = source_name
+        used_format = source_format
+        status = str(result.get("status", ""))
+        error_msg = str(result.get("error", ""))
+        attempt_log.append({"source": source_name, "format": source_format, "status": status, "error": error_msg})
+        # Stop on success or on non-ligand-prep failures (those likely won't be fixed by ligand input fallback).
+        if status != "error":
+            break
+        if "Ligand preparation failed" not in error_msg:
+            break
+    preparation_artifacts: dict[str, Any] = {
+        **prep_artifacts,
+        "ligand_input_used_for_md": used_source,
+        "ligand_input_format_used_for_md": used_format,
+        "ligand_input_attempts": attempt_log,
+        "strict_refined_ligand": strict_refined,
+    }
+    if config.get("input_complex_pdb_path"):
+        preparation_artifacts["input_complex_pdb_path"] = str(config.get("input_complex_pdb_path"))
+    if downloaded_pdb_path is not None:
+        preparation_artifacts["downloaded_pdb"] = str(downloaded_pdb_path)
+    # Provenance: point back to structure-prep assets when reused.
+    if config.get("prepared_complex_path"):
+        preparation_artifacts["prepared_complex_path"] = str(config.get("prepared_complex_path"))
+    if config.get("ligand_refined_sdf_path"):
+        preparation_artifacts["ligand_refined_sdf_source_path"] = str(config.get("ligand_refined_sdf_path"))
+    if config.get("reference_smiles_path"):
+        preparation_artifacts["reference_smiles_source_path"] = str(config.get("reference_smiles_path"))
+
     wrapped = {
         "success": result.get("status") != "error",
         "pdb_id": config.get("pdb_id", "").upper(),
         "selected_ligand": selected,
         "ligand_pdb": ligand_pdb,
-        "preparation_artifacts": {
-            "downloaded_pdb": str(downloaded_pdb_path),
-            **prep_artifacts,
-            "ligand_input_used_for_md": prep_artifacts.get("ligand_refined_sdf", "inline_pdb"),
-            "ligand_input_format_used_for_md": ligand_data_format,
-        },
+        "preparation_artifacts": preparation_artifacts,
         "md_result": result,
         "mmgbsa": {
             "status": "not_implemented",

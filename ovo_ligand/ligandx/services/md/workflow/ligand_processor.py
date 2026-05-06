@@ -8,6 +8,8 @@ import logging
 from typing import Dict, Any, Optional
 import traceback
 import urllib.request
+import tempfile
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -311,12 +313,35 @@ class LigandProcessor:
             from rdkit.Chem import AllChem
             from openff.toolkit import Molecule
             from ..utils.pdb_utils import sanitize_pdb_block
+
+            # Notebook-parity path: for SDF input, first try OpenFF from_file() directly.
+            if data_format.lower() == "sdf":
+                direct_openff = self._load_openff_molecule_from_sdf(structure_data, ligand_id)
+                if direct_openff is not None:
+                    logger.info("Step 1: Parsed SDF via OpenFF Molecule.from_file()")
+                    logger.info(f"Step 2: Assigning partial charges using {charge_method} method...")
+                    try:
+                        charged_molecule = self.assign_partial_charges(direct_openff, method=charge_method)
+                    except NotImplementedError as e:
+                        logger.error(f"Charge method '{charge_method}' not implemented: {e}")
+                        return {
+                            "success": False,
+                            "error": f"Charge calculation method '{charge_method}' not yet implemented. Use 'am1bcc', 'mmff94', or 'gasteiger' instead.",
+                            "molecule": None
+                        }
+                    if not charged_molecule:
+                        return {"success": False, "error": f"Charge assignment failed with method: {charge_method}", "molecule": None}
+                    logger.info("[COMPLETE] Ligand preparation from structure completed successfully (OpenFF SDF path)")
+                    return {"success": True, "molecule": charged_molecule, "error": None}
             
             # Step 1: Parse structure data
             logger.info(f"Step 1: Parsing {data_format.upper()} structure data")
             
             if data_format.lower() == 'sdf' or data_format.lower() == 'mol':
-                rdkit_mol = Chem.MolFromMolBlock(structure_data, removeHs=False)
+                rdkit_mol = self._parse_ligand_molblock_with_fallbacks(
+                    structure_data=structure_data,
+                    data_format=data_format.lower(),
+                )
             elif data_format.lower() == 'pdb':
                 sanitized_pdb = sanitize_pdb_block(structure_data)
                 rdkit_mol = Chem.MolFromPDBBlock(sanitized_pdb, removeHs=False)
@@ -381,6 +406,88 @@ class LigandProcessor:
             logger.error(f"Ligand preparation from structure failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             return {"success": False, "error": str(e), "molecule": None}
+
+    def _load_openff_molecule_from_sdf(self, structure_data: str, ligand_id: str):
+        """Load OpenFF molecule from SDF text via temporary file."""
+        from openff.toolkit import Molecule
+
+        text = structure_data or ""
+        if not text.strip():
+            return None
+
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".sdf")
+            os.close(fd)
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            molecule = Molecule.from_file(tmp_path, file_format="SDF", allow_undefined_stereo=True)
+            if molecule is not None:
+                molecule.name = ligand_id
+            return molecule
+        except Exception as exc:
+            logger.warning("OpenFF SDF direct load failed: %s", exc)
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def _parse_ligand_molblock_with_fallbacks(self, structure_data: str, data_format: str):
+        """
+        Parse ligand SDF/MOL text robustly.
+        """
+        from rdkit import Chem
+
+        text = structure_data or ""
+        if not text.strip():
+            return None
+
+        mol = Chem.MolFromMolBlock(text, removeHs=False)
+        if mol is not None:
+            return mol
+
+        try:
+            mol = Chem.MolFromMolBlock(text, removeHs=False, strictParsing=False)
+            if mol is not None:
+                logger.info("Recovered ligand parse using strictParsing=False")
+                return mol
+        except Exception:
+            pass
+
+        if "$$$$" in text:
+            first_record = text.split("$$$$", 1)[0].rstrip() + "\n"
+            try:
+                mol = Chem.MolFromMolBlock(first_record, removeHs=False, strictParsing=False)
+                if mol is not None:
+                    logger.info("Recovered ligand parse from first SDF record")
+                    return mol
+            except Exception:
+                pass
+
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".sdf")
+            os.close(fd)
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            supplier = Chem.SDMolSupplier(tmp_path, removeHs=False, sanitize=True)
+            for candidate in supplier:
+                if candidate is not None:
+                    logger.info("Recovered ligand parse using SDMolSupplier fallback")
+                    return candidate
+        except Exception as exc:
+            logger.warning("SDMolSupplier fallback failed: %s", exc)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        return None
 
     def _apply_ccd_template_bond_orders(self, rdkit_mol, pdb_block: str):
         """

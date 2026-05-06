@@ -123,6 +123,14 @@ def _write_run_metadata(run_dir: Path, update: dict) -> dict:
     return merged
 
 
+def _current_ligand_source() -> str:
+    prepared = st.session_state.get("prepared_structure_last", {}) or {}
+    source = str(prepared.get("source", "")).strip().lower()
+    if source in {"pdb", "vina", "boltz", "custom"}:
+        return source
+    return "pdb"
+
+
 def _download_pdb(pdb_id: str) -> str:
     pdb_id = pdb_id.strip().upper()
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
@@ -653,6 +661,29 @@ def _slice_phase(df: pd.DataFrame, start_ps: float, end_ps: float) -> pd.DataFra
     return phase_df
 
 
+def _derive_local_phase_rmsd_from_global(
+    rmsd_df: pd.DataFrame,
+    phase_windows: list[tuple[str, float, float]],
+) -> dict[str, dict[str, list[float]]]:
+    derived: dict[str, dict[str, list[float]]] = {}
+    for phase_name, start_ps, end_ps in phase_windows:
+        phase_df = _slice_phase(rmsd_df, start_ps, end_ps)
+        if phase_df.empty:
+            continue
+        local_time = (phase_df.index - float(phase_df.index[0])).tolist()
+        bb = phase_df["protein_backbone_rmsd_A"].to_numpy()
+        lig = phase_df["ligand_rmsd_A"].to_numpy()
+        bb0 = float(bb[0]) if len(bb) else 0.0
+        lig0 = float(lig[0]) if len(lig) else 0.0
+        derived[phase_name.lower()] = {
+            "time_ps": [round(float(x), 3) for x in local_time],
+            # Phase-local normalized series from existing global RMSD data
+            "backbone_rmsd_angstrom": [round(max(0.0, float(x) - bb0), 4) for x in bb],
+            "ligand_rmsd_angstrom": [round(max(0.0, float(x) - lig0), 4) for x in lig],
+        }
+    return derived
+
+
 def _count_multimodel_frames(pdb_data: str) -> int:
     model_frames = pdb_data.count("\nMODEL")
     if model_frames == 0:
@@ -1049,17 +1080,24 @@ def _render_protocol_timeline(
     npt_steps: int,
     production_steps: int,
     minimization_only: bool,
+    include_prepare: bool = True,
+    include_energy: bool = True,
 ) -> None:
-    stages = [
-        ("Prepare", "Protein cleanup and selected bound ligand extraction", "enabled"),
+    stages = []
+    if include_prepare:
+        stages.append(("Prepare", "Protein cleanup and selected bound ligand extraction", "enabled"))
+    stages.extend(
+        [
         ("Parameterize", "OpenFF ligand force field and OpenMM system setup", "enabled"),
         ("Minimize", "Relax clashes before dynamics", "enabled"),
         ("Heat", f"Gradual thermalization, {heating_steps:,} steps per stage", "skipped" if minimization_only else "enabled"),
         ("NVT", f"Constant volume equilibration, {nvt_steps:,} steps", "skipped" if minimization_only else "enabled"),
         ("NPT", f"Constant pressure equilibration, {npt_steps:,} steps", "skipped" if minimization_only else "enabled"),
         ("Production", f"{production_steps:,} MD steps", "skipped" if minimization_only or production_steps == 0 else "enabled"),
-        ("Energy", "MM/GBSA not found in Ligand-X; result is marked pending", "pending"),
-    ]
+        ]
+    )
+    if include_energy:
+        stages.append(("Energy", "MM/GBSA not found in Ligand-X; result is marked pending", "pending"))
     cols = st.columns(len(stages))
     for col, (title, detail, state) in zip(cols, stages):
         color = {"enabled": "#1f883d", "skipped": "#8c959f", "pending": "#bf8700"}[state]
@@ -1095,23 +1133,26 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
 
     kpi = analytics.get("kpi_summary", {})
     system_info = md_result.get("system_info", {})
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(3)
     metric_cols[0].metric("Total atoms", f"{md_result.get('total_atoms', 0):,}")
     metric_cols[1].metric("Water molecules", f"{system_info.get('water_molecules', 0):,}")
     metric_cols[2].metric("Ions", f"{system_info.get('ions', 0):,}")
-    metric_cols[3].metric("Backbone RMSD", kpi.get("backbone_rmsd_status", "n/a"))
-    metric_cols[4].metric("Ligand RMSD", kpi.get("ligand_rmsd_status", "n/a"))
 
     minimization = md_result.get("equilibration_stats", {}).get("energy_minimization", {})
-    st.markdown("#### Energy")
-    energy_cols = st.columns(3)
-    energy_cols[0].metric("Initial energy", f"{minimization.get('initial_energy', 0):,.1f} kJ/mol")
-    energy_cols[1].metric("Final energy", f"{minimization.get('final_energy', 0):,.1f} kJ/mol")
-    energy_cols[2].metric("Energy change", f"{minimization.get('energy_change', 0):,.1f} kJ/mol")
 
     thermodynamics = analytics.get("thermodynamics", {})
     if thermodynamics.get("time_ps"):
         st.markdown("#### Thermodynamics")
+        min_energy_df = pd.DataFrame(
+            [
+                {
+                    "stage": "minimization",
+                    "initial_energy_kjmol": minimization.get("initial_energy"),
+                    "final_energy_kjmol": minimization.get("final_energy"),
+                    "delta_energy_kjmol": minimization.get("energy_change"),
+                }
+            ]
+        )
         thermo_df = pd.DataFrame(
             {
                 "time_ps": thermodynamics.get("time_ps", []),
@@ -1123,8 +1164,10 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         ).set_index("time_ps")
         phase_windows = _phase_time_windows(analytics)
         if phase_windows:
-            thermo_tabs = st.tabs([name for name, _, _ in phase_windows])
-            for tab, (phase_name, start_ps, end_ps) in zip(thermo_tabs, phase_windows):
+            thermo_tabs = st.tabs(["Energy"] + [name for name, _, _ in phase_windows])
+            with thermo_tabs[0]:
+                st.dataframe(min_energy_df, use_container_width=True, hide_index=True)
+            for tab, (phase_name, start_ps, end_ps) in zip(thermo_tabs[1:], phase_windows):
                 with tab:
                     phase_df = _slice_phase(thermo_df, start_ps, end_ps)
                     if phase_df.empty:
@@ -1155,6 +1198,8 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                             "nm3",
                         )
         else:
+            st.caption("Minimization energy summary")
+            st.dataframe(min_energy_df, use_container_width=True, hide_index=True)
             _render_static_line_plot(
                 thermo_df,
                 ["potential_energy_kjmol"],
@@ -1185,6 +1230,13 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
     rmsd = analytics.get("rmsd", {})
     if rmsd.get("time_ps"):
         st.markdown("#### RMSD")
+        rmsd_reference_mode = st.radio(
+            "RMSD reference mode",
+            ["Global reference (first phase frame 0)", "Per-phase local reference (phase frame 0)"],
+            horizontal=True,
+            key=f"rmsd_ref_mode_{run_dir.name}",
+        )
+        use_per_phase_local = rmsd_reference_mode.startswith("Per-phase")
         rmsd_df = pd.DataFrame(
             {
                 "time_ps": rmsd.get("time_ps", []),
@@ -1193,26 +1245,127 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
             }
         ).set_index("time_ps")
         phase_windows = _phase_time_windows(analytics)
+        per_phase_local = rmsd.get("per_phase_local", {}) or {}
+        if (not per_phase_local) and phase_windows:
+            per_phase_local = _derive_local_phase_rmsd_from_global(rmsd_df, phase_windows)
+            if use_per_phase_local:
+                st.caption(
+                    "Local mode uses derived phase-normalized RMSD for this older run. "
+                    "Re-run analytics/new MD runs to get native per-phase local RMSD."
+                )
         if phase_windows:
-            rmsd_tabs = st.tabs([name for name, _, _ in phase_windows])
-            for tab, (phase_name, start_ps, end_ps) in zip(rmsd_tabs, phase_windows):
-                with tab:
-                    phase_df = _slice_phase(rmsd_df, start_ps, end_ps)
-                    if phase_df.empty:
-                        st.caption(f"No RMSD samples inside {phase_name} window ({start_ps:.2f}-{end_ps:.2f} ps).")
-                        continue
-                    _render_static_line_plot(
-                        phase_df,
-                        ["protein_backbone_rmsd_A", "ligand_rmsd_A"],
-                        f"{phase_name} Protein/Ligand RMSD",
-                        "Angstrom",
+            def _tail20_mean(series: pd.Series) -> float | None:
+                clean = series.dropna()
+                if clean.empty:
+                    return None
+                n = max(1, len(clean) // 5)
+                return float(clean.iloc[-n:].mean())
+
+            def _status(mean_value: float | None, pass_thr: float, warn_thr: float) -> str:
+                if mean_value is None:
+                    return "n/a"
+                if mean_value < pass_thr:
+                    return "pass"
+                if mean_value < warn_thr:
+                    return "warn"
+                return "fail"
+
+            phase_kpi_map: dict[str, dict[str, object]] = {}
+            for phase_name, start_ps, end_ps in phase_windows:
+                if use_per_phase_local and phase_name.lower() in per_phase_local:
+                    blk = per_phase_local.get(phase_name.lower(), {})
+                    phase_calc_df = pd.DataFrame(
+                        {
+                            "protein_backbone_rmsd_A": blk.get("backbone_rmsd_angstrom", []),
+                            "ligand_rmsd_A": blk.get("ligand_rmsd_angstrom", []),
+                        }
                     )
-                    summary_cols = st.columns(4)
-                    summary_cols[0].metric("Backbone max", f"{phase_df['protein_backbone_rmsd_A'].max():.3f} A")
-                    summary_cols[1].metric("Backbone last", f"{phase_df['protein_backbone_rmsd_A'].iloc[-1]:.3f} A")
-                    summary_cols[2].metric("Ligand max", f"{phase_df['ligand_rmsd_A'].max():.3f} A")
-                    summary_cols[3].metric("Ligand last", f"{phase_df['ligand_rmsd_A'].iloc[-1]:.3f} A")
+                else:
+                    phase_calc_df = _slice_phase(rmsd_df, start_ps, end_ps)
+                bb_mean = _tail20_mean(phase_calc_df["protein_backbone_rmsd_A"]) if "protein_backbone_rmsd_A" in phase_calc_df else None
+                lig_mean = _tail20_mean(phase_calc_df["ligand_rmsd_A"]) if "ligand_rmsd_A" in phase_calc_df else None
+                phase_kpi_map[phase_name] = {
+                    "bb_mean": bb_mean,
+                    "bb_status": _status(
+                        bb_mean,
+                        float(kpi.get("backbone_rmsd_pass_a", 2.5)),
+                        3.5,
+                    ),
+                    "lig_mean": lig_mean,
+                    "lig_status": _status(
+                        lig_mean,
+                        float(kpi.get("ligand_rmsd_pass_a", 2.0)),
+                        5.0,
+                    ),
+                }
+
+            phase_names = [name for name, _, _ in phase_windows]
+            selected_phase = st.segmented_control(
+                "RMSD phase",
+                phase_names,
+                default=phase_names[0],
+                key=f"rmsd_phase_{run_dir.name}",
+            )
+            phase_name, start_ps, end_ps = next(
+                (w for w in phase_windows if w[0] == selected_phase),
+                phase_windows[0],
+            )
+            if use_per_phase_local and phase_name.lower() in per_phase_local:
+                local_block = per_phase_local.get(phase_name.lower(), {})
+                phase_df = pd.DataFrame(
+                    {
+                        "time_ps": local_block.get("time_ps", []),
+                        "protein_backbone_rmsd_A": local_block.get("backbone_rmsd_angstrom", []),
+                        "ligand_rmsd_A": local_block.get("ligand_rmsd_angstrom", []),
+                    }
+                ).set_index("time_ps")
+                x_label = "Phase time (ps)"
+            else:
+                phase_df = _slice_phase(rmsd_df, start_ps, end_ps)
+                x_label = "Time (ps)"
+            if phase_df.empty:
+                st.caption(f"No RMSD samples inside {phase_name} window ({start_ps:.2f}-{end_ps:.2f} ps).")
+            else:
+                if use_per_phase_local:
+                    st.caption(
+                        f"Reference frame for {phase_name}: phase-local frame 0 "
+                        f"({phase_name} trajectory first frame)."
+                    )
+                else:
+                    global_ref = phase_windows[0][0]
+                    st.caption(
+                        f"Reference frame for {phase_name}: global frame 0 "
+                        f"(first frame of {global_ref})."
+                    )
+                _render_static_line_plot(
+                    phase_df,
+                    ["protein_backbone_rmsd_A", "ligand_rmsd_A"],
+                    f"{phase_name} Protein/Ligand RMSD",
+                    "Angstrom",
+                    x_label=x_label,
+                )
+                summary_cols = st.columns(4)
+                phase_kpi = phase_kpi_map.get(phase_name, {})
+                bb_mean = phase_kpi.get("bb_mean")
+                lig_mean = phase_kpi.get("lig_mean")
+                summary_cols[0].metric("Backbone status", str(phase_kpi.get("bb_status", "n/a")))
+                summary_cols[1].metric(
+                    "Backbone tail20 mean",
+                    "n/a" if bb_mean is None else f"{float(bb_mean):.3f} A",
+                )
+                summary_cols[2].metric("Ligand status", str(phase_kpi.get("lig_status", "n/a")))
+                summary_cols[3].metric(
+                    "Ligand tail20 mean",
+                    "n/a" if lig_mean is None else f"{float(lig_mean):.3f} A",
+                )
+                bb_pass = float(kpi.get("backbone_rmsd_pass_a", 2.5))
+                lig_pass = float(kpi.get("ligand_rmsd_pass_a", 2.0))
+                st.caption(
+                    f"Status thresholds — Backbone: pass < {bb_pass:.1f} A, warn {bb_pass:.1f}-3.5 A, fail >= 3.5 A. "
+                    f"Ligand: pass < {lig_pass:.1f} A, warn {lig_pass:.1f}-5.0 A, fail >= 5.0 A."
+                )
         else:
+            st.caption("Reference frame: global frame 0 (first trajectory frame).")
             _render_static_line_plot(
                 rmsd_df,
                 ["protein_backbone_rmsd_A", "ligand_rmsd_A"],
@@ -1796,12 +1949,14 @@ def render() -> None:
         run_id = str(uuid4())
         output_dir = _run_root() / "bound-ligand-md" / run_id
         output_dir.mkdir(parents=True, exist_ok=False)
+        ligand_source = _current_ligand_source()
         _write_run_metadata(
             output_dir,
             {
                 "created_at": _utc_now_iso(),
                 "workflow": "bound-ligand-md",
                 "status": "running",
+                "ligand_source": ligand_source,
                 "pdb_id": st.session_state.get("bound_md_pdb_id", pdb_id),
                 "ligand_key": selected_ligand.get("key") if selected_ligand else None,
                 "ligand_label": _ligand_label(selected_ligand) if selected_ligand else None,
@@ -1849,6 +2004,7 @@ def render() -> None:
                     "completed_at": _utc_now_iso(),
                     "result_json": str(result_json),
                     "host_run_dir": str(output_dir),
+                    "ligand_source": ligand_source,
                     "pdb_id": result_payload.get("pdb_id") or st.session_state.get("bound_md_pdb_id", pdb_id),
                     "ligand_key": (result_payload.get("selected_ligand") or {}).get("key"),
                     "ligand_label": _ligand_label(result_payload.get("selected_ligand")) if result_payload.get("selected_ligand") else None,
@@ -1898,4 +2054,5 @@ def render() -> None:
     )
 
 
-render()
+if __name__ == "__main__":
+    render()

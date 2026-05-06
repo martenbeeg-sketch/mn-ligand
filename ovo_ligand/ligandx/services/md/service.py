@@ -51,6 +51,7 @@ class MDOptimizationService:
         self.environment_status = {}
         self.ligand_ff = None
         self.protein_ff = None
+        self._last_ligand_error: Optional[str] = None
     
     def _lazy_init(self):
         """Perform heavy initialization only when needed."""
@@ -345,9 +346,11 @@ class MDOptimizationService:
             structure_data, ligand_id, data_format, preserve_pose, charge_method
         )
         if result['success']:
+            self._last_ligand_error = None
             return result['molecule']
         else:
-            logger.error(f"Ligand preparation failed: {result['error']}")
+            self._last_ligand_error = str(result.get("error") or "unknown ligand preparation error")
+            logger.error(f"Ligand preparation failed: {self._last_ligand_error}")
             return None
     
     def prepare_protein(self, pdb_data: str, pdb_id: str = "protein") -> Optional[str]:
@@ -505,6 +508,8 @@ class MDOptimizationService:
 
         valid, error = validate_ligand_preparation(prepared_ligand, config.ligand_id)
         if not valid:
+            if self._last_ligand_error:
+                raise RuntimeError(f"{error}: {self._last_ligand_error}")
             raise RuntimeError(error)
 
         self._cached_prepared_ligand = prepared_ligand
@@ -621,11 +626,17 @@ class MDOptimizationService:
             nvt_steps=config.nvt_steps,
             npt_steps=config.npt_steps,
             heating_steps_per_stage=getattr(config, "heating_steps_per_stage", 2500),
+            heating_start_temperature=getattr(config, "heating_start_temperature", 50.0),
+            heating_stages=getattr(config, "heating_stages", 6),
             pause_at_minimized=config.pause_at_minimized,
             minimization_only=config.minimization_only,
             skip_minimization=config.minimized_acknowledged,
             production_steps=config.production_steps,
             production_report_interval=config.production_report_interval,
+            minimization_max_iterations=getattr(config, "minimization_max_iterations", 5000),
+            minimization_tolerance_kjmol_nm=getattr(config, "minimization_tolerance_kjmol_nm", 10.0),
+            npt_restraint_release_scales_csv=getattr(config, "npt_restraint_release_scales", "1.0,0.5,0.2,0.05,0.0"),
+            npt_release_enabled=getattr(config, "npt_release_enabled", True),
             temperature=config.temperature,
             pressure=config.pressure
         )
