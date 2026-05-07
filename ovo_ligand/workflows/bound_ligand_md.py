@@ -616,12 +616,22 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
                 "heating_stages": int(config.get("heating_stages", 6)),
                 "npt_restraint_release_scales": str(config.get("npt_restraint_release_scales", "1.0,0.5,0.2,0.05,0.0")),
                 "npt_release_enabled": bool(config.get("npt_release_enabled", True)),
+                "protein_npt_release_scales": str(config.get("protein_npt_release_scales", "1.0,0.5,0.1,0.01,0.0")),
+                "planarity_npt_release_scales": str(config.get("planarity_npt_release_scales", "1.0,0.5,0.2,0.05,0.0")),
+                "allow_restrained_production": bool(config.get("allow_restrained_production", False)),
+                "force_unrestrained_production": bool(config.get("force_unrestrained_production", True)),
+                "resume_from_checkpoint_path": config.get("resume_from_checkpoint_path"),
+                "resume_system_pdb_path": config.get("resume_system_pdb_path"),
                 "minimization_only": bool(config.get("minimization_only", False)),
             }
         )
 
     # Optional runtime overrides for ligand restraints in system construction.
-    os.environ["OVO_LIGAND_ENABLE_LIGAND_RESTRAINTS"] = "1" if bool(config.get("ligand_restraints_enabled", True)) else "0"
+    os.environ["OVO_LIGAND_ENABLE_LIGAND_RESTRAINTS"] = "1" if bool(config.get("ligand_restraints_enabled", config.get("apply_ligand_restraints_during_heating_nvt", True))) else "0"
+    os.environ["OVO_LIGAND_ENABLE_PROTEIN_RESTRAINTS"] = "1" if bool(config.get("apply_protein_restraints_during_heating_nvt", True)) else "0"
+    os.environ["OVO_LIGAND_PROTEIN_RESTRAINT_SELECTION"] = str(config.get("protein_restraint_selection", "backbone"))
+    os.environ["OVO_LIGAND_PROTEIN_RESTRAINT_K_KJMOL_NM2"] = str(config.get("protein_restraint_k", 1000.0))
+    os.environ["OVO_LIGAND_ENABLE_PLANARITY_RESTRAINTS"] = "1" if bool(config.get("enable_ligand_planarity_restraints", False)) else "0"
     if "ligand_lock_k_kjmol_nm2" in config:
         os.environ["OVO_LIGAND_LOCK_K_KJMOL_NM2"] = str(config.get("ligand_lock_k_kjmol_nm2"))
     if "ligand_planarity_k_kjmol_nm2" in config:

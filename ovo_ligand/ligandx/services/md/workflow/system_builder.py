@@ -35,6 +35,18 @@ class SolvatedSystemBuilder:
         self.enable_ligand_restraints = str(
             os.getenv("OVO_LIGAND_ENABLE_LIGAND_RESTRAINTS", "1")
         ).strip().lower() not in {"0", "false", "no", "off"}
+        self.enable_protein_restraints = str(
+            os.getenv("OVO_LIGAND_ENABLE_PROTEIN_RESTRAINTS", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        self.protein_restraint_selection = str(
+            os.getenv("OVO_LIGAND_PROTEIN_RESTRAINT_SELECTION", "backbone")
+        ).strip().lower()
+        self.protein_restraint_k = float(
+            os.getenv("OVO_LIGAND_PROTEIN_RESTRAINT_K_KJMOL_NM2", "1000.0")
+        )
+        self.enable_planarity_restraints = str(
+            os.getenv("OVO_LIGAND_ENABLE_PLANARITY_RESTRAINTS", "0")
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
     def create_forcefield_with_ligand(self, prepared_ligand, forcefield_method: str = "openff-2.2.0") -> Any:
         """
@@ -514,8 +526,8 @@ class SolvatedSystemBuilder:
             if atom.index in ligand_set and atom.element is not None and atom.element.symbol != "H"
         ]
 
-        force = CustomExternalForce("k*periodicdistance(x,y,z,x0,y0,z0)^2")
-        force.addGlobalParameter("k", float(k_kjmol_nm2))
+        force = CustomExternalForce("k_lig*periodicdistance(x,y,z,x0,y0,z0)^2")
+        force.addGlobalParameter("k_lig", float(k_kjmol_nm2))
         force.addPerParticleParameter("x0")
         force.addPerParticleParameter("y0")
         force.addPerParticleParameter("z0")
@@ -528,8 +540,58 @@ class SolvatedSystemBuilder:
         openmm_system.addForce(force)
         return {
             "status": "applied",
+            "parameter_name": "k_lig",
             "k_kjmol_nm2": float(k_kjmol_nm2),
             "restrained_heavy_atoms": len(heavy_indices),
+        }
+
+    def _add_protein_positional_restraints(
+        self,
+        openmm_system,
+        topology,
+        positions,
+        ligand_atom_indices: list[int],
+        selection: str,
+        k_kjmol_nm2: float,
+    ) -> Dict[str, Any]:
+        from openmm import CustomExternalForce, unit
+
+        ligand_set = set(ligand_atom_indices)
+        selection = (selection or "backbone").lower()
+        target_atoms = []
+        backbone = {"N", "CA", "C", "O"}
+        for atom in topology.atoms():
+            if atom.index in ligand_set:
+                continue
+            if atom.residue.name in self.WATER_RESIDUES or atom.residue.name in self.ION_RESIDUES:
+                continue
+            if atom.element is None:
+                continue
+            if selection == "heavy":
+                if atom.element.symbol != "H":
+                    target_atoms.append(atom.index)
+            else:  # backbone default
+                if atom.name in backbone:
+                    target_atoms.append(atom.index)
+
+        force = CustomExternalForce("k_prot*periodicdistance(x,y,z,x0,y0,z0)^2")
+        force.addGlobalParameter("k_prot", float(k_kjmol_nm2))
+        force.addPerParticleParameter("x0")
+        force.addPerParticleParameter("y0")
+        force.addPerParticleParameter("z0")
+
+        pos_nm = positions.value_in_unit(unit.nanometer)
+        for idx in target_atoms:
+            p = pos_nm[idx]
+            force.addParticle(int(idx), [float(p.x), float(p.y), float(p.z)])
+
+        openmm_system.addForce(force)
+        return {
+            "status": "applied",
+            "selection": selection,
+            "parameter_name": "k_prot",
+            "k_kjmol_nm2": float(k_kjmol_nm2),
+            "restrained_atoms": len(target_atoms),
         }
 
     def _add_ligand_planarity_restraints(
@@ -568,14 +630,14 @@ class SolvatedSystemBuilder:
 
         force = CustomCompoundBondForce(
             4,
-            "kp * ( ((x4-x1)*((y2-y1)*(z3-z1)-(z2-z1)*(y3-y1)) + "
+            "k_plan * ( ((x4-x1)*((y2-y1)*(z3-z1)-(z2-z1)*(y3-y1)) + "
             "(y4-y1)*((z2-z1)*(x3-x1)-(x2-x1)*(z3-z1)) + "
             "(z4-z1)*((x2-x1)*(y3-y1)-(y2-y1)*(x3-x1))) / "
             "sqrt( ((y2-y1)*(z3-z1)-(z2-z1)*(y3-y1))^2 + "
             "((z2-z1)*(x3-x1)-(x2-x1)*(z3-z1))^2 + "
             "((x2-x1)*(y3-y1)-(y2-y1)*(x3-x1))^2 + 1e-12) )^2"
         )
-        force.addGlobalParameter("kp", float(k_kjmol_nm2))
+        force.addGlobalParameter("k_plan", float(k_kjmol_nm2))
 
         applied = 0
         missing_atoms = []
@@ -609,6 +671,7 @@ class SolvatedSystemBuilder:
         openmm_system.addForce(force)
         return {
             "status": "applied",
+            "parameter_name": "k_plan",
             "k_kjmol_nm2": float(k_kjmol_nm2),
             "rings_detected": len(ring_names),
             "restraint_terms": applied,
@@ -710,6 +773,14 @@ class SolvatedSystemBuilder:
         logger.info("Creating protein-ligand complex using hybrid OpenFF/OpenMM approach...")
         
         try:
+            # Safety: if ligand is provided from refined chemistry input, protein input must not already contain it.
+            ligand_resname = (ligand_id[:3] if ligand_id else "LIG").upper()
+            for ln in protein_pdb_data.splitlines():
+                if ln.startswith("HETATM") and len(ln) >= 20 and ln[17:20].strip().upper() == ligand_resname:
+                    raise ValueError(
+                        f"ligand added twice error: selected ligand residue '{ligand_resname}' is still present in protein input PDB while refined ligand input is also being added"
+                    )
+
             # Step 1: Prepare ligand PDB
             logger.info("Step 1: Converting OpenFF ligand to PDB format...")
             ligand_pdb_path = self.prepare_ligand_pdb(prepared_ligand, ligand_id)
@@ -809,13 +880,16 @@ class SolvatedSystemBuilder:
                         added_ligand_atom_indices,
                         self.LIGAND_LOCK_K_KJMOL_NM2,
                     )
-                    pre_planarity_restraint = self._add_ligand_planarity_restraints(
-                        pre_system,
-                        modeller.topology,
-                        ligand_pdb_path,
-                        added_ligand_atom_indices,
-                        self.LIGAND_PLANARITY_K_KJMOL_NM2,
-                    )
+                    if self.enable_planarity_restraints:
+                        pre_planarity_restraint = self._add_ligand_planarity_restraints(
+                            pre_system,
+                            modeller.topology,
+                            ligand_pdb_path,
+                            added_ligand_atom_indices,
+                            self.LIGAND_PLANARITY_K_KJMOL_NM2,
+                        )
+                    else:
+                        pre_planarity_restraint = {"status": "disabled", "reason": "planarity restraints disabled by config"}
                 else:
                     pre_lock_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
                     pre_planarity_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
@@ -859,16 +933,31 @@ class SolvatedSystemBuilder:
                     added_ligand_atom_indices,
                     self.LIGAND_LOCK_K_KJMOL_NM2,
                 )
-                setup_planarity_restraint = self._add_ligand_planarity_restraints(
-                    openmm_system,
-                    modeller.topology,
-                    ligand_pdb_path,
-                    added_ligand_atom_indices,
-                    self.LIGAND_PLANARITY_K_KJMOL_NM2,
-                )
+                if self.enable_planarity_restraints:
+                    setup_planarity_restraint = self._add_ligand_planarity_restraints(
+                        openmm_system,
+                        modeller.topology,
+                        ligand_pdb_path,
+                        added_ligand_atom_indices,
+                        self.LIGAND_PLANARITY_K_KJMOL_NM2,
+                    )
+                else:
+                    setup_planarity_restraint = {"status": "disabled", "reason": "planarity restraints disabled by config"}
             else:
                 setup_lock_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
                 setup_planarity_restraint = {"status": "disabled", "reason": "ligand restraints disabled by config"}
+
+            if self.enable_protein_restraints and self.protein_restraint_selection != "none":
+                setup_protein_restraint = self._add_protein_positional_restraints(
+                    openmm_system,
+                    modeller.topology,
+                    modeller.positions,
+                    added_ligand_atom_indices,
+                    self.protein_restraint_selection,
+                    self.protein_restraint_k,
+                )
+            else:
+                setup_protein_restraint = {"status": "disabled", "reason": "protein restraints disabled by config"}
 
             # Enable long-range dispersion correction
             for force in openmm_system.getForces():
@@ -993,6 +1082,9 @@ class SolvatedSystemBuilder:
                 "ligand_planarity_restraints": {
                     "pre_minimization": pre_planarity_restraint if "pre_planarity_restraint" in locals() else {"status": "not_applied"},
                     "setup_minimization": setup_planarity_restraint,
+                },
+                "protein_positional_restraints": {
+                    "setup_minimization": setup_protein_restraint,
                 },
             }
             

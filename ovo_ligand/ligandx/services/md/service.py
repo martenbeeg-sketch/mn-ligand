@@ -517,6 +517,39 @@ class MDOptimizationService:
     
     def _prepare_and_create_system(self, config: MDOptimizationConfig) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Prepare protein and create solvated system."""
+        # Checkpoint-resume path: rebuild simulation directly from original system PDB,
+        # bypassing protein cleanup on NPT/final snapshots.
+        if getattr(config, "resume_from_checkpoint_path", None):
+            resume_system_pdb_path = getattr(config, "resume_system_pdb_path", None)
+            if not resume_system_pdb_path or not os.path.exists(str(resume_system_pdb_path)):
+                raise RuntimeError(
+                    "Checkpoint resume requested but resume_system_pdb_path is missing or unreadable."
+                )
+            logger.info("=== RESUME MODE: REBUILD SYSTEM FOR CHECKPOINT LOAD ===")
+            logger.info(f"Using system PDB from prep run: {resume_system_pdb_path}")
+            with open(str(resume_system_pdb_path), "r") as f:
+                system_pdb_data = f.read()
+
+            if config.is_protein_only:
+                system_result = self.solvated_system_builder.recreate_system_from_pdb_protein_only(
+                    system_pdb_data, config.system_id,
+                    temperature=config.temperature,
+                    pressure=config.pressure
+                )
+            else:
+                system_result = self.solvated_system_builder.recreate_system_from_pdb(
+                    system_pdb_data, self._get_prepared_ligand(config), config.system_id,
+                    config.forcefield_method,
+                    temperature=config.temperature,
+                    pressure=config.pressure
+                )
+            # Keep a meaningful provenance pointer even though protein prep is bypassed.
+            prepared_protein_path = str(resume_system_pdb_path)
+            valid, error = validate_system_result(system_result)
+            if not valid:
+                raise RuntimeError(error)
+            return prepared_protein_path, system_result
+
         if config.preview_acknowledged or config.minimized_acknowledged:
             # Resuming workflow
             logger.info("=== RESUMING WORKFLOW ===")
@@ -637,6 +670,11 @@ class MDOptimizationService:
             minimization_tolerance_kjmol_nm=getattr(config, "minimization_tolerance_kjmol_nm", 10.0),
             npt_restraint_release_scales_csv=getattr(config, "npt_restraint_release_scales", "1.0,0.5,0.2,0.05,0.0"),
             npt_release_enabled=getattr(config, "npt_release_enabled", True),
+            protein_npt_release_scales_csv=getattr(config, "protein_npt_release_scales", "1.0,0.5,0.1,0.01,0.0"),
+            planarity_npt_release_scales_csv=getattr(config, "planarity_npt_release_scales", "1.0,0.5,0.2,0.05,0.0"),
+            allow_restrained_production=getattr(config, "allow_restrained_production", False),
+            force_unrestrained_production=getattr(config, "force_unrestrained_production", True),
+            resume_from_checkpoint_path=getattr(config, "resume_from_checkpoint_path", None),
             temperature=config.temperature,
             pressure=config.pressure
         )
@@ -673,6 +711,7 @@ class MDOptimizationService:
             "ligand_assembly_qc",
             "ligand_assembly_qc_after_enforcement",
             "ligand_final_enforcement",
+            "protein_positional_restraints",
             "ligand_positional_restraints",
             "ligand_planarity_restraints",
         ):

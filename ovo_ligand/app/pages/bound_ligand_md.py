@@ -1082,20 +1082,22 @@ def _render_protocol_timeline(
     minimization_only: bool,
     include_prepare: bool = True,
     include_energy: bool = True,
+    include_production: bool = True,
 ) -> None:
     stages = []
     if include_prepare:
         stages.append(("Prepare", "Protein cleanup and selected bound ligand extraction", "enabled"))
     stages.extend(
         [
-        ("Parameterize", "OpenFF ligand force field and OpenMM system setup", "enabled"),
-        ("Minimize", "Relax clashes before dynamics", "enabled"),
-        ("Heat", f"Gradual thermalization, {heating_steps:,} steps per stage", "skipped" if minimization_only else "enabled"),
-        ("NVT", f"Constant volume equilibration, {nvt_steps:,} steps", "skipped" if minimization_only else "enabled"),
-        ("NPT", f"Constant pressure equilibration, {npt_steps:,} steps", "skipped" if minimization_only else "enabled"),
-        ("Production", f"{production_steps:,} MD steps", "skipped" if minimization_only or production_steps == 0 else "enabled"),
+            ("Parameterize", "OpenFF ligand force field and OpenMM system setup", "enabled"),
+            ("Minimize", "Relax clashes before dynamics", "enabled"),
+            ("Heat", f"Gradual thermalization, {heating_steps:,} steps per stage", "skipped" if minimization_only else "enabled"),
+            ("NVT", f"Constant volume equilibration, {nvt_steps:,} steps", "skipped" if minimization_only else "enabled"),
+            ("NPT", f"Constant pressure equilibration, {npt_steps:,} steps", "skipped" if minimization_only else "enabled"),
         ]
     )
+    if include_production:
+        stages.append(("Production", f"{production_steps:,} MD steps", "skipped" if minimization_only or production_steps == 0 else "enabled"))
     if include_energy:
         stages.append(("Energy", "MM/GBSA not found in Ligand-X; result is marked pending", "pending"))
     cols = st.columns(len(stages))

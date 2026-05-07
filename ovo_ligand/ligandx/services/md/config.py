@@ -47,6 +47,12 @@ class MDOptimizationConfig:
     heating_stages: int = 6
     npt_restraint_release_scales: str = "1.0,0.5,0.2,0.05,0.0"
     npt_release_enabled: bool = True
+    protein_npt_release_scales: str = "1.0,0.5,0.1,0.01,0.0"
+    planarity_npt_release_scales: str = "1.0,0.5,0.2,0.05,0.0"
+    allow_restrained_production: bool = False
+    force_unrestrained_production: bool = True
+    resume_from_checkpoint_path: Optional[str] = None
+    resume_system_pdb_path: Optional[str] = None
 
     def validate(self) -> tuple[bool, str]:
         """
@@ -137,6 +143,12 @@ class MDOptimizationConfig:
             heating_stages=data.get('heating_stages', 6),
             npt_restraint_release_scales=data.get('npt_restraint_release_scales', "1.0,0.5,0.2,0.05,0.0"),
             npt_release_enabled=data.get('npt_release_enabled', True),
+            protein_npt_release_scales=data.get('protein_npt_release_scales', "1.0,0.5,0.1,0.01,0.0"),
+            planarity_npt_release_scales=data.get('planarity_npt_release_scales', "1.0,0.5,0.2,0.05,0.0"),
+            allow_restrained_production=data.get('allow_restrained_production', False),
+            force_unrestrained_production=data.get('force_unrestrained_production', True),
+            resume_from_checkpoint_path=data.get('resume_from_checkpoint_path'),
+            resume_system_pdb_path=data.get('resume_system_pdb_path'),
         )
 
 

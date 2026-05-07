@@ -43,9 +43,14 @@ def main() -> None:
 
     jobs_md_page = st.Page(
         page=str(package_root / "app/pages/jobs_md.py"),
-        title="Jobs – MD",
+        title="Jobs – MD Production",
         url_path="jobs-md",
         default=True,
+    )
+    jobs_md_system_page = st.Page(
+        page=str(package_root / "app/pages/jobs_md_system.py"),
+        title="Jobs – MD System Prep",
+        url_path="jobs-md-system-prep",
     )
     jobs_md_legacy_page = st.Page(
         page=str(package_root / "app/pages/legacy_jobs_redirect.py"),
@@ -112,15 +117,15 @@ def main() -> None:
         ),
         _make_page(
             package_root,
-            "ovo_ligand.app.pages.docking",
-            "Docking",
-            "workspace-docking",
+            "ovo_ligand.app.pages.md_system_preparation",
+            "MD System Preparation",
+            "workspace-md-system-preparation",
         ),
         _make_page(
             package_root,
-            "ovo_ligand.app.pages.md",
-            "MD Run",
-            "workspace-md-run",
+            "ovo_ligand.app.pages.md_production",
+            "MD Production",
+            "workspace-md-production",
         ),
         _make_page(
             package_root,
@@ -158,7 +163,7 @@ def main() -> None:
 
     pg = st.navigation(
         {
-            "Jobs": [jobs_md_page, jobs_structure_page, jobs_openfe_page],
+            "Jobs": [jobs_structure_page, jobs_md_system_page, jobs_md_page, jobs_openfe_page],
             "Pipelines": pipeline_pages,
             "Task": task_pages,
             "Internal": [md_results_page, structure_results_page, jobs_md_legacy_page, *structure_preparation_legacy_pages],

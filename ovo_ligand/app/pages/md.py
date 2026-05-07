@@ -61,20 +61,71 @@ def _collect_structure_jobs() -> list[dict]:
     return rows
 
 
-def render() -> None:
-    st.title("MD Run")
-    st.caption("Import a prepared structure job, tune MD parameters, and run when ready.")
+def _collect_md_system_prep_jobs() -> list[dict]:
+    runs_root = _run_root() / "md-system-prep"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    for run_dir in sorted(
+        [p for p in runs_root.iterdir() if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        metadata = _read_run_metadata(run_dir)
+        result_path = run_dir / "result.json"
+        input_path = run_dir / "input.json"
+        if not metadata or not result_path.exists() or not input_path.exists():
+            continue
+        try:
+            result_payload = json.loads(result_path.read_text())
+            input_payload = json.loads(input_path.read_text())
+        except Exception:
+            continue
+        if not bool(result_payload.get("success")):
+            continue
 
-    structure_jobs = _collect_structure_jobs()
+        complex_path = str(input_payload.get("prepared_complex_path") or "").strip()
+        if not complex_path:
+            continue
+        rows.append(
+            {
+                "run_id": run_dir.name,
+                "job_code": metadata.get("job_code") or _short_job_code(run_dir.name),
+                "source": metadata.get("ligand_source") or "unknown",
+                "pdb_id": metadata.get("pdb_id") or input_payload.get("pdb_id") or "",
+                "ligand_key": metadata.get("ligand_key") or "",
+                "protein_chains": input_payload.get("selected_protein_chains") or [],
+                "complex_path": complex_path,
+                "created_at": metadata.get("created_at") or "",
+                "structure_run_id": metadata.get("structure_run_id") or "",
+            }
+        )
+    return rows
+
+
+def render() -> None:
+    mode = str(st.session_state.get("md_task_mode", "system_prep") or "system_prep")
+    is_production_mode = mode == "production"
+    st.title("MD Production" if is_production_mode else "MD System Preparation")
+    st.caption(
+        "Import an MD system preparation job and run production."
+        if is_production_mode
+        else "Import a prepared structure job, tune equilibration/system parameters, and build reusable MD-ready systems (no production run)."
+    )
+
+    structure_jobs = _collect_md_system_prep_jobs() if is_production_mode else _collect_structure_jobs()
     if not structure_jobs:
-        st.info("No prepared structure jobs found. Create one first in Structure Preparation.")
-        if st.button("Go to Structure Preparation"):
-            st.switch_page("app/pages/structure_preparation.py")
+        st.info(
+            "No MD system preparation jobs found. Run MD System Preparation first."
+            if is_production_mode
+            else "No prepared structure jobs found. Create one first in Structure Preparation."
+        )
+        if st.button("Go to MD System Preparation" if is_production_mode else "Go to Structure Preparation"):
+            st.switch_page("app/pages/md_system_preparation.py" if is_production_mode else "app/pages/structure_preparation.py")
         return
 
-    st.subheader("1. Import prepared structure")
+    st.subheader("1. Import prepared MD system" if is_production_mode else "1. Import prepared structure")
     selected_idx = st.selectbox(
-        "Prepared structure job",
+        "Prepared MD system job" if is_production_mode else "Prepared structure job",
         options=list(range(len(structure_jobs))),
         format_func=lambda i: (
             f"{structure_jobs[i]['job_code']} | "
@@ -124,10 +175,11 @@ def render() -> None:
     st.subheader("2. Simulation input preview")
     _render_simulation_input_view(pdb_data, selected_ligand, selected_protein_chains)
 
-    st.subheader("3. MD setup")
+    st.subheader("3. MD production setup" if is_production_mode else "3. MD system setup")
     preset_name = st.segmented_control("Protocol preset", list(PROTOCOL_PRESETS), default="Preview")
     preset = PROTOCOL_PRESETS[preset_name]
     st.caption(preset["description"])
+    pipeline_placeholder = st.container()
     st.markdown("**3.1 Parameterize & System creation**")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -155,7 +207,54 @@ def render() -> None:
             step=0.5,
         )
 
-    st.markdown("**3.3 Heat**")
+    st.markdown("**3.3 Equilibration restraints (minimization/heating/NVT)**")
+    eq_col1, eq_col2 = st.columns(2)
+    with eq_col1:
+        apply_protein_restraints_during_heating_nvt = st.checkbox(
+            "Apply protein restraints during equilibration",
+            value=True,
+            help="Active during minimization, heating, and NVT.",
+        )
+        protein_restraint_selection = st.selectbox(
+            "Protein restraint selection",
+            ["backbone", "heavy", "none"],
+            index=0,
+            disabled=not apply_protein_restraints_during_heating_nvt,
+        )
+        protein_restraint_k = st.number_input(
+            "Protein restraint k (kJ/mol/nm²)",
+            min_value=0.0,
+            value=1000.0,
+            step=100.0,
+            disabled=not apply_protein_restraints_during_heating_nvt,
+        )
+    with eq_col2:
+        ligand_restraints_enabled = st.checkbox(
+            "Apply ligand positional restraints during equilibration",
+            value=True,
+            help="Active during minimization, heating, and NVT.",
+        )
+        ligand_lock_k = st.number_input(
+            "Ligand positional restraint k (kJ/mol/nm²)",
+            min_value=0.0,
+            value=2500.0,
+            step=100.0,
+            disabled=not ligand_restraints_enabled,
+        )
+        enable_ligand_planarity_restraints = st.checkbox(
+            "Enable ligand planarity/geometry restraints",
+            value=False,
+            help="Optional equilibration aid; disabled by default.",
+        )
+        ligand_planarity_k = st.number_input(
+            "Ligand planarity restraint k (kJ/mol/nm²)",
+            min_value=0.0,
+            value=1500.0,
+            step=100.0,
+            disabled=not enable_ligand_planarity_restraints,
+        )
+
+    st.markdown("**3.4 Heat**")
     heat_col1, heat_col2 = st.columns(2)
     with heat_col1:
         heating_start_temperature = st.number_input("Heating start temperature (K)", min_value=0.0, value=50.0, step=10.0)
@@ -168,65 +267,76 @@ def render() -> None:
         step=250,
     )
 
-    st.markdown("**3.4 NVT equilibration**")
+    st.markdown("**3.5 NVT equilibration**")
     nvt_steps = st.number_input("NVT steps", min_value=0, value=int(preset["nvt_steps"]), step=500)
 
-    st.markdown("**3.5 NPT equilibration**")
+    st.markdown("**3.6 NPT equilibration**")
     npt_steps = st.number_input("NPT steps", min_value=0, value=int(preset["npt_steps"]), step=500)
-    st.markdown("**3.6 Restraints**")
-    ligand_restraints_enabled = st.checkbox(
-        "Apply ligand restraints during heating/NVT",
+    npt_release_enabled = st.checkbox(
+        "Release restraints during NPT",
         value=True,
-        help="Keeps ligand pose/planarity stable during early equilibration.",
+        help="Gradually release enabled protein/ligand restraints during NPT.",
+        disabled=not (apply_protein_restraints_during_heating_nvt or ligand_restraints_enabled or enable_ligand_planarity_restraints),
     )
-    npt_release_enabled = False
     npt_restraint_release_scales = "1.0"
-    if ligand_restraints_enabled:
-        npt_release_enabled = st.checkbox(
-            "Release ligand restraints during NPT",
-            value=True,
-            help="Gradually relax ligand restraints across NPT stages.",
-        )
+    if apply_protein_restraints_during_heating_nvt or ligand_restraints_enabled or enable_ligand_planarity_restraints:
         npt_restraint_release_scales = st.text_input(
             "NPT ligand restraint release scales",
-            value="1.0,0.5,0.2,0.05,0.0" if npt_release_enabled else "1.0",
-            help="Comma-separated scale factors applied stage-wise to ligand restraints (last should usually be 0.0).",
+            value="1.0,0.5,0.2,0.05,0.0",
+            help="Comma-separated scale factors (applied to ligand positional restraints).",
             disabled=not npt_release_enabled,
         )
-
-    st.markdown("**3.7 Production**")
-    production_steps = st.number_input("Production steps", min_value=0, value=int(preset["production_steps"]), step=1000)
-    production_report_interval = st.number_input("Production report interval", min_value=100, value=2500, step=100)
-    st.markdown("**3.8 Ligand restraint strengths**")
-    rst_col1, rst_col2 = st.columns(2)
-    with rst_col1:
-        ligand_lock_k = st.number_input(
-            "Ligand positional restraint k (kJ/mol/nm²)",
-            min_value=0.0,
-            value=2500.0,
-            step=100.0,
+        protein_npt_release_scales = st.text_input(
+            "NPT protein restraint release scales",
+            value="1.0,0.5,0.1,0.01,0.0",
+            help="Comma-separated scale factors (applied to protein restraints).",
+            disabled=not npt_release_enabled,
         )
-    with rst_col2:
-        ligand_planarity_k = st.number_input(
-            "Ligand planarity restraint k (kJ/mol/nm²)",
-            min_value=0.0,
-            value=1500.0,
-            step=100.0,
+        planarity_npt_release_scales = st.text_input(
+            "NPT planarity restraint release scales",
+            value="1.0,0.5,0.2,0.05,0.0",
+            help="Comma-separated scale factors (applied to planarity restraints).",
+            disabled=not npt_release_enabled or not enable_ligand_planarity_restraints,
+        )
+    else:
+        protein_npt_release_scales = "1.0,0.5,0.1,0.01,0.0"
+        planarity_npt_release_scales = "1.0,0.5,0.2,0.05,0.0"
+
+    if is_production_mode:
+        st.markdown("**3.7 Production policy**")
+        allow_restrained_production = st.checkbox(
+            "Allow restrained production",
+            value=False,
+            help="If off (recommended), production is forced unrestrained even if release settings are unsafe.",
+        )
+    else:
+        allow_restrained_production = False
+
+    if is_production_mode:
+        production_steps = st.number_input("Production steps", min_value=0, value=int(preset["production_steps"]), step=1000)
+        production_report_interval = st.number_input("Production report interval", min_value=100, value=2500, step=100)
+    else:
+        production_steps = 0
+        production_report_interval = 2500
+
+    with pipeline_placeholder:
+        _render_protocol_timeline(
+            heating_steps,
+            nvt_steps,
+            npt_steps,
+            production_steps,
+            minimization_only,
+            include_prepare=False,
+            include_energy=False,
+            include_production=is_production_mode,
         )
 
-    _render_protocol_timeline(
-        heating_steps,
-        nvt_steps,
-        npt_steps,
-        production_steps,
-        minimization_only,
-        include_prepare=False,
-        include_energy=False,
-    )
-
-    with st.expander("Docker/runtime settings"):
-        image = st.text_input("MD Docker image", value=DEFAULT_MD_IMAGE)
-        use_gpu = st.checkbox("Use GPU", value=True)
+    image = DEFAULT_MD_IMAGE
+    use_gpu = True
+    if is_production_mode:
+        with st.expander("Docker/runtime settings"):
+            image = st.text_input("MD Docker image", value=DEFAULT_MD_IMAGE)
+            use_gpu = st.checkbox("Use GPU", value=True)
 
     refined_sdf_path = next(iter(sorted(structure_job_dir.glob("*_ligand_refined.sdf"))), None)
     reference_smi_path = next(iter(sorted(structure_job_dir.glob("*_ligand_ref.smi"))), None)
@@ -240,25 +350,26 @@ def render() -> None:
     except Exception:
         pass
 
-    with st.expander("Input files used for this MD run", expanded=True):
-        st.table(
-            [
-                {"role": "Refined complex PDB (structure coordinates)", "file": str(complex_path)},
-                {
-                    "role": "Refined protein PDB (MD protein input)",
-                    "file": str(protein_refined_path) if protein_refined_path else "not found (fallback to refined complex PDB)",
-                },
-                {
-                    "role": "Refined ligand SDF (parameterization input)",
-                    "file": str(refined_sdf_path) if refined_sdf_path else "not found (fallback to extracted ligand PDB)",
-                },
-                {
-                    "role": "Reference ligand SMILES",
-                    "file": str(reference_smi_path) if reference_smi_path else "not found (optional)",
-                },
-                {"role": "Structure job folder", "file": str(structure_job_dir)},
-            ]
-        )
+    if is_production_mode:
+        with st.expander("Input files used for this MD run", expanded=True):
+            st.table(
+                [
+                    {"role": "Refined complex PDB (structure coordinates)", "file": str(complex_path)},
+                    {
+                        "role": "Refined protein PDB (MD protein input)",
+                        "file": str(protein_refined_path) if protein_refined_path else "not found (fallback to refined complex PDB)",
+                    },
+                    {
+                        "role": "Refined ligand SDF (parameterization input)",
+                        "file": str(refined_sdf_path) if refined_sdf_path else "not found (fallback to extracted ligand PDB)",
+                    },
+                    {
+                        "role": "Reference ligand SMILES",
+                        "file": str(reference_smi_path) if reference_smi_path else "not found (optional)",
+                    },
+                    {"role": "Structure job folder", "file": str(structure_job_dir)},
+                ]
+            )
 
     preview_payload = _build_md_input_payload(
         selected_job["pdb_id"] or "UNKNOWN",
@@ -284,6 +395,14 @@ def render() -> None:
     preview_payload["heating_start_temperature"] = float(heating_start_temperature)
     preview_payload["heating_stages"] = int(heating_stages)
     preview_payload["npt_restraint_release_scales"] = str(npt_restraint_release_scales)
+    preview_payload["protein_npt_release_scales"] = str(protein_npt_release_scales)
+    preview_payload["planarity_npt_release_scales"] = str(planarity_npt_release_scales)
+    preview_payload["apply_protein_restraints_during_heating_nvt"] = bool(apply_protein_restraints_during_heating_nvt)
+    preview_payload["protein_restraint_selection"] = str(protein_restraint_selection)
+    preview_payload["protein_restraint_k"] = float(protein_restraint_k)
+    preview_payload["enable_ligand_planarity_restraints"] = bool(enable_ligand_planarity_restraints)
+    preview_payload["allow_restrained_production"] = bool(allow_restrained_production)
+    preview_payload["force_unrestrained_production"] = not bool(allow_restrained_production)
     preview_payload["ligand_restraints_enabled"] = bool(ligand_restraints_enabled)
     preview_payload["npt_release_enabled"] = bool(npt_release_enabled)
     preview_payload["ligand_lock_k_kjmol_nm2"] = float(ligand_lock_k)
@@ -297,17 +416,17 @@ def render() -> None:
     if reference_smi_path:
         preview_payload["reference_smiles_path"] = str(reference_smi_path)
     preview_payload["prepared_complex_path"] = str(complex_path)
-    st.subheader("4. Run MD")
-    if st.button("Run MD from prepared structure", type="primary"):
+    st.subheader("4. Run MD production" if is_production_mode else "4. Run MD system preparation")
+    if st.button("Run MD production" if is_production_mode else "Run MD system preparation", type="primary"):
         run_id = str(uuid4())
-        output_dir = _run_root() / "bound-ligand-md" / run_id
+        output_dir = (_run_root() / "bound-ligand-md" / run_id) if is_production_mode else (_run_root() / "md-system-prep" / run_id)
         output_dir.mkdir(parents=True, exist_ok=False)
 
         _write_run_metadata(
             output_dir,
             {
                 "created_at": _utc_now_iso(),
-                "workflow": "bound-ligand-md",
+                "workflow": "bound-ligand-md" if is_production_mode else "md-system-prep",
                 "status": "running",
                 "ligand_source": selected_job.get("source") or "unknown",
                 "structure_run_id": selected_job["run_id"],
@@ -346,6 +465,14 @@ def render() -> None:
         input_payload["heating_start_temperature"] = float(heating_start_temperature)
         input_payload["heating_stages"] = int(heating_stages)
         input_payload["npt_restraint_release_scales"] = str(npt_restraint_release_scales)
+        input_payload["protein_npt_release_scales"] = str(protein_npt_release_scales)
+        input_payload["planarity_npt_release_scales"] = str(planarity_npt_release_scales)
+        input_payload["apply_protein_restraints_during_heating_nvt"] = bool(apply_protein_restraints_during_heating_nvt)
+        input_payload["protein_restraint_selection"] = str(protein_restraint_selection)
+        input_payload["protein_restraint_k"] = float(protein_restraint_k)
+        input_payload["enable_ligand_planarity_restraints"] = bool(enable_ligand_planarity_restraints)
+        input_payload["allow_restrained_production"] = bool(allow_restrained_production)
+        input_payload["force_unrestrained_production"] = not bool(allow_restrained_production)
         input_payload["ligand_restraints_enabled"] = bool(ligand_restraints_enabled)
         input_payload["npt_release_enabled"] = bool(npt_release_enabled)
         input_payload["ligand_lock_k_kjmol_nm2"] = float(ligand_lock_k)
@@ -371,7 +498,7 @@ def render() -> None:
 
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode == 0:
-            st.success(f"Workflow completed: {run_id}")
+            st.success(f"MD production completed: {run_id}" if is_production_mode else f"MD system preparation completed: {run_id}")
         else:
             st.error(f"Workflow failed with exit code {result.returncode}")
         st.code(str(output_dir))
@@ -408,6 +535,3 @@ def render() -> None:
         if result.stderr:
             with st.expander("stderr"):
                 st.code(result.stderr)
-
-
-render()

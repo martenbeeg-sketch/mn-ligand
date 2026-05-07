@@ -52,6 +52,37 @@ class EquilibrationRunner:
     NPT_RESTRAINT_RELEASE_SCALES = (1.0, 0.5, 0.2, 0.05, 0.0)
 
     @staticmethod
+    def _parse_scales(value: str, default: List[float]) -> List[float]:
+        try:
+            vals = [float(x.strip()) for x in str(value).split(",") if x.strip()]
+            return vals if vals else list(default)
+        except Exception:
+            return list(default)
+
+    @staticmethod
+    def _set_context_param_if_present(context, name: str, value: float) -> bool:
+        try:
+            params = set(context.getParameters().keys())
+            if name in params:
+                context.setParameter(name, float(value))
+                return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _list_active_restraint_params(context) -> Dict[str, Optional[float]]:
+        out = {"k_prot": None, "k_lig": None, "k_plan": None, "k": None, "kp": None}
+        try:
+            params = set(context.getParameters().keys())
+            for key in list(out.keys()):
+                if key in params:
+                    out[key] = float(context.getParameter(key))
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
     def _compute_stage_ranges(nvt_steps: int, npt_steps: int, production_steps: int) -> Dict[str, Tuple[int, int]]:
         """
         Compute progress percentage ranges for each stage based on step counts.
@@ -441,6 +472,11 @@ class EquilibrationRunner:
         minimization_tolerance_kjmol_nm: float = 10.0,
         npt_restraint_release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
         npt_release_enabled: bool = True,
+        protein_npt_release_scales_csv: str = "1.0,0.5,0.1,0.01,0.0",
+        planarity_npt_release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
+        allow_restrained_production: bool = False,
+        force_unrestrained_production: bool = True,
+        resume_from_checkpoint_path: str | None = None,
         temperature: float = 300.0,
         pressure: float = 1.0
     ) -> Dict[str, Any]:
@@ -503,6 +539,8 @@ class EquilibrationRunner:
             minimized_pdb_path = os.path.join(self.output_dir, f"{system_id}_minimized.pdb")
             nvt_pdb_path = os.path.join(self.output_dir, f"{system_id}_nvt_final.pdb")
             npt_pdb_path = os.path.join(self.output_dir, f"{system_id}_npt_final.pdb")
+            npt_checkpoint_path = os.path.join(self.output_dir, f"{system_id}_npt_final.chk")
+            npt_state_xml_path = os.path.join(self.output_dir, f"{system_id}_npt_final_state.xml")
             production_traj_path = os.path.join(self.output_dir, f"{system_id}_production.dcd")
             production_pdb_path = os.path.join(self.output_dir, f"{system_id}_production_final.pdb")
             production_log_path = os.path.join(self.output_dir, f"{system_id}_production.log")
@@ -529,6 +567,71 @@ class EquilibrationRunner:
 
             # Emit preparation complete (system was built before this point)
             emit_progress(ranges['preparation'][1], "System preparation complete", ["preparation"])
+
+            resume_from_checkpoint = bool(resume_from_checkpoint_path and str(resume_from_checkpoint_path).strip())
+            if resume_from_checkpoint:
+                checkpoint_path = str(resume_from_checkpoint_path).strip()
+                if not os.path.exists(checkpoint_path):
+                    raise RuntimeError(f"Checkpoint not found for production resume: {checkpoint_path}")
+                logger.info("Resuming simulation from checkpoint: %s", checkpoint_path)
+                simulation.loadCheckpoint(checkpoint_path)
+                logger.info("Checkpoint loaded successfully.")
+
+                completed_stages = ["preparation", "minimization", "thermal_heating", "nvt", "npt"]
+                equilibration_stats = {
+                    "energy_minimization": {
+                        "initial_energy": None,
+                        "final_energy": None,
+                        "energy_change": None,
+                    },
+                    "thermal_heating": {"status": "skipped_resume_checkpoint"},
+                    "nvt_equilibration": {"status": "skipped_resume_checkpoint"},
+                    "npt_equilibration": {
+                        "status": "loaded_from_checkpoint",
+                        "checkpoint_path": checkpoint_path,
+                    },
+                }
+                output_files = {
+                    "equilibration_log": log_path,
+                    "console_log": console_log_path,
+                    "npt_checkpoint": checkpoint_path,
+                }
+
+                if production_steps > 0:
+                    prod_progress_start = ranges['production'][0]
+                    prod_progress_end = 100
+                    emit_progress(prod_progress_start, "Starting production MD from checkpoint...", completed_stages)
+                    prod_result = self._run_production(
+                        simulation, production_steps, production_report_interval,
+                        production_traj_path, production_log_path,
+                        production_pdb_path, unit,
+                        prod_progress_start, prod_progress_end,
+                        completed_stages,
+                        allow_restrained_production=allow_restrained_production,
+                        force_unrestrained_production=force_unrestrained_production,
+                    )
+                    equilibration_stats["production"] = prod_result
+                    output_files["production_trajectory"] = production_traj_path
+                    output_files["production_pdb"] = production_pdb_path
+                    output_files["production_log"] = production_log_path
+                    completed_stages.append("production")
+                    emit_progress(100, "MD production completed successfully", completed_stages)
+
+                results.update({
+                    "status": "success",
+                    "output_files": output_files,
+                    "equilibration_stats": equilibration_stats,
+                    "restraint_protocol": {
+                        "production_unrestrained": bool(equilibration_stats.get("production", {}).get("production_unrestrained", True)),
+                        "force_unrestrained_production": bool(force_unrestrained_production),
+                        "allow_restrained_production": bool(allow_restrained_production),
+                        "npt_release_stages": [],
+                        "warnings": equilibration_stats.get("production", {}).get("warnings", []),
+                        "resumed_from_checkpoint": True,
+                    },
+                })
+                self._cleanup_file_handler(file_handler)
+                return results
 
             # Stage 1: Energy Minimization
             if not skip_minimization:
@@ -602,6 +705,8 @@ class EquilibrationRunner:
                 npt_traj_path, log_path, npt_pdb_path, unit,
                 release_scales_csv=npt_restraint_release_scales_csv,
                 release_enabled=bool(npt_release_enabled),
+                protein_release_scales_csv=protein_npt_release_scales_csv,
+                planarity_release_scales_csv=planarity_npt_release_scales_csv,
                 progress_start=ranges['npt'][0],
                 progress_end=ranges['npt'][1],
             )
@@ -632,6 +737,12 @@ class EquilibrationRunner:
                 "npt_pdb": npt_pdb_path
             }
 
+            # Persist exact post-NPT restart artifacts for downstream production runs.
+            simulation.saveCheckpoint(npt_checkpoint_path)
+            simulation.saveState(npt_state_xml_path)
+            output_files["npt_checkpoint"] = npt_checkpoint_path
+            output_files["npt_state_xml"] = npt_state_xml_path
+
             # Stage 4: Production MD (optional)
             if production_steps > 0:
                 prod_progress_start = ranges['production'][0]
@@ -643,7 +754,9 @@ class EquilibrationRunner:
                     production_traj_path, production_log_path,
                     production_pdb_path, unit,
                     prod_progress_start, prod_progress_end,
-                    completed_stages
+                    completed_stages,
+                    allow_restrained_production=allow_restrained_production,
+                    force_unrestrained_production=force_unrestrained_production,
                 )
 
                 equilibration_stats["production"] = prod_result
@@ -658,7 +771,14 @@ class EquilibrationRunner:
             results.update({
                 "status": "success",
                 "output_files": output_files,
-                "equilibration_stats": equilibration_stats
+                "equilibration_stats": equilibration_stats,
+                "restraint_protocol": {
+                    "production_unrestrained": bool(equilibration_stats.get("production", {}).get("production_unrestrained", True)),
+                    "force_unrestrained_production": bool(force_unrestrained_production),
+                    "allow_restrained_production": bool(allow_restrained_production),
+                    "npt_release_stages": npt_result.get("release_stage_details", []),
+                    "warnings": equilibration_stats.get("production", {}).get("warnings", []),
+                },
             })
 
             self._cleanup_file_handler(file_handler)
@@ -1093,6 +1213,8 @@ class EquilibrationRunner:
         self, simulation, steps: int, report_interval: int,
         traj_path: str, log_path: str, pdb_path: str, unit,
         release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
+        protein_release_scales_csv: str = "1.0,0.5,0.1,0.01,0.0",
+        planarity_release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
         release_enabled: bool = True,
         progress_start: int = 15,
         progress_end: int = 95,
@@ -1126,36 +1248,34 @@ class EquilibrationRunner:
         initial_volume = initial_state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
         logger.info(f"Initial volume: {initial_volume:.2f} nm^3")
 
-        # Run NPT equilibration with staged ligand-restraint release.
+        # Run NPT equilibration with staged restraint release.
         logger.info(f"Running NPT equilibration for {steps} steps ({steps * 0.004 / 1000:.1f} ns)")
         context = simulation.context
         release_scales = list(self.NPT_RESTRAINT_RELEASE_SCALES)
+        ligand_scales = self._parse_scales(release_scales_csv, list(self.NPT_RESTRAINT_RELEASE_SCALES))
+        protein_scales = self._parse_scales(protein_release_scales_csv, [1.0, 0.5, 0.1, 0.01, 0.0])
+        planarity_scales = self._parse_scales(planarity_release_scales_csv, list(self.NPT_RESTRAINT_RELEASE_SCALES))
         if not release_enabled:
-            release_scales = [1.0]
-        try:
-            custom = [float(x.strip()) for x in str(release_scales_csv).split(",") if x.strip()]
-            if custom and release_enabled:
-                release_scales = custom
-        except Exception:
-            logger.warning(
-                "Invalid NPT restraint release scales '%s'; using defaults %s",
-                release_scales_csv,
-                release_scales,
-            )
+            ligand_scales = [1.0]
+            protein_scales = [1.0]
+            planarity_scales = [1.0]
+        release_scales = ligand_scales
         try:
             param_names = set(context.getParameters().keys())
         except Exception:
             param_names = set()
-        has_positional_k = "k" in param_names
-        has_planarity_k = "kp" in param_names
-        initial_k = context.getParameter("k") if has_positional_k else None
-        initial_kp = context.getParameter("kp") if has_planarity_k else None
-        if has_positional_k or has_planarity_k:
+        has_ligand_k = ("k_lig" in param_names) or ("k" in param_names)
+        has_planarity_k = ("k_plan" in param_names) or ("kp" in param_names)
+        has_protein_k = "k_prot" in param_names
+        initial_k_lig = context.getParameter("k_lig") if "k_lig" in param_names else (context.getParameter("k") if "k" in param_names else None)
+        initial_kp = context.getParameter("k_plan") if "k_plan" in param_names else (context.getParameter("kp") if "kp" in param_names else None)
+        initial_k_prot = context.getParameter("k_prot") if has_protein_k else None
+        if has_ligand_k or has_planarity_k or has_protein_k:
             logger.info(
-                "Applying staged NPT ligand restraint release with scales=%s (k=%s, kp=%s)",
-                release_scales,
-                initial_k,
-                initial_kp,
+                "Applying staged NPT restraint release: protein=%s ligand=%s planarity=%s",
+                protein_scales,
+                ligand_scales,
+                planarity_scales,
             )
         else:
             release_scales = [1.0]
@@ -1163,24 +1283,43 @@ class EquilibrationRunner:
 
         # Run with staged release + progress reporting
         completed_steps = 0
-        n_stages = len(release_scales)
+        n_stages = max(len(ligand_scales), len(protein_scales), len(planarity_scales))
         stage_lengths = [steps // n_stages] * n_stages
         for i in range(steps % n_stages):
             stage_lengths[i] += 1
 
-        for stage_idx, (scale, stage_steps) in enumerate(zip(release_scales, stage_lengths), start=1):
+        release_stage_details = []
+        for stage_idx, stage_steps in enumerate(stage_lengths, start=1):
             if stage_steps <= 0:
                 continue
-            if has_positional_k and initial_k is not None:
-                context.setParameter("k", float(initial_k) * float(scale))
+            lig_scale = ligand_scales[min(stage_idx - 1, len(ligand_scales) - 1)]
+            prot_scale = protein_scales[min(stage_idx - 1, len(protein_scales) - 1)]
+            plan_scale = planarity_scales[min(stage_idx - 1, len(planarity_scales) - 1)]
+            if has_ligand_k and initial_k_lig is not None:
+                self._set_context_param_if_present(context, "k_lig", float(initial_k_lig) * float(lig_scale))
+                self._set_context_param_if_present(context, "k", float(initial_k_lig) * float(lig_scale))
             if has_planarity_k and initial_kp is not None:
-                context.setParameter("kp", float(initial_kp) * float(scale))
+                self._set_context_param_if_present(context, "k_plan", float(initial_kp) * float(plan_scale))
+                self._set_context_param_if_present(context, "kp", float(initial_kp) * float(plan_scale))
+            if has_protein_k and initial_k_prot is not None:
+                self._set_context_param_if_present(context, "k_prot", float(initial_k_prot) * float(prot_scale))
             logger.info(
-                "NPT restraint-release stage %d/%d: scale=%.3f, steps=%d",
+                "NPT restraint-release stage %d/%d: protein=%.3f ligand=%.3f planarity=%.3f steps=%d",
                 stage_idx,
                 n_stages,
-                scale,
+                prot_scale,
+                lig_scale,
+                plan_scale,
                 stage_steps,
+            )
+            release_stage_details.append(
+                {
+                    "stage": int(stage_idx),
+                    "protein_scale": float(prot_scale) if has_protein_k else None,
+                    "ligand_scale": float(lig_scale) if has_ligand_k else None,
+                    "planarity_scale": float(plan_scale) if has_planarity_k else None,
+                    "steps": int(stage_steps),
+                }
             )
 
             chunk_size = max(stage_steps // 4, 500)
@@ -1227,7 +1366,13 @@ class EquilibrationRunner:
             "initial_volume_nm3": initial_volume,
             "final_volume_nm3": final_volume,
             "restraint_release_scales": release_scales,
-            "restraint_release_applied": bool(has_positional_k or has_planarity_k),
+            "restraint_release_applied": bool(has_ligand_k or has_planarity_k or has_protein_k),
+            "release_stage_details": release_stage_details,
+            "final_scales": {
+                "protein": float(protein_scales[-1]) if protein_scales else None,
+                "ligand": float(ligand_scales[-1]) if ligand_scales else None,
+                "planarity": float(planarity_scales[-1]) if planarity_scales else None,
+            },
         }
 
     def _run_production(
@@ -1235,7 +1380,9 @@ class EquilibrationRunner:
         traj_path: str, log_path: str, pdb_path: str, unit,
         progress_start: int = 95, progress_end: int = 100,
         completed_stages: Optional[List[str]] = None,
-        checkpoint_interval: int = 25000
+        checkpoint_interval: int = 25000,
+        allow_restrained_production: bool = False,
+        force_unrestrained_production: bool = True,
     ) -> Dict[str, Any]:
         """
         Run unrestrained production MD.
@@ -1264,6 +1411,18 @@ class EquilibrationRunner:
 
         duration_ns = steps * 0.004 / 1000  # 4 fs timestep
         logger.info(f"=== STAGE 5: PRODUCTION MD ({duration_ns:.1f} ns, {steps} steps) ===")
+        warnings: List[str] = []
+        active_before = self._list_active_restraint_params(simulation.context)
+        any_active_before = any(v is not None and abs(float(v)) > 1e-12 for v in active_before.values())
+        if force_unrestrained_production and (not allow_restrained_production) and any_active_before:
+            for pname in ("k_prot", "k_lig", "k_plan", "k", "kp"):
+                self._set_context_param_if_present(simulation.context, pname, 0.0)
+            simulation.context.reinitialize(preserveState=True)
+            logger.info("Production MD starting unrestrained: no protein, ligand, or planarity restraint forces active.")
+        elif any_active_before:
+            msg = "WARNING: Production MD is restrained."
+            warnings.append(msg)
+            logger.warning(msg)
 
         # Clear reporters and add production reporters
         simulation.reporters.clear()
@@ -1323,6 +1482,8 @@ class EquilibrationRunner:
         )
 
         n_frames = steps // report_interval
+        active_after = self._list_active_restraint_params(simulation.context)
+        any_active_after = any(v is not None and abs(float(v)) > 1e-12 for v in active_after.values())
         logger.info(
             f"[COMPLETE] Production MD completed: {duration_ns:.1f} ns, "
             f"{n_frames} trajectory frames saved"
@@ -1334,4 +1495,7 @@ class EquilibrationRunner:
             "duration_ps": steps * 0.004,
             "trajectory_frames": n_frames,
             "final_volume_nm3": final_volume,
+            "production_unrestrained": not any_active_after,
+            "active_restraints_in_production": active_after,
+            "warnings": warnings,
         }
