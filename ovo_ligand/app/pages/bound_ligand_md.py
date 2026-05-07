@@ -383,6 +383,43 @@ def _count_pdb_contents(pdb_data: str) -> dict[str, int]:
     return counts
 
 
+def _derive_system_info_from_pdb_file(path: str | None) -> dict[str, int] | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        pdb_data = p.read_text()
+    except Exception:
+        return None
+    water_residues: set[tuple[str, str, str, str]] = set()
+    ion_residues: set[tuple[str, str, str, str]] = set()
+    total_atoms = 0
+    protein_atoms = 0
+    for line in pdb_data.splitlines():
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        total_atoms += 1
+        resname = line[17:20].strip().upper() if len(line) >= 20 else ""
+        chain = line[21].strip() if len(line) > 21 else ""
+        resseq = line[22:26].strip() if len(line) >= 26 else ""
+        icode = line[26].strip() if len(line) > 26 else ""
+        resid = (resname, chain or "_", resseq, icode or "_")
+        if line.startswith("ATOM"):
+            protein_atoms += 1
+        elif resname in WATER:
+            water_residues.add(resid)
+        elif resname in COMMON_IONS:
+            ion_residues.add(resid)
+    return {
+        "total_atoms": int(total_atoms),
+        "protein_atoms": int(protein_atoms),
+        "water_molecules": int(len(water_residues)),
+        "ions": int(len(ion_residues)),
+    }
+
+
 @st.cache_data(show_spinner=False)
 def _trajectory_to_multimodel_pdb(
     dcd_path: str,
@@ -621,7 +658,7 @@ def _render_static_line_plot(
     y_columns: list[str],
     title: str,
     y_label: str,
-    x_label: str = "Time (ps)",
+    x_label: str = "Time (ns)",
 ) -> None:
     fig, ax = plt.subplots(figsize=(5.0, 1.9), dpi=130)
     for column in y_columns:
@@ -636,6 +673,11 @@ def _render_static_line_plot(
     ax.grid(True, alpha=0.2, linewidth=0.6)
     fig.tight_layout(pad=0.6)
     st.pyplot(fig, clear_figure=True, use_container_width=False)
+
+
+def _steps_to_ns(steps: int | float) -> float:
+    # 4 fs timestep in this workflow.
+    return float(steps) * 0.000004
 
 
 def _phase_time_windows(analytics: dict) -> list[tuple[str, float, float]]:
@@ -1087,17 +1129,21 @@ def _render_protocol_timeline(
     stages = []
     if include_prepare:
         stages.append(("Prepare", "Protein cleanup and selected bound ligand extraction", "enabled"))
+    heat_total_ns = _steps_to_ns(heating_steps * 6)
+    nvt_ns = _steps_to_ns(nvt_steps)
+    npt_ns = _steps_to_ns(npt_steps)
+    prod_ns = _steps_to_ns(production_steps)
     stages.extend(
         [
             ("Parameterize", "OpenFF ligand force field and OpenMM system setup", "enabled"),
             ("Minimize", "Relax clashes before dynamics", "enabled"),
-            ("Heat", f"Gradual thermalization, {heating_steps:,} steps per stage", "skipped" if minimization_only else "enabled"),
-            ("NVT", f"Constant volume equilibration, {nvt_steps:,} steps", "skipped" if minimization_only else "enabled"),
-            ("NPT", f"Constant pressure equilibration, {npt_steps:,} steps", "skipped" if minimization_only else "enabled"),
+            ("Heat", f"Gradual thermalization, {heating_steps:,} steps/stage (~{heat_total_ns:.3f} ns total)", "skipped" if minimization_only else "enabled"),
+            ("NVT", f"Constant volume equilibration, {nvt_steps:,} steps (~{nvt_ns:.3f} ns)", "skipped" if minimization_only else "enabled"),
+            ("NPT", f"Constant pressure equilibration, {npt_steps:,} steps (~{npt_ns:.3f} ns)", "skipped" if minimization_only else "enabled"),
         ]
     )
     if include_production:
-        stages.append(("Production", f"{production_steps:,} MD steps", "skipped" if minimization_only or production_steps == 0 else "enabled"))
+        stages.append(("Production", f"{production_steps:,} MD steps (~{prod_ns:.3f} ns)", "skipped" if minimization_only or production_steps == 0 else "enabled"))
     if include_energy:
         stages.append(("Energy", "MM/GBSA not found in Ligand-X; result is marked pending", "pending"))
     cols = st.columns(len(stages))
@@ -1134,11 +1180,28 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
     st.caption(f"Job code: {job_code}")
 
     kpi = analytics.get("kpi_summary", {})
-    system_info = md_result.get("system_info", {})
+    system_info = md_result.get("system_info", {}) or {}
+    fallback_system_info = None
+    if ("water_molecules" not in system_info) or ("ions" not in system_info):
+        candidate_paths = [
+            output_files.get("system_pdb"),
+            output_files.get("production_pdb"),
+            output_files.get("npt_pdb"),
+        ]
+        for cand in candidate_paths:
+            fallback_system_info = _derive_system_info_from_pdb_file(cand)
+            if fallback_system_info:
+                break
+    water_value = system_info.get("water_molecules")
+    ion_value = system_info.get("ions")
+    if water_value is None and fallback_system_info:
+        water_value = fallback_system_info.get("water_molecules")
+    if ion_value is None and fallback_system_info:
+        ion_value = fallback_system_info.get("ions")
     metric_cols = st.columns(3)
     metric_cols[0].metric("Total atoms", f"{md_result.get('total_atoms', 0):,}")
-    metric_cols[1].metric("Water molecules", f"{system_info.get('water_molecules', 0):,}")
-    metric_cols[2].metric("Ions", f"{system_info.get('ions', 0):,}")
+    metric_cols[1].metric("Water molecules", "unknown" if water_value is None else f"{int(water_value):,}")
+    metric_cols[2].metric("Ions", "unknown" if ion_value is None else f"{int(ion_value):,}")
 
     minimization = md_result.get("equilibration_stats", {}).get("energy_minimization", {})
 
@@ -1157,23 +1220,23 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         )
         thermo_df = pd.DataFrame(
             {
-                "time_ps": thermodynamics.get("time_ps", []),
+                "time_ns": [float(v) / 1000.0 for v in thermodynamics.get("time_ps", [])],
                 "potential_energy_kjmol": thermodynamics.get("potential_energy_kjmol", []),
                 "temperature_k": thermodynamics.get("temperature_k", []),
                 "density_gcm3": thermodynamics.get("density_gcm3", []),
                 "volume_nm3": thermodynamics.get("volume_nm3", []),
             }
-        ).set_index("time_ps")
-        phase_windows = _phase_time_windows(analytics)
+        ).set_index("time_ns")
+        phase_windows = [(name, start / 1000.0, end / 1000.0) for name, start, end in _phase_time_windows(analytics)]
         if phase_windows:
             thermo_tabs = st.tabs(["Energy"] + [name for name, _, _ in phase_windows])
             with thermo_tabs[0]:
                 st.dataframe(min_energy_df, use_container_width=True, hide_index=True)
-            for tab, (phase_name, start_ps, end_ps) in zip(thermo_tabs[1:], phase_windows):
+            for tab, (phase_name, start_ns, end_ns) in zip(thermo_tabs[1:], phase_windows):
                 with tab:
-                    phase_df = _slice_phase(thermo_df, start_ps, end_ps)
+                    phase_df = _slice_phase(thermo_df, start_ns, end_ns)
                     if phase_df.empty:
-                        st.caption(f"No thermodynamics samples inside {phase_name} window ({start_ps:.2f}-{end_ps:.2f} ps).")
+                        st.caption(f"No thermodynamics samples inside {phase_name} window ({start_ns:.3f}-{end_ns:.3f} ns).")
                     else:
                         _render_static_line_plot(
                             phase_df,
@@ -1241,12 +1304,12 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         use_per_phase_local = rmsd_reference_mode.startswith("Per-phase")
         rmsd_df = pd.DataFrame(
             {
-                "time_ps": rmsd.get("time_ps", []),
+                "time_ns": [float(v) / 1000.0 for v in rmsd.get("time_ps", [])],
                 "protein_backbone_rmsd_A": rmsd.get("backbone_rmsd_angstrom", []),
                 "ligand_rmsd_A": rmsd.get("ligand_rmsd_angstrom", []),
             }
-        ).set_index("time_ps")
-        phase_windows = _phase_time_windows(analytics)
+        ).set_index("time_ns")
+        phase_windows = [(name, start / 1000.0, end / 1000.0) for name, start, end in _phase_time_windows(analytics)]
         per_phase_local = rmsd.get("per_phase_local", {}) or {}
         if (not per_phase_local) and phase_windows:
             per_phase_local = _derive_local_phase_rmsd_from_global(rmsd_df, phase_windows)
@@ -1273,7 +1336,7 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                 return "fail"
 
             phase_kpi_map: dict[str, dict[str, object]] = {}
-            for phase_name, start_ps, end_ps in phase_windows:
+            for phase_name, start_ns, end_ns in phase_windows:
                 if use_per_phase_local and phase_name.lower() in per_phase_local:
                     blk = per_phase_local.get(phase_name.lower(), {})
                     phase_calc_df = pd.DataFrame(
@@ -1283,7 +1346,7 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                         }
                     )
                 else:
-                    phase_calc_df = _slice_phase(rmsd_df, start_ps, end_ps)
+                    phase_calc_df = _slice_phase(rmsd_df, start_ns, end_ns)
                 bb_mean = _tail20_mean(phase_calc_df["protein_backbone_rmsd_A"]) if "protein_backbone_rmsd_A" in phase_calc_df else None
                 lig_mean = _tail20_mean(phase_calc_df["ligand_rmsd_A"]) if "ligand_rmsd_A" in phase_calc_df else None
                 phase_kpi_map[phase_name] = {
@@ -1308,7 +1371,7 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                 default=phase_names[0],
                 key=f"rmsd_phase_{run_dir.name}",
             )
-            phase_name, start_ps, end_ps = next(
+            phase_name, start_ns, end_ns = next(
                 (w for w in phase_windows if w[0] == selected_phase),
                 phase_windows[0],
             )
@@ -1316,17 +1379,17 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                 local_block = per_phase_local.get(phase_name.lower(), {})
                 phase_df = pd.DataFrame(
                     {
-                        "time_ps": local_block.get("time_ps", []),
+                        "time_ns": [float(v) / 1000.0 for v in local_block.get("time_ps", [])],
                         "protein_backbone_rmsd_A": local_block.get("backbone_rmsd_angstrom", []),
                         "ligand_rmsd_A": local_block.get("ligand_rmsd_angstrom", []),
                     }
-                ).set_index("time_ps")
-                x_label = "Phase time (ps)"
+                ).set_index("time_ns")
+                x_label = "Phase time (ns)"
             else:
-                phase_df = _slice_phase(rmsd_df, start_ps, end_ps)
-                x_label = "Time (ps)"
+                phase_df = _slice_phase(rmsd_df, start_ns, end_ns)
+                x_label = "Time (ns)"
             if phase_df.empty:
-                st.caption(f"No RMSD samples inside {phase_name} window ({start_ps:.2f}-{end_ps:.2f} ps).")
+                st.caption(f"No RMSD samples inside {phase_name} window ({start_ns:.3f}-{end_ns:.3f} ns).")
             else:
                 if use_per_phase_local:
                     st.caption(
@@ -1393,13 +1456,19 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
     }
     snapshot_options = {key: value for key, value in snapshot_options.items() if value and Path(value).exists()}
     if snapshot_options:
-        snapshot_label = st.selectbox("Structure snapshot", list(snapshot_options), index=len(snapshot_options) - 1)
+        snapshot_label = st.selectbox(
+            "Structure snapshot",
+            list(snapshot_options),
+            index=len(snapshot_options) - 1,
+            key=f"snapshot_label_{run_dir.name}",
+        )
         snapshot_path = Path(snapshot_options[snapshot_label])
         snapshot_mode = st.segmented_control(
             "Snapshot contents",
             ["Protein + ligand", "Full solvent box"],
             default="Protein + ligand",
             help="Full solvent box keeps the CRYST1 unit-cell record plus waters and ions.",
+            key=f"snapshot_mode_{run_dir.name}",
         )
         show_box = st.checkbox("Show periodic box contour", value=False, key=f"snapshot_box_{run_dir.name}_{snapshot_label}")
         st.caption(str(snapshot_path))
@@ -1429,7 +1498,12 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
     trajectory_files = {key: value for key, value in trajectory_files.items() if value and Path(value).exists()}
     if trajectory_files:
         st.markdown("#### Trajectory playback")
-        traj_label = st.selectbox("Trajectory", list(trajectory_files), index=len(trajectory_files) - 1)
+        traj_label = st.selectbox(
+            "Trajectory",
+            list(trajectory_files),
+            index=len(trajectory_files) - 1,
+            key=f"trajectory_label_{run_dir.name}",
+        )
         topology_candidates = [
             output_files.get("production_pdb"),
             output_files.get("npt_pdb"),
@@ -1445,14 +1519,16 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                 value=1,
                 step=1,
                 help="Use a larger stride for faster loading and smaller playback files.",
+                key=f"trajectory_stride_{run_dir.name}",
             )
         with traj_cols[1]:
-            align_trajectory = st.checkbox("Align on protein", value=True)
+            align_trajectory = st.checkbox("Align on protein", value=True, key=f"trajectory_align_{run_dir.name}")
         with traj_cols[2]:
             include_solvent_trajectory = st.checkbox(
                 "Include waters/ions",
                 value=False,
                 help="Solvent playback can be very large. Start without solvent, then enable if needed.",
+                key=f"trajectory_solvent_{run_dir.name}",
             )
         total_frames = _get_dcd_total_frames(trajectory_files[traj_label])
         sampled_frames = (total_frames + int(stride) - 1) // int(stride) if total_frames else None
@@ -1884,6 +1960,7 @@ def render() -> None:
                 step=250,
                 help="Steps used in each heating interval before equilibration.",
             )
+            st.caption(f"~{_steps_to_ns(int(heating_steps) * 6):.3f} ns total heating")
             nvt_steps = st.number_input(
                 "NVT steps",
                 min_value=0,
@@ -1891,6 +1968,7 @@ def render() -> None:
                 step=500,
                 help="Constant-volume equilibration steps.",
             )
+            st.caption(f"~{_steps_to_ns(int(nvt_steps)):.3f} ns")
         with col2:
             npt_steps = st.number_input(
                 "NPT steps",
@@ -1899,6 +1977,7 @@ def render() -> None:
                 step=500,
                 help="Constant-pressure equilibration steps.",
             )
+            st.caption(f"~{_steps_to_ns(int(npt_steps)):.3f} ns")
             production_steps = st.number_input(
                 "Production steps",
                 min_value=0,
@@ -1906,6 +1985,7 @@ def render() -> None:
                 step=1000,
                 help="Production MD steps. Preview mode leaves this at 0.",
             )
+            st.caption(f"~{_steps_to_ns(int(production_steps)):.3f} ns")
         with col3:
             temperature = st.number_input("Temperature K", min_value=1.0, value=300.0)
             padding_nm = st.number_input("Solvent padding nm", min_value=0.1, value=1.0)
@@ -2050,10 +2130,26 @@ def render() -> None:
         st.caption("Run MD once to see energy metrics, RMSD plots, thermodynamic traces, and 3D snapshots.")
 
     st.subheader("8. Energy analysis")
-    st.warning(
-        "MM/GBSA is not wired yet because no MM/GBSA implementation was found in the original Ligand-X code. "
-        "The current workflow can generate MD outputs; the result JSON records MM/GBSA as not implemented."
-    )
+    mmgbsa = result_payload.get("mmgbsa") or {}
+    mm_status = str(mmgbsa.get("status") or "unknown")
+    if mm_status == "success":
+        delta = mmgbsa.get("delta") or {}
+        c1, c2, c3 = st.columns(3)
+        c1.metric("ΔG_bind total (kJ/mol)", f"{float(delta.get('delta_g_bind_total_kj_mol', 0.0)):.3f}")
+        c2.metric("ΔMM (kJ/mol)", f"{float(delta.get('delta_mm_kj_mol', 0.0)):.3f}")
+        c3.metric("ΔGBSA (kJ/mol)", f"{float(delta.get('delta_gbsa_kj_mol', 0.0)):.3f}")
+        st.caption(f"Method: {mmgbsa.get('method', '-')}")
+        st.caption(f"Snapshot: {mmgbsa.get('snapshot_path', '-')}")
+        with st.expander("MM/GBSA details"):
+            st.json(mmgbsa)
+    elif mm_status == "failed":
+        st.error(f"MM/GBSA failed: {mmgbsa.get('error', 'Unknown error')}")
+        with st.expander("MM/GBSA details"):
+            st.json(mmgbsa)
+    elif mm_status == "skipped":
+        st.warning(f"MM/GBSA skipped: {mmgbsa.get('reason', 'No reason provided')}")
+    else:
+        st.info("MM/GBSA not available for this run yet. Use 'Recompute MM/GBSA' on the results page.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import subprocess
 from pathlib import Path
@@ -10,6 +11,7 @@ import streamlit as st
 
 from ovo_ligand.app.pages.bound_ligand_md import (
     DEFAULT_MD_IMAGE,
+    PROTOCOL_PRESETS,
     _build_command,
     _build_md_input_payload,
     _ligand_label,
@@ -23,6 +25,18 @@ from ovo_ligand.app.pages.bound_ligand_md import (
     _parse_protein_chains,
 )
 from ovo_ligand.app.pages.md import _collect_md_system_prep_jobs
+
+
+def _steps_to_ns(steps: int | float) -> float:
+    return float(steps) * 0.000004
+
+
+PRODUCTION_REPORT_INTERVAL_PRESETS = {
+    "Preview": 500,
+    "Short MD": 1000,
+    "Longer MD": 2500,
+    "Custom": 2500,  # Custom starts from Longer MD defaults
+}
 
 
 def _host_path_to_container_path(path: Path | None) -> str:
@@ -42,6 +56,7 @@ def _host_path_to_container_path(path: Path | None) -> str:
 
 def render() -> None:
     st.title("MD Production")
+    st.caption("MD Production UI revision: 2026-05-07-preset-fix-r4")
     st.caption("Select a prepared MD system, review the carried-over system parameters, inspect the exact structure, then run production.")
 
     prep_jobs = _collect_md_system_prep_jobs()
@@ -54,8 +69,11 @@ def render() -> None:
     st.subheader("1. Select prepared MD system")
     selected_idx = st.selectbox(
         "MD system preparation job",
-        options=list(range(len(prep_jobs))),
+        options=[None] + list(range(len(prep_jobs))),
         format_func=lambda i: (
+            "Select a prepared MD system job..."
+            if i is None
+            else
             f"{prep_jobs[i]['job_code']} | "
             f"{prep_jobs[i]['pdb_id'] or '-'} | "
             f"{prep_jobs[i]['ligand_key'] or '-'} | "
@@ -63,6 +81,9 @@ def render() -> None:
         ),
         index=0,
     )
+    if selected_idx is None:
+        st.info("Select a prepared MD system job to continue.")
+        return
     selected_job = prep_jobs[int(selected_idx)]
 
     md_system_prep_dir = _run_root() / "md-system-prep" / selected_job["run_id"]
@@ -78,6 +99,8 @@ def render() -> None:
     except Exception:
         prep_input = {}
         prep_result = {}
+    # Normalize any container-style output paths (/output/...) to host-visible run paths.
+    prep_result = _rewrite_output_paths(prep_result, md_system_prep_dir)
 
     complex_path = Path(selected_job["complex_path"])
     protein_refined_path = next(iter(sorted(complex_path.parent.glob("*_protein_refined.pdb"))), None)
@@ -87,26 +110,14 @@ def render() -> None:
     prep_system_pdb_path = Path(prep_system_pdb_str) if prep_system_pdb_str else None
     if prep_system_pdb_path and not prep_system_pdb_path.exists():
         prep_system_pdb_path = None
-    if prep_system_pdb_path is None:
-        system_candidates = sorted(md_system_prep_dir.rglob("*_system.pdb"))
-        if system_candidates:
-            prep_system_pdb_path = system_candidates[0]
     npt_final_path_str = str(output_files.get("npt_pdb") or "").strip()
     npt_final_path = Path(npt_final_path_str) if npt_final_path_str else None
     if npt_final_path and not npt_final_path.exists():
         npt_final_path = None
-    if npt_final_path is None:
-        npt_candidates = sorted(md_system_prep_dir.rglob("*_npt_final.pdb"))
-        if npt_candidates:
-            npt_final_path = npt_candidates[0]
     npt_checkpoint_str = str(output_files.get("npt_checkpoint") or "").strip()
     npt_checkpoint_path = Path(npt_checkpoint_str) if npt_checkpoint_str else None
     if npt_checkpoint_path and not npt_checkpoint_path.exists():
         npt_checkpoint_path = None
-    if npt_checkpoint_path is None:
-        chk_candidates = sorted(md_system_prep_dir.rglob("*_npt_final.chk"))
-        if chk_candidates:
-            npt_checkpoint_path = chk_candidates[0]
     restart_mode = st.selectbox(
         "Restart mode",
         options=["Checkpoint (exact continuation)", "NPT-final PDB (coordinate restart)"],
@@ -120,22 +131,28 @@ def render() -> None:
 
     if npt_final_path is None:
         st.error(
-            "Selected MD system preparation job has no NPT-final structure (`*_npt_final.pdb`). "
+            "Selected MD system preparation job is missing a valid `md_result.output_files.npt_pdb` artifact. "
             "Production cannot start."
         )
-        st.info(f"Expected in prep run folder: `{md_system_prep_dir}`")
+        st.info(
+            "Re-run MD system preparation and ensure `result.json` contains host-visible output files via "
+            "`md_result.output_files`."
+        )
+        st.code(f"Prep result file: {prep_result_json}")
         return
     if use_checkpoint_restart and npt_checkpoint_path is None:
         st.error(
-            "Checkpoint restart selected, but no NPT checkpoint (`*_npt_final.chk`) was found."
+            "Checkpoint restart selected, but no valid `md_result.output_files.npt_checkpoint` artifact was found."
         )
         st.info("Switch restart mode to `NPT-final PDB (coordinate restart)` or regenerate MD system prep.")
+        st.code(f"Prep result file: {prep_result_json}")
         return
     if use_checkpoint_restart and prep_system_pdb_path is None:
         st.error(
-            "Checkpoint restart selected, but no MD system PDB (`*_system.pdb`) was found."
+            "Checkpoint restart selected, but no valid `md_result.output_files.system_pdb` artifact was found."
         )
         st.info("Regenerate MD system prep so production can rebuild the exact checkpoint-compatible system.")
+        st.code(f"Prep result file: {prep_result_json}")
         return
     production_start_path = npt_final_path
     try:
@@ -236,15 +253,76 @@ def render() -> None:
     st.subheader("4. Production run settings")
     c1, c2 = st.columns(2)
     with c1:
-        preset = st.selectbox("Preset", ["Preview", "Short MD", "Longer MD", "Custom"], index=2)
-        production_steps = st.number_input("Production steps", min_value=0, value=50000, step=1000)
+        preset = st.selectbox("Preset", ["Preview", "Short MD", "Longer MD", "Custom"], index=2, key="md_prod_preset")
+        # Custom intentionally starts from Longer MD defaults.
+        preset_source = "Longer MD" if preset == "Custom" else preset
+        default_steps = int((PROTOCOL_PRESETS.get(preset_source) or {}).get("production_steps", 500000))
+        default_report = int(PRODUCTION_REPORT_INTERVAL_PRESETS.get(preset, 2500))
+        steps_state_key = "md_prod_production_steps"
+        report_state_key = "md_prod_report_interval"
+        preset_applied_key = "md_prod_preset_applied"
+        bootstrap_key = "md_prod_bootstrap_done"
+        if not st.session_state.get(bootstrap_key, False):
+            st.session_state[steps_state_key] = default_steps
+            st.session_state[report_state_key] = default_report
+            st.session_state[preset_applied_key] = preset
+            st.session_state[bootstrap_key] = True
+            st.rerun()
+        if st.session_state.get(preset_applied_key) != preset:
+            st.session_state[steps_state_key] = default_steps
+            st.session_state[report_state_key] = default_report
+            st.session_state[preset_applied_key] = preset
+            st.rerun()
+        production_steps = st.number_input(
+            "Production steps",
+            min_value=0,
+            value=default_steps,
+            step=1000,
+            key=steps_state_key,
+        )
+        if st.button("Reset Production Defaults", key="md_prod_reset_defaults"):
+            st.session_state[steps_state_key] = default_steps
+            st.session_state[report_state_key] = default_report
+            st.session_state[preset_applied_key] = preset
+            st.rerun()
+        st.caption(f"Estimated production time: ~{_steps_to_ns(int(production_steps)):.3f} ns")
     with c2:
-        production_report_interval = st.number_input("Production report interval", min_value=100, value=2500, step=100)
+        production_report_interval = st.number_input(
+            "Production report interval",
+            min_value=100,
+            value=default_report,
+            step=100,
+            key=report_state_key,
+        )
         allow_restrained_production = st.checkbox("Allow restrained production", value=False)
+        repeat_count = int(st.number_input("Repetitions", min_value=1, value=1, step=1))
     st.caption(
         f"Temperature and pressure are inherited from system preparation: "
         f"{prep_input.get('temperature_k', 300.0)} K, {prep_input.get('pressure', 1.0)} bar."
     )
+    st.markdown("**MM/GBSA at end of run**")
+    mmgbsa_enabled = st.checkbox("Run MM/GBSA after MD production", value=True)
+    mmc1, mmc2, mmc3 = st.columns(3)
+    with mmc1:
+        mmgbsa_start_pct = int(st.number_input("Start (%)", min_value=0, max_value=100, value=20, step=1))
+    with mmc2:
+        mmgbsa_end_pct = int(st.number_input("End (%)", min_value=0, max_value=100, value=100, step=1))
+    expected_total_frames = max(1, int(production_steps) // max(1, int(production_report_interval)))
+    start_pct_clamped = max(0, min(100, int(mmgbsa_start_pct)))
+    end_pct_clamped = max(start_pct_clamped, min(100, int(mmgbsa_end_pct)))
+    start_idx = int((start_pct_clamped / 100.0) * expected_total_frames)
+    end_idx = int((end_pct_clamped / 100.0) * expected_total_frames)
+    analyzed_frames = max(1, end_idx - start_idx)
+    suggested_stride = 1 if analyzed_frames <= 600 else int(math.ceil(analyzed_frames / 600.0))
+    stride_key = "md_prod_mmgbsa_stride"
+    if stride_key not in st.session_state:
+        st.session_state[stride_key] = suggested_stride
+    with mmc3:
+        mmgbsa_stride = int(st.number_input("Sampling stride", min_value=1, value=int(st.session_state[stride_key]), step=1, key=stride_key))
+    if analyzed_frames <= 600:
+        st.info(f"MM/GBSA analysis window has only ~{analyzed_frames} frame(s); using stride 1 is recommended.")
+    else:
+        st.caption(f"Auto-suggested stride for ~600 analyzed frames: {suggested_stride} (window ~{analyzed_frames} frames)")
 
     with st.expander("Docker/runtime settings"):
         image = st.text_input("MD Docker image", value=DEFAULT_MD_IMAGE)
@@ -262,124 +340,144 @@ def render() -> None:
 
     st.subheader("5. Run MD production")
     if st.button("Run MD production", type="primary"):
-        run_id = str(uuid4())
-        output_dir = _run_root() / "bound-ligand-md" / run_id
-        output_dir.mkdir(parents=True, exist_ok=False)
+        repeat_group_id = str(uuid4())
+        for repeat_idx in range(repeat_count):
+            run_id = str(uuid4())
+            output_dir = _run_root() / "bound-ligand-md" / run_id
+            output_dir.mkdir(parents=True, exist_ok=False)
 
-        _write_run_metadata(
-            output_dir,
-            {
-                "created_at": _utc_now_iso(),
-                "workflow": "bound-ligand-md",
-                "status": "running",
-                "ligand_source": selected_job.get("source") or "unknown",
-                "structure_run_id": selected_job.get("structure_run_id") or "",
-                "md_system_prep_run_id": selected_job["run_id"],
-                "pdb_id": selected_job.get("pdb_id"),
-                "ligand_key": selected_ligand.get("key"),
-                "ligand_label": _ligand_label(selected_ligand),
-                "docker_image": image,
-                "use_gpu": bool(use_gpu),
-                "run_dir": str(output_dir),
-                "preset": preset,
-                "restart_mode": restart_mode,
-            },
-        )
-
-        input_payload = _build_md_input_payload(
-            selected_job.get("pdb_id") or "UNKNOWN",
-            protein_pdb_data,
-            selected_ligand,
-            run_id,
-            prep_input.get("charge_method", "gasteiger"),
-            prep_input.get("forcefield_method", "openff-2.2.0"),
-            0,
-            0,
-            0,
-            int(production_steps),
-            float(prep_input.get("temperature_k", 300.0)),
-            float(prep_input.get("padding_nm", 1.0)),
-            False,
-        )
-        input_payload["protocol_preset"] = preset
-        input_payload["box_shape"] = prep_input.get("box_shape", "dodecahedron")
-        input_payload["ionic_strength"] = float(prep_input.get("ionic_strength", 0.15))
-        input_payload["pressure"] = float(prep_input.get("pressure", 1.0))
-        input_payload["production_report_interval"] = int(production_report_interval)
-        input_payload["allow_restrained_production"] = bool(allow_restrained_production)
-        input_payload["force_unrestrained_production"] = not bool(allow_restrained_production)
-        input_payload["prepared_complex_path"] = str(complex_path)
-        input_payload["source_md_system_prep_run_id"] = selected_job["run_id"]
-        if use_checkpoint_restart and npt_checkpoint_path:
-            input_payload["resume_from_checkpoint_path"] = _host_path_to_container_path(npt_checkpoint_path)
-            input_payload["resume_system_pdb_path"] = _host_path_to_container_path(prep_system_pdb_path)
-        else:
-            input_payload.pop("resume_from_checkpoint_path", None)
-            input_payload.pop("resume_system_pdb_path", None)
-
-        if refined_sdf_data:
-            input_payload["ligand_refined_sdf_data"] = refined_sdf_data
-            input_payload["strict_refined_ligand"] = True
-            input_payload["ligand_refined_sdf_path"] = str(refined_sdf_path)
-        if reference_smiles:
-            input_payload["reference_smiles"] = reference_smiles
-        if reference_smi_path:
-            input_payload["reference_smiles_path"] = str(reference_smi_path)
-
-        final_input_protein_host = output_dir / "final_input_protein_refined.pdb"
-        final_input_protein_host.write_text(protein_pdb_data if protein_pdb_data.endswith("\n") else protein_pdb_data + "\n")
-        input_payload["input_complex_pdb_path"] = f"/output/{final_input_protein_host.name}"
-        input_payload.pop("pdb_data", None)
-
-        input_json = output_dir / "input.json"
-        result_json = output_dir / "result.json"
-        input_json.write_text(json.dumps(input_payload, indent=2))
-
-        command = _build_command(image, output_dir, input_json, result_json, use_gpu)
-        with st.expander("Docker command", expanded=True):
-            st.code(shlex.join(command))
-
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            st.success(f"MD production completed: {run_id}")
-        else:
-            st.error(f"Workflow failed with exit code {result.returncode}")
-        st.code(str(output_dir))
-
-        if result_json.exists():
-            result_payload = _rewrite_output_paths(json.loads(result_json.read_text()), output_dir)
-            metadata = _write_run_metadata(
-                output_dir,
-                {
-                    "status": "completed" if result_payload.get("success") else "failed",
-                    "completed_at": _utc_now_iso(),
-                    "result_json": str(result_json),
-                    "host_run_dir": str(output_dir),
-                    "structure_run_id": selected_job.get("structure_run_id") or "",
-                    "md_system_prep_run_id": selected_job["run_id"],
-                },
-            )
-            result_payload["metadata"] = metadata
-            result_json.write_text(json.dumps(result_payload, indent=2))
-            _render_md_results(result_payload, output_dir)
-        else:
             _write_run_metadata(
                 output_dir,
                 {
-                    "status": "failed",
-                    "completed_at": _utc_now_iso(),
-                    "failure_reason": f"process_exit_{result.returncode}",
-                    "host_run_dir": str(output_dir),
+                    "created_at": _utc_now_iso(),
+                    "workflow": "bound-ligand-md",
+                    "status": "running",
+                    "ligand_source": selected_job.get("source") or "unknown",
+                    "structure_run_id": selected_job.get("structure_run_id") or "",
                     "md_system_prep_run_id": selected_job["run_id"],
+                    "pdb_id": selected_job.get("pdb_id"),
+                    "ligand_key": selected_ligand.get("key"),
+                    "ligand_label": _ligand_label(selected_ligand),
+                    "docker_image": image,
+                    "use_gpu": bool(use_gpu),
+                    "run_dir": str(output_dir),
+                    "preset": preset,
+                    "restart_mode": restart_mode,
+                    "repeat_group_id": repeat_group_id,
+                    "repeat_index": repeat_idx + 1,
+                    "repeat_total": repeat_count,
                 },
             )
 
-        if result.stdout:
-            with st.expander("stdout"):
-                st.code(result.stdout)
-        if result.stderr:
-            with st.expander("stderr"):
-                st.code(result.stderr)
+            input_payload = _build_md_input_payload(
+                selected_job.get("pdb_id") or "UNKNOWN",
+                protein_pdb_data,
+                selected_ligand,
+                run_id,
+                prep_input.get("charge_method", "gasteiger"),
+                prep_input.get("forcefield_method", "openff-2.2.0"),
+                0,
+                0,
+                0,
+                int(production_steps),
+                float(prep_input.get("temperature_k", 300.0)),
+                float(prep_input.get("padding_nm", 1.0)),
+                False,
+            )
+            input_payload["protocol_preset"] = preset
+            input_payload["box_shape"] = prep_input.get("box_shape", "dodecahedron")
+            input_payload["ionic_strength"] = float(prep_input.get("ionic_strength", 0.15))
+            input_payload["pressure"] = float(prep_input.get("pressure", 1.0))
+            input_payload["production_report_interval"] = int(production_report_interval)
+            input_payload["allow_restrained_production"] = bool(allow_restrained_production)
+            input_payload["force_unrestrained_production"] = not bool(allow_restrained_production)
+            input_payload["prepared_complex_path"] = str(complex_path)
+            input_payload["source_md_system_prep_run_id"] = selected_job["run_id"]
+            input_payload["source_md_system_prep_result_json"] = str(prep_result_json)
+            input_payload["restart_mode"] = restart_mode
+            input_payload["mmgbsa_enabled"] = bool(mmgbsa_enabled)
+            input_payload["mmgbsa_start_pct"] = int(mmgbsa_start_pct)
+            input_payload["mmgbsa_end_pct"] = int(mmgbsa_end_pct)
+            input_payload["mmgbsa_stride"] = int(mmgbsa_stride)
+            input_payload["repeat_group_id"] = repeat_group_id
+            input_payload["repeat_index"] = repeat_idx + 1
+            input_payload["repeat_total"] = repeat_count
+            input_payload["restart_contract"] = {
+                "npt_pdb": str(npt_final_path) if npt_final_path else None,
+                "npt_checkpoint": str(npt_checkpoint_path) if npt_checkpoint_path else None,
+                "system_pdb": str(prep_system_pdb_path) if prep_system_pdb_path else None,
+            }
+            if use_checkpoint_restart and npt_checkpoint_path:
+                input_payload["resume_from_checkpoint_path"] = _host_path_to_container_path(npt_checkpoint_path)
+                input_payload["resume_system_pdb_path"] = _host_path_to_container_path(prep_system_pdb_path)
+            else:
+                input_payload.pop("resume_from_checkpoint_path", None)
+                input_payload.pop("resume_system_pdb_path", None)
+
+            if refined_sdf_data:
+                input_payload["ligand_refined_sdf_data"] = refined_sdf_data
+                input_payload["strict_refined_ligand"] = True
+                input_payload["ligand_refined_sdf_path"] = str(refined_sdf_path)
+            if reference_smiles:
+                input_payload["reference_smiles"] = reference_smiles
+            if reference_smi_path:
+                input_payload["reference_smiles_path"] = str(reference_smi_path)
+
+            final_input_protein_host = output_dir / "final_input_protein_refined.pdb"
+            final_input_protein_host.write_text(protein_pdb_data if protein_pdb_data.endswith("\n") else protein_pdb_data + "\n")
+            input_payload["input_complex_pdb_path"] = f"/output/{final_input_protein_host.name}"
+            input_payload.pop("pdb_data", None)
+
+            input_json = output_dir / "input.json"
+            result_json = output_dir / "result.json"
+            input_json.write_text(json.dumps(input_payload, indent=2))
+
+            command = _build_command(image, output_dir, input_json, result_json, use_gpu)
+            with st.expander(f"Docker command (repeat {repeat_idx + 1}/{repeat_count})", expanded=(repeat_idx == 0)):
+                st.code(shlex.join(command))
+
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                st.success(f"MD production completed: {run_id} (repeat {repeat_idx + 1}/{repeat_count})")
+            else:
+                st.error(f"Workflow failed with exit code {result.returncode} for repeat {repeat_idx + 1}/{repeat_count}")
+            st.code(str(output_dir))
+
+            if result_json.exists():
+                result_payload = _rewrite_output_paths(json.loads(result_json.read_text()), output_dir)
+                metadata = _write_run_metadata(
+                    output_dir,
+                    {
+                        "status": "completed" if result_payload.get("success") else "failed",
+                        "completed_at": _utc_now_iso(),
+                        "result_json": str(result_json),
+                        "host_run_dir": str(output_dir),
+                        "structure_run_id": selected_job.get("structure_run_id") or "",
+                        "md_system_prep_run_id": selected_job["run_id"],
+                    },
+                )
+                result_payload["metadata"] = metadata
+                result_json.write_text(json.dumps(result_payload, indent=2))
+            else:
+                _write_run_metadata(
+                    output_dir,
+                    {
+                        "status": "failed",
+                        "completed_at": _utc_now_iso(),
+                        "failure_reason": f"process_exit_{result.returncode}",
+                        "host_run_dir": str(output_dir),
+                        "md_system_prep_run_id": selected_job["run_id"],
+                    },
+                )
+
+            if result.stdout:
+                with st.expander(f"stdout (repeat {repeat_idx + 1}/{repeat_count})"):
+                    st.code(result.stdout)
+            if result.stderr:
+                with st.expander(f"stderr (repeat {repeat_idx + 1}/{repeat_count})"):
+                    st.code(result.stderr)
+        st.switch_page("app/pages/jobs_md.py")
+        return
 
 
 render()

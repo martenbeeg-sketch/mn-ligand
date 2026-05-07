@@ -8,8 +8,10 @@ Ligand-X-derived MD and structure modules that live inside ovo-ligand.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
+import io
 import urllib.request
 import warnings
 from pathlib import Path
@@ -196,6 +198,204 @@ def extract_ligand_pdb(pdb_data: str, selected_key: str) -> str:
     if not lines:
         raise ValueError(f"Selected ligand was not found in PDB data: {selected_key}")
     return "\n".join(lines + ["END", ""])
+
+
+def _split_snapshot_for_mmgbsa(pdb_data: str, selected_key: str) -> dict[str, str]:
+    """Build single-trajectory MM/GBSA inputs from one snapshot.
+
+    Keeps only:
+    - receptor: protein ATOM records
+    - ligand: selected ligand residue
+    - complex: receptor + selected ligand
+    """
+    protein_lines: list[str] = []
+    ligand_lines: list[str] = []
+    for line in pdb_data.splitlines():
+        if line.startswith("ATOM"):
+            protein_lines.append(line)
+            continue
+        if not line.startswith("HETATM"):
+            continue
+        resname = line[17:20].strip()
+        if resname in WATER or resname in COMMON_IONS:
+            continue
+        key = ligand_key(line[17:20], line[21], line[22:26], line[26])
+        if key == selected_key:
+            ligand_lines.append(line)
+    if not protein_lines:
+        raise RuntimeError("MM/GBSA input build failed: no protein ATOM records found in snapshot.")
+    if not ligand_lines:
+        raise RuntimeError(f"MM/GBSA input build failed: selected ligand not found in snapshot ({selected_key}).")
+    receptor = "\n".join(protein_lines + ["END", ""])
+    ligand = "\n".join(ligand_lines + ["END", ""])
+    complex_pdb = "\n".join(protein_lines + ligand_lines + ["END", ""])
+    return {"receptor_pdb": receptor, "ligand_pdb": ligand, "complex_pdb": complex_pdb}
+
+
+def _compute_mmgbsa_openmm(
+    config: dict[str, Any],
+    selected: dict[str, Any],
+    md_result: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Single-snapshot endpoint MM/GBSA via OpenMM implicit solvent (OBC2)."""
+    output_files = (md_result.get("output_files") or {})
+    trajectory_path = str(
+        output_files.get("production_trajectory")
+        or output_files.get("npt_trajectory")
+        or ""
+    ).strip()
+    topology_path = str(
+        output_files.get("production_pdb")
+        or output_files.get("npt_pdb")
+        or output_files.get("system_pdb")
+        or ""
+    ).strip()
+    traj_file = Path(trajectory_path) if trajectory_path else None
+    top_file = Path(topology_path) if topology_path else None
+
+    if (not trajectory_path) or (traj_file is not None and not traj_file.exists()):
+        candidates = []
+        for pattern in ("*_production.dcd", "*_npt_equilibration.dcd"):
+            candidates.extend(sorted(output_dir.rglob(pattern)))
+        if candidates:
+            trajectory_path = str(candidates[0])
+            traj_file = Path(trajectory_path)
+    if (not topology_path) or (top_file is not None and not top_file.exists()):
+        candidates = []
+        for pattern in ("*_production_final.pdb", "*_npt_final.pdb", "*_system.pdb"):
+            candidates.extend(sorted(output_dir.rglob(pattern)))
+        if candidates:
+            topology_path = str(candidates[0])
+            top_file = Path(topology_path)
+    if not trajectory_path or not topology_path:
+        return {
+            "status": "failed",
+            "error": "MM/GBSA requires trajectory and topology (production/npt dcd + pdb) but they were not found.",
+        }
+    traj_file = Path(trajectory_path)
+    top_file = Path(topology_path)
+    if not traj_file.exists() or not top_file.exists():
+        return {
+            "status": "failed",
+            "error": f"MM/GBSA inputs missing: trajectory={traj_file.exists()} topology={top_file.exists()}",
+        }
+
+    forcefield_method = str(config.get("forcefield_method", "openff-2.2.0"))
+
+    repo_root = Path(__file__).resolve().parents[2]
+    ligand_sdf_path = None
+    configured_sdf_path = str(config.get("ligand_refined_sdf_path", "") or "").strip()
+    if configured_sdf_path:
+        cand = Path(configured_sdf_path)
+        if not cand.exists():
+            marker = "ovo-ligand/"
+            if marker in configured_sdf_path:
+                rel = configured_sdf_path.split(marker, 1)[1]
+                mapped = repo_root / rel
+                if mapped.exists():
+                    cand = mapped
+        if cand.exists():
+            ligand_sdf_path = cand
+
+    if ligand_sdf_path is None:
+        ligand_sdf_data = str(config.get("ligand_refined_sdf_data", "") or "").strip()
+        if not ligand_sdf_data:
+            return {
+                "status": "failed",
+                "error": "MM/GBSA requires `ligand_refined_sdf_path` or `ligand_refined_sdf_data`.",
+            }
+        if "$$$$" not in ligand_sdf_data:
+            ligand_sdf_data = ligand_sdf_data.rstrip() + "\n$$$$\n"
+        ligand_sdf_path = output_dir / "mmgbsa_ligand_input.sdf"
+        ligand_sdf_path.write_text(ligand_sdf_data)
+
+    mmgbsa_start_frame = int(config.get("mmgbsa_start_frame", 0))
+    mmgbsa_stop_frame = int(config.get("mmgbsa_stop_frame", -1))
+    mmgbsa_stride = int(config.get("mmgbsa_stride", 1))
+    start_pct_cfg = config.get("mmgbsa_start_pct")
+    end_pct_cfg = config.get("mmgbsa_end_pct")
+    if start_pct_cfg is not None or end_pct_cfg is not None:
+        try:
+            import mdtraj as md
+
+            with md.open(str(traj_file)) as handle:
+                total_frames = int(len(handle))
+            if total_frames > 0:
+                start_pct = float(start_pct_cfg if start_pct_cfg is not None else 0.0)
+                end_pct = float(end_pct_cfg if end_pct_cfg is not None else 100.0)
+                start_pct = max(0.0, min(100.0, start_pct))
+                end_pct = max(start_pct, min(100.0, end_pct))
+                mmgbsa_start_frame = int((start_pct / 100.0) * total_frames)
+                mmgbsa_start_frame = min(max(0, mmgbsa_start_frame), max(0, total_frames - 1))
+                mmgbsa_stop_frame = int((end_pct / 100.0) * total_frames)
+                mmgbsa_stop_frame = min(max(mmgbsa_start_frame + 1, mmgbsa_stop_frame), total_frames)
+        except Exception:
+            pass
+
+    try:
+        script_path = Path(__file__).resolve().parents[2] / "scripts" / "openmm_mmgbsa.py"
+        if not script_path.exists():
+            return {"status": "failed", "error": f"MM/GBSA script not found: {script_path}"}
+        spec = importlib.util.spec_from_file_location("openmm_mmgbsa_script", str(script_path))
+        if spec is None or spec.loader is None:
+            return {"status": "failed", "error": "Failed to load MM/GBSA script module spec."}
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        prefix = str(output_dir / "mmgbsa")
+        ligand_resname = str(selected.get("resname") or "LIG")
+        per_frame_df, summary_df, metadata = module.run_single_trajectory_mmgbsa_from_files(
+            production_dcd=str(traj_file),
+            topology_pdb=str(top_file),
+            ligand_sdf=str(ligand_sdf_path),
+            ligand_resname=ligand_resname,
+            ligand_ff=forcefield_method,
+            output_prefix=prefix,
+            start_frame=mmgbsa_start_frame,
+            stop_frame=None if mmgbsa_stop_frame < 0 else mmgbsa_stop_frame,
+            stride=mmgbsa_stride,
+        )
+    except Exception as exc:
+        return {"status": "failed", "error": f"MM/GBSA script execution failed: {exc}"}
+
+    if summary_df is None or len(summary_df) == 0:
+        return {"status": "failed", "error": "MM/GBSA script returned empty summary."}
+    summary_map = {str(row["term"]): float(row["mean"]) for _, row in summary_df.iterrows()}
+    d_vdw_kcal = summary_map.get("delta_E_vdw_kcalmol", 0.0)
+    d_elec_kcal = summary_map.get("delta_E_elec_kcalmol", 0.0)
+    d_gb_kcal = summary_map.get("delta_G_gbsa_kcalmol", 0.0)
+    d_total_kcal = summary_map.get("delta_G_mmgbsa_kcalmol", 0.0)
+    d_nonpolar_kcal = summary_map.get("delta_G_nonpolar_kcalmol", 0.0)
+    kcal_to_kj = 4.184
+
+    return {
+        "status": "success",
+        "method": "single-trajectory_openmm_mmgbsa_script",
+        "units": "kJ/mol",
+        "units_secondary": "kcal/mol",
+        "trajectory_path": str(traj_file),
+        "topology_path": str(top_file),
+        "selected_ligand_key": selected["key"],
+        "forcefield_method": forcefield_method,
+        "metadata": metadata,
+        "artifacts": {
+            "per_frame_csv": str(output_dir / "mmgbsa_mmgbsa_per_frame.csv"),
+            "summary_csv": str(output_dir / "mmgbsa_mmgbsa_summary.csv"),
+            "metadata_json": str(output_dir / "mmgbsa_mmgbsa_metadata.json"),
+            "plot_png": str(output_dir / "mmgbsa_mmgbsa_terms.png"),
+        },
+        "delta": {
+            "delta_g_bind_total_kj_mol": float(d_total_kcal * kcal_to_kj),
+            "delta_mm_kj_mol": float((d_vdw_kcal + d_elec_kcal) * kcal_to_kj),
+            "delta_gbsa_kj_mol": float(d_gb_kcal * kcal_to_kj),
+            "delta_nonpolar_kj_mol": float(d_nonpolar_kcal * kcal_to_kj),
+            "delta_g_bind_total_kcal_mol": float(d_total_kcal),
+            "delta_mm_kcal_mol": float(d_vdw_kcal + d_elec_kcal),
+            "delta_gbsa_kcal_mol": float(d_gb_kcal),
+            "delta_nonpolar_kcal_mol": float(d_nonpolar_kcal),
+        },
+    }
 
 
 def _fetch_ccd_smiles(resname: str) -> str:
@@ -696,13 +896,44 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
         "ligand_pdb": ligand_pdb,
         "preparation_artifacts": preparation_artifacts,
         "md_result": result,
-        "mmgbsa": {
-            "status": "not_implemented",
-            "message": "Ligand-X contains ABFE/RBFE free-energy workflows, but no MM/GBSA implementation was found in the original code.",
-        },
+        "mmgbsa": {"status": "skipped", "reason": "md_failed"},
     }
+    if wrapped["success"]:
+        production_steps = int(config.get("production_steps", 0) or 0)
+        if not bool(config.get("mmgbsa_enabled", True)):
+            wrapped["mmgbsa"] = {
+                "status": "skipped",
+                "reason": "disabled_by_user",
+            }
+        elif production_steps <= 0:
+            wrapped["mmgbsa"] = {
+                "status": "skipped",
+                "reason": "no_production_segment",
+            }
+        else:
+            wrapped["mmgbsa"] = _compute_mmgbsa_openmm(config, selected, result, output_dir)
     output_path.write_text(json.dumps(wrapped, indent=2))
     return wrapped
+
+
+def recompute_mmgbsa(input_config: dict[str, Any], result_payload: dict[str, Any], output_path: Path) -> dict[str, Any]:
+    """Recompute MM/GBSA for an existing run result payload."""
+    selected = result_payload.get("selected_ligand") or {}
+    md_result = result_payload.get("md_result") or {}
+    if not selected or not md_result:
+        result_payload["mmgbsa"] = {
+            "status": "failed",
+            "error": "Missing selected_ligand or md_result in existing result payload.",
+        }
+    else:
+        result_payload["mmgbsa"] = _compute_mmgbsa_openmm(
+            input_config,
+            selected,
+            md_result,
+            output_path.parent,
+        )
+    output_path.write_text(json.dumps(result_payload, indent=2))
+    return result_payload
 
 
 def main() -> None:
@@ -720,6 +951,15 @@ def main() -> None:
     run = subparsers.add_parser("run")
     run.add_argument("--input", required=True)
     run.add_argument("--output", required=True)
+    mmgbsa = subparsers.add_parser("mmgbsa")
+    mmgbsa.add_argument("--input", required=True)
+    mmgbsa.add_argument("--result", required=True)
+    mmgbsa.add_argument("--output", required=True)
+    mmgbsa.add_argument("--start-frame", type=int, default=0)
+    mmgbsa.add_argument("--stop-frame", type=int, default=-1)
+    mmgbsa.add_argument("--stride", type=int, default=1)
+    mmgbsa.add_argument("--start-pct", type=float, default=None)
+    mmgbsa.add_argument("--end-pct", type=float, default=None)
 
     args = parser.parse_args()
     try:
@@ -731,6 +971,17 @@ def main() -> None:
         elif args.command == "run":
             config = json.loads(Path(args.input).read_text())
             run_ligandx_md(config, Path(args.output))
+        elif args.command == "mmgbsa":
+            config = json.loads(Path(args.input).read_text())
+            config["mmgbsa_start_frame"] = int(getattr(args, "start_frame", 0))
+            config["mmgbsa_stop_frame"] = int(getattr(args, "stop_frame", -1))
+            config["mmgbsa_stride"] = int(getattr(args, "stride", 1))
+            if getattr(args, "start_pct", None) is not None:
+                config["mmgbsa_start_pct"] = float(getattr(args, "start_pct"))
+            if getattr(args, "end_pct", None) is not None:
+                config["mmgbsa_end_pct"] = float(getattr(args, "end_pct"))
+            result_payload = json.loads(Path(args.result).read_text())
+            recompute_mmgbsa(config, result_payload, Path(args.output))
     except Exception as exc:
         payload = {"success": False, "error": str(exc)}
         output_arg = getattr(args, "output", None)

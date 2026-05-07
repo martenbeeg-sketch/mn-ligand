@@ -28,6 +28,10 @@ from ovo_ligand.app.pages.bound_ligand_md import (
 )
 
 
+def _steps_to_ns(steps: int | float) -> float:
+    return float(steps) * 0.000004
+
+
 def _collect_structure_jobs() -> list[dict]:
     runs_root = _run_root() / "structure-jobs"
     runs_root.mkdir(parents=True, exist_ok=True)
@@ -126,8 +130,11 @@ def render() -> None:
     st.subheader("1. Import prepared MD system" if is_production_mode else "1. Import prepared structure")
     selected_idx = st.selectbox(
         "Prepared MD system job" if is_production_mode else "Prepared structure job",
-        options=list(range(len(structure_jobs))),
+        options=[None] + list(range(len(structure_jobs))),
         format_func=lambda i: (
+            "Select a job..."
+            if i is None
+            else
             f"{structure_jobs[i]['job_code']} | "
             f"{structure_jobs[i]['pdb_id'] or '-'} | "
             f"{structure_jobs[i]['ligand_key'] or '-'} | "
@@ -135,6 +142,9 @@ def render() -> None:
         ),
         index=0,
     )
+    if selected_idx is None:
+        st.info("Select a prepared job to continue.")
+        return
     selected_job = structure_jobs[int(selected_idx)]
     complex_path = Path(selected_job["complex_path"])
     protein_refined_path = next(iter(sorted(complex_path.parent.glob("*_protein_refined.pdb"))), None)
@@ -266,12 +276,15 @@ def render() -> None:
         value=int(preset["heating_steps_per_stage"]),
         step=250,
     )
+    st.caption(f"Estimated heating time (all stages): ~{_steps_to_ns(int(heating_steps) * int(heating_stages)):.3f} ns")
 
     st.markdown("**3.5 NVT equilibration**")
     nvt_steps = st.number_input("NVT steps", min_value=0, value=int(preset["nvt_steps"]), step=500)
+    st.caption(f"Estimated NVT time: ~{_steps_to_ns(int(nvt_steps)):.3f} ns")
 
     st.markdown("**3.6 NPT equilibration**")
     npt_steps = st.number_input("NPT steps", min_value=0, value=int(preset["npt_steps"]), step=500)
+    st.caption(f"Estimated NPT time: ~{_steps_to_ns(int(npt_steps)):.3f} ns")
     npt_release_enabled = st.checkbox(
         "Release restraints during NPT",
         value=True,
@@ -314,6 +327,7 @@ def render() -> None:
 
     if is_production_mode:
         production_steps = st.number_input("Production steps", min_value=0, value=int(preset["production_steps"]), step=1000)
+        st.caption(f"Estimated production time: ~{_steps_to_ns(int(production_steps)):.3f} ns")
         production_report_interval = st.number_input("Production report interval", min_value=100, value=2500, step=100)
     else:
         production_steps = 0
@@ -535,3 +549,5 @@ def render() -> None:
         if result.stderr:
             with st.expander("stderr"):
                 st.code(result.stderr)
+        st.switch_page("app/pages/jobs_md.py" if is_production_mode else "app/pages/jobs_md_system.py")
+        return
