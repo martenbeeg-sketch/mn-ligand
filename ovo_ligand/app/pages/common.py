@@ -4,6 +4,7 @@ import os
 import json
 import shlex
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -172,6 +173,142 @@ def _run_root() -> Path:
     return root
 
 
+def _gpu_lock_path() -> Path:
+    return _run_root() / ".gpu_job.lock"
+
+
+def acquire_gpu_job_lock(workflow: str, run_id: str) -> tuple[bool, dict]:
+    payload = {"workflow": str(workflow), "run_id": str(run_id)}
+    lock_path = _gpu_lock_path()
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(payload, indent=2))
+        return True, payload
+    except FileExistsError:
+        try:
+            existing = json.loads(lock_path.read_text())
+        except Exception:
+            existing = {"workflow": "unknown", "run_id": "unknown"}
+        return False, existing
+
+
+def release_gpu_job_lock(run_id: str) -> None:
+    lock_path = _gpu_lock_path()
+    if not lock_path.exists():
+        return
+    try:
+        data = json.loads(lock_path.read_text())
+        if str(data.get("run_id", "")) != str(run_id):
+            return
+    except Exception:
+        return
+    try:
+        lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def queue_gpu_job(run_dir: Path, workflow: str, run_id: str, command: list[str]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = run_dir / "metadata.json"
+    current = {}
+    if metadata_path.exists():
+        try:
+            current = json.loads(metadata_path.read_text())
+        except Exception:
+            current = {}
+    current.update(
+        {
+            "run_id": run_id,
+            "workflow": workflow,
+            "status": "queued",
+            "gpu_queued": True,
+            "queued_command": command,
+            "updated_at": current.get("updated_at") or "",
+        }
+    )
+    metadata_path.write_text(json.dumps(current, indent=2))
+
+
+def try_dispatch_next_queued_gpu_job() -> dict[str, Any] | None:
+    """Dispatch oldest queued GPU job if lock is free.
+
+    Returns a small status dict when a queued job is run, otherwise None.
+    """
+    if _gpu_lock_path().exists():
+        return None
+
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
+    for meta in _run_root().glob("**/metadata.json"):
+        try:
+            payload = json.loads(meta.read_text())
+        except Exception:
+            continue
+        if str(payload.get("status")) != "queued":
+            continue
+        cmd = payload.get("queued_command")
+        if not isinstance(cmd, list) or not cmd:
+            continue
+        run_dir = meta.parent
+        try:
+            t = run_dir.stat().st_mtime
+        except Exception:
+            t = 0.0
+        candidates.append((t, run_dir, payload))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    _, run_dir, payload = candidates[0]
+    run_id = str(payload.get("run_id") or run_dir.name)
+    workflow = str(payload.get("workflow") or "unknown")
+    cmd = payload.get("queued_command")
+    lock_ok, _ = acquire_gpu_job_lock(workflow, run_id)
+    if not lock_ok:
+        return None
+
+    metadata_path = run_dir / "metadata.json"
+    payload["status"] = "running"
+    metadata_path.write_text(json.dumps(payload, indent=2))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        payload["status"] = "completed" if result.returncode == 0 else "failed"
+        payload["returncode"] = int(result.returncode)
+        payload["stdout_tail"] = (result.stdout or "")[-8000:]
+        payload["stderr_tail"] = (result.stderr or "")[-8000:]
+        metadata_path.write_text(json.dumps(payload, indent=2))
+        return {"run_id": run_id, "workflow": workflow, "returncode": int(result.returncode)}
+    finally:
+        release_gpu_job_lock(run_id)
+
+
+def reconcile_run_metadata_status(run_dir: Path) -> bool:
+    """Finalize stale run metadata from result.json when possible.
+
+    Returns True when metadata was updated.
+    """
+    meta_path = run_dir / "metadata.json"
+    result_path = run_dir / "result.json"
+    if not meta_path.exists() or not result_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text())
+        status = str(meta.get("status") or "")
+        if status not in {"running", "queued"}:
+            return False
+        result = json.loads(result_path.read_text())
+        final_status = "completed" if bool(result.get("success")) else "failed"
+        meta["status"] = final_status
+        now_iso = datetime.now(timezone.utc).isoformat()
+        meta["completed_at"] = meta.get("completed_at") or now_iso
+        meta["updated_at"] = now_iso
+        meta_path.write_text(json.dumps(meta, indent=2))
+        return True
+    except Exception:
+        return False
+
+
 def _save_upload(workflow_key: str, param_name: str, uploaded_file) -> str | None:
     if uploaded_file is None:
         return None
@@ -263,19 +400,37 @@ def _build_docker_command(
 
 def _run_docker_workflow(workflow_key: str, workflow: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     run_id = str(uuid4())
+    lock_acquired = False
+    if workflow.get("gpu"):
+        lock_acquired, lock_info = acquire_gpu_job_lock(workflow_key, run_id)
+        if not lock_acquired:
+            return {
+                "run_id": run_id,
+                "output_dir": "",
+                "command": [],
+                "returncode": 99,
+                "stdout": "",
+                "stderr": (
+                    "GPU job lock is active. Another GPU-bound job is running: "
+                    f"{lock_info.get('workflow')} ({lock_info.get('run_id')})."
+                ),
+            }
     output_dir = _run_root() / workflow_key / run_id
     output_dir.mkdir(parents=True, exist_ok=False)
     command = _build_docker_command(workflow_key, workflow, params, output_dir)
-
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    return {
-        "run_id": run_id,
-        "output_dir": str(output_dir),
-        "command": command,
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        return {
+            "run_id": run_id,
+            "output_dir": str(output_dir),
+            "command": command,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    finally:
+        if lock_acquired:
+            release_gpu_job_lock(run_id)
 
 
 def render_workflow_page(workflow_key: str) -> None:

@@ -53,6 +53,14 @@ class MDOptimizationConfig:
     force_unrestrained_production: bool = True
     resume_from_checkpoint_path: Optional[str] = None
     resume_system_pdb_path: Optional[str] = None
+    resume_state_xml_path: Optional[str] = None
+    resume_system_xml_path: Optional[str] = None
+    resume_integrator_xml_path: Optional[str] = None
+    production_only_from_prepared: bool = False
+    md_backend: str = "openmm_openff"
+    amber_complex_prmtop_path: Optional[str] = None
+    amber_complex_inpcrd_path: Optional[str] = None
+    amber_system_pdb_path: Optional[str] = None
 
     def validate(self) -> tuple[bool, str]:
         """
@@ -89,6 +97,12 @@ class MDOptimizationConfig:
 
         if not self.system_id or not self.system_id.strip():
             return False, "system_id cannot be empty"
+
+        if (self.md_backend or "").strip().lower() == "amber_native":
+            if not self.amber_complex_prmtop_path or not str(self.amber_complex_prmtop_path).strip():
+                return False, "amber_complex_prmtop_path is required for amber_native backend"
+            if not self.amber_complex_inpcrd_path or not str(self.amber_complex_inpcrd_path).strip():
+                return False, "amber_complex_inpcrd_path is required for amber_native backend"
 
         return True, ""
 
@@ -149,6 +163,14 @@ class MDOptimizationConfig:
             force_unrestrained_production=data.get('force_unrestrained_production', True),
             resume_from_checkpoint_path=data.get('resume_from_checkpoint_path'),
             resume_system_pdb_path=data.get('resume_system_pdb_path'),
+            resume_state_xml_path=data.get('resume_state_xml_path'),
+            resume_system_xml_path=data.get('resume_system_xml_path'),
+            resume_integrator_xml_path=data.get('resume_integrator_xml_path'),
+            production_only_from_prepared=data.get('production_only_from_prepared', False),
+            md_backend=data.get('md_backend', 'openmm_openff'),
+            amber_complex_prmtop_path=data.get('amber_complex_prmtop_path'),
+            amber_complex_inpcrd_path=data.get('amber_complex_inpcrd_path'),
+            amber_system_pdb_path=data.get('amber_system_pdb_path'),
         )
 
 

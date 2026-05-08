@@ -477,6 +477,10 @@ class EquilibrationRunner:
         allow_restrained_production: bool = False,
         force_unrestrained_production: bool = True,
         resume_from_checkpoint_path: str | None = None,
+        resume_state_xml_path: str | None = None,
+        resume_system_xml_path: str | None = None,
+        resume_integrator_xml_path: str | None = None,
+        production_only_from_prepared: bool = False,
         temperature: float = 300.0,
         pressure: float = 1.0
     ) -> Dict[str, Any]:
@@ -541,6 +545,8 @@ class EquilibrationRunner:
             npt_pdb_path = os.path.join(self.output_dir, f"{system_id}_npt_final.pdb")
             npt_checkpoint_path = os.path.join(self.output_dir, f"{system_id}_npt_final.chk")
             npt_state_xml_path = os.path.join(self.output_dir, f"{system_id}_npt_final_state.xml")
+            npt_system_xml_path = os.path.join(self.output_dir, f"{system_id}_npt_system.xml")
+            npt_integrator_xml_path = os.path.join(self.output_dir, f"{system_id}_npt_integrator.xml")
             production_traj_path = os.path.join(self.output_dir, f"{system_id}_production.dcd")
             production_pdb_path = os.path.join(self.output_dir, f"{system_id}_production_final.pdb")
             production_log_path = os.path.join(self.output_dir, f"{system_id}_production.log")
@@ -570,37 +576,165 @@ class EquilibrationRunner:
 
             resume_from_checkpoint = bool(resume_from_checkpoint_path and str(resume_from_checkpoint_path).strip())
             if resume_from_checkpoint:
+                bundle_system_xml = str(resume_system_xml_path or "").strip()
+                bundle_integrator_xml = str(resume_integrator_xml_path or "").strip()
+                bundle_used = False
+                if bundle_system_xml and bundle_integrator_xml and os.path.exists(bundle_system_xml) and os.path.exists(bundle_integrator_xml):
+                    try:
+                        from openmm import XmlSerializer
+                        from openmm.app import Simulation
+                        with open(bundle_system_xml, "r") as sf:
+                            restored_system = XmlSerializer.deserialize(sf.read())
+                        with open(bundle_integrator_xml, "r") as inf:
+                            restored_integrator = XmlSerializer.deserialize(inf.read())
+                        platform = simulation.context.getPlatform()
+                        simulation = Simulation(simulation.topology, restored_system, restored_integrator, platform)
+                        bundle_used = True
+                        logger.info("Rebuilt simulation context from serialized OpenMM bundle.")
+                    except Exception as bundle_exc:
+                        logger.warning("OpenMM bundle restore failed; using current simulation object. reason=%s", bundle_exc)
+
                 checkpoint_path = str(resume_from_checkpoint_path).strip()
                 if not os.path.exists(checkpoint_path):
                     raise RuntimeError(f"Checkpoint not found for production resume: {checkpoint_path}")
                 logger.info("Resuming simulation from checkpoint: %s", checkpoint_path)
-                simulation.loadCheckpoint(checkpoint_path)
-                logger.info("Checkpoint loaded successfully.")
+                resume_mode = "checkpoint"
+                try:
+                    simulation.loadCheckpoint(checkpoint_path)
+                    logger.info("Checkpoint loaded successfully.")
+                except Exception as exc:
+                    logger.warning("Checkpoint load failed: %s", exc)
+                    state_xml_path = str(resume_state_xml_path or "").strip()
+                    if state_xml_path and os.path.exists(state_xml_path):
+                        logger.info("Falling back to state XML resume: %s", state_xml_path)
+                        try:
+                            simulation.loadState(state_xml_path)
+                            resume_mode = "state_xml"
+                            logger.info("State XML loaded successfully.")
+                        except Exception as state_exc:
+                            if bool(production_only_from_prepared):
+                                logger.warning(
+                                    "State XML resume also failed (%s). Falling back to production-only coordinate continuation.",
+                                    state_exc,
+                                )
+                                resume_from_checkpoint = False
+                            else:
+                                raise
+                    elif bool(production_only_from_prepared):
+                        logger.warning(
+                            "No usable state XML provided. Falling back to production-only coordinate continuation."
+                        )
+                        resume_from_checkpoint = False
+                    else:
+                        raise
 
-                completed_stages = ["preparation", "minimization", "thermal_heating", "nvt", "npt"]
+                if resume_from_checkpoint:
+                    completed_stages = ["preparation", "minimization", "thermal_heating", "nvt", "npt"]
+                    equilibration_stats = {
+                        "energy_minimization": {
+                            "initial_energy": None,
+                            "final_energy": None,
+                            "energy_change": None,
+                        },
+                        "thermal_heating": {"status": "skipped_resume_checkpoint"},
+                        "nvt_equilibration": {"status": "skipped_resume_checkpoint"},
+                        "npt_equilibration": {
+                            "status": "loaded_from_checkpoint" if resume_mode == "checkpoint" else "loaded_from_state_xml",
+                            "checkpoint_path": checkpoint_path if resume_mode == "checkpoint" else None,
+                            "state_xml_path": (str(resume_state_xml_path).strip() if resume_mode == "state_xml" else None),
+                        },
+                    }
+                    output_files = {
+                        "equilibration_log": log_path,
+                        "console_log": console_log_path,
+                        "npt_checkpoint": checkpoint_path if resume_mode == "checkpoint" else None,
+                        "npt_state_xml": (str(resume_state_xml_path).strip() if resume_mode == "state_xml" else None),
+                        "npt_system_xml": bundle_system_xml or None,
+                        "npt_integrator_xml": bundle_integrator_xml or None,
+                    }
+
+                    if production_steps > 0:
+                        prod_progress_start = ranges['production'][0]
+                        prod_progress_end = 100
+                        start_msg = "Starting production MD from checkpoint..." if resume_mode == "checkpoint" else "Starting production MD from state XML..."
+                        emit_progress(prod_progress_start, start_msg, completed_stages)
+                        prod_result = self._run_production(
+                            simulation, production_steps, production_report_interval,
+                            production_traj_path, production_log_path,
+                            production_pdb_path, unit,
+                            prod_progress_start, prod_progress_end,
+                            completed_stages,
+                            allow_restrained_production=allow_restrained_production,
+                            force_unrestrained_production=force_unrestrained_production,
+                        )
+                        equilibration_stats["production"] = prod_result
+                        output_files["production_trajectory"] = production_traj_path
+                        output_files["production_pdb"] = production_pdb_path
+                        output_files["production_log"] = production_log_path
+                        completed_stages.append("production")
+                        emit_progress(100, "MD production completed successfully", completed_stages)
+
+                    results.update({
+                        "status": "success",
+                        "output_files": output_files,
+                        "equilibration_stats": equilibration_stats,
+                        "restart_resume": {
+                            "requested_checkpoint_path": checkpoint_path,
+                            "requested_state_xml_path": (str(resume_state_xml_path).strip() if resume_state_xml_path else None),
+                            "requested_system_xml_path": (bundle_system_xml or None),
+                            "requested_integrator_xml_path": (bundle_integrator_xml or None),
+                            "bundle_context_rebuild_used": bool(bundle_used),
+                            "resume_mode": (
+                                "bundle_checkpoint" if (bundle_used and resume_mode == "checkpoint")
+                                else "bundle_state_xml" if (bundle_used and resume_mode == "state_xml")
+                                else "checkpoint" if resume_mode == "checkpoint"
+                                else "state_xml"
+                            ),
+                        },
+                        "restraint_protocol": {
+                            "production_unrestrained": bool(equilibration_stats.get("production", {}).get("production_unrestrained", True)),
+                            "force_unrestrained_production": bool(force_unrestrained_production),
+                            "allow_restrained_production": bool(allow_restrained_production),
+                            "npt_release_stages": [],
+                            "warnings": equilibration_stats.get("production", {}).get("warnings", []),
+                            "resumed_from_checkpoint": bool(resume_mode == "checkpoint"),
+                            "resumed_from_state_xml": bool(resume_mode == "state_xml"),
+                        },
+                    })
+                    self._cleanup_file_handler(file_handler)
+                    return results
+
+            if bool(production_only_from_prepared):
+                logger.info("Production-only mode enabled: skipping minimization/heating/NVT/NPT.")
+                try:
+                    simulation.minimizeEnergy(maxIterations=500)
+                except Exception as exc:
+                    logger.warning("Production-only pre-stabilization minimization failed: %s", exc)
+                try:
+                    simulation.context.setVelocitiesToTemperature(float(temperature) * unit.kelvin)
+                except Exception:
+                    logger.warning("Could not initialize velocities to target temperature before production-only run.")
+
+                completed_stages = ["preparation", "npt"]
                 equilibration_stats = {
                     "energy_minimization": {
                         "initial_energy": None,
                         "final_energy": None,
                         "energy_change": None,
                     },
-                    "thermal_heating": {"status": "skipped_resume_checkpoint"},
-                    "nvt_equilibration": {"status": "skipped_resume_checkpoint"},
-                    "npt_equilibration": {
-                        "status": "loaded_from_checkpoint",
-                        "checkpoint_path": checkpoint_path,
-                    },
+                    "thermal_heating": {"status": "skipped_production_only"},
+                    "nvt_equilibration": {"status": "skipped_production_only"},
+                    "npt_equilibration": {"status": "skipped_production_only"},
                 }
                 output_files = {
                     "equilibration_log": log_path,
                     "console_log": console_log_path,
-                    "npt_checkpoint": checkpoint_path,
                 }
 
                 if production_steps > 0:
                     prod_progress_start = ranges['production'][0]
                     prod_progress_end = 100
-                    emit_progress(prod_progress_start, "Starting production MD from checkpoint...", completed_stages)
+                    emit_progress(prod_progress_start, "Starting production-only MD...", completed_stages)
                     prod_result = self._run_production(
                         simulation, production_steps, production_report_interval,
                         production_traj_path, production_log_path,
@@ -615,19 +749,27 @@ class EquilibrationRunner:
                     output_files["production_pdb"] = production_pdb_path
                     output_files["production_log"] = production_log_path
                     completed_stages.append("production")
-                    emit_progress(100, "MD production completed successfully", completed_stages)
+                    emit_progress(100, "Production-only MD completed successfully", completed_stages)
 
                 results.update({
                     "status": "success",
                     "output_files": output_files,
                     "equilibration_stats": equilibration_stats,
+                    "restart_resume": {
+                        "requested_checkpoint_path": (str(resume_from_checkpoint_path).strip() if resume_from_checkpoint_path else None),
+                        "requested_state_xml_path": (str(resume_state_xml_path).strip() if resume_state_xml_path else None),
+                        "requested_system_xml_path": (str(resume_system_xml_path).strip() if resume_system_xml_path else None),
+                        "requested_integrator_xml_path": (str(resume_integrator_xml_path).strip() if resume_integrator_xml_path else None),
+                        "bundle_context_rebuild_used": False,
+                        "resume_mode": "coordinate_continuation",
+                    },
                     "restraint_protocol": {
                         "production_unrestrained": bool(equilibration_stats.get("production", {}).get("production_unrestrained", True)),
                         "force_unrestrained_production": bool(force_unrestrained_production),
                         "allow_restrained_production": bool(allow_restrained_production),
                         "npt_release_stages": [],
                         "warnings": equilibration_stats.get("production", {}).get("warnings", []),
-                        "resumed_from_checkpoint": True,
+                        "production_only_from_prepared": True,
                     },
                 })
                 self._cleanup_file_handler(file_handler)
@@ -740,8 +882,18 @@ class EquilibrationRunner:
             # Persist exact post-NPT restart artifacts for downstream production runs.
             simulation.saveCheckpoint(npt_checkpoint_path)
             simulation.saveState(npt_state_xml_path)
+            try:
+                from openmm import XmlSerializer
+                with open(npt_system_xml_path, "w") as sf:
+                    sf.write(XmlSerializer.serialize(simulation.system))
+                with open(npt_integrator_xml_path, "w") as inf:
+                    inf.write(XmlSerializer.serialize(simulation.integrator))
+            except Exception as exc:
+                logger.warning("Failed to write OpenMM serialized bundle (system/integrator): %s", exc)
             output_files["npt_checkpoint"] = npt_checkpoint_path
             output_files["npt_state_xml"] = npt_state_xml_path
+            output_files["npt_system_xml"] = npt_system_xml_path
+            output_files["npt_integrator_xml"] = npt_integrator_xml_path
 
             # Stage 4: Production MD (optional)
             if production_steps > 0:
@@ -772,6 +924,14 @@ class EquilibrationRunner:
                 "status": "success",
                 "output_files": output_files,
                 "equilibration_stats": equilibration_stats,
+                "restart_resume": {
+                    "requested_checkpoint_path": None,
+                    "requested_state_xml_path": None,
+                    "requested_system_xml_path": None,
+                    "requested_integrator_xml_path": None,
+                    "bundle_context_rebuild_used": False,
+                    "resume_mode": "fresh_protocol",
+                },
                 "restraint_protocol": {
                     "production_unrestrained": bool(equilibration_stats.get("production", {}).get("production_unrestrained", True)),
                     "force_unrestrained_production": bool(force_unrestrained_production),

@@ -165,7 +165,9 @@ def _extract_selected_complex_pdb(
                 ]
             )
             if key == selected_ligand_key:
-                lines.append(line)
+                # Canonicalize selected ligand residue name to LIG across prepared structures.
+                # Keep chain/resseq/icode unchanged for traceability.
+                lines.append(line[:17] + f"{'LIG':>3}" + line[20:])
             continue
         if line.startswith(("TER", "MODEL", "ENDMDL", "CRYST1", "HEADER", "TITLE", "REMARK")):
             lines.append(line)
@@ -462,7 +464,7 @@ def render() -> None:
                             st.markdown("- extracted ligand from selected complex")
                             st.markdown("- downloaded/selected reference SMILES for template matching")
                             st.markdown("- assigned bond orders / aromaticity using the reference template")
-                            st.markdown("- wrote raw and refined ligand SDF artifacts")
+                            st.markdown("- wrote generated OpenMM files (raw and refined ligand SDF)")
                             raw_stats = _sdf_quick_summary(raw_sdf)
                             refined_stats = _sdf_quick_summary(refined_sdf)
                             if raw_stats and refined_stats:
@@ -482,7 +484,7 @@ def render() -> None:
                         if artifacts.get("ligand_fix_warning"):
                             st.warning(str(artifacts.get("ligand_fix_warning")))
                     else:
-                        st.info("No 2D preview artifacts generated for this ligand.")
+                        st.info("No generated OpenMM files (2D preview) were produced for this ligand.")
                     if ligand_artifact_error:
                         st.warning(f"Ligand refinement strict-check warning: {ligand_artifact_error}")
                     if fallback_debug:

@@ -26,6 +26,13 @@ from ovo_ligand.app.pages.bound_ligand_md import (
     _write_run_metadata,
     parse_bound_ligands,
 )
+from ovo_ligand.app.pages.common import (
+    acquire_gpu_job_lock,
+    reconcile_run_metadata_status,
+    release_gpu_job_lock,
+    queue_gpu_job,
+    try_dispatch_next_queued_gpu_job,
+)
 
 
 def _steps_to_ns(steps: int | float) -> float:
@@ -41,6 +48,7 @@ def _collect_structure_jobs() -> list[dict]:
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     ):
+        reconcile_run_metadata_status(run_dir)
         metadata = _read_run_metadata(run_dir)
         if not metadata:
             continue
@@ -107,6 +115,7 @@ def _collect_md_system_prep_jobs() -> list[dict]:
 
 
 def render() -> None:
+    try_dispatch_next_queued_gpu_job()
     mode = str(st.session_state.get("md_task_mode", "system_prep") or "system_prep")
     is_production_mode = mode == "production"
     st.title("MD Production" if is_production_mode else "MD System Preparation")
@@ -193,9 +202,12 @@ def render() -> None:
     st.markdown("**3.1 Parameterize & System creation**")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
+        mmgbsa_backend = st.selectbox("MM/GBSA backend", ["openmm_gbsa", "ambertools_mmpbsa"], index=0, help="Selected in system prep and reused by production/recompute.")
         protein_forcefield = st.selectbox("Protein force field", ["amber14-all + tip3p"], index=0, disabled=True)
-        forcefield_method = st.selectbox("Ligand force field", ["openff-2.2.0", "openff-2.1.0", "openff-2.0.0"], index=0)
-        charge_method = st.selectbox("Ligand charge method", ["gasteiger", "mmff94", "am1bcc"], index=0)
+        ligand_ff_options = ["gaff2"] if mmgbsa_backend == "ambertools_mmpbsa" else ["openff-2.2.0", "openff-2.1.0", "openff-2.0.0"]
+        forcefield_method = st.selectbox("Ligand force field", ligand_ff_options, index=0)
+        charge_options = ["am1bcc", "gasteiger", "mmff94"] if mmgbsa_backend == "ambertools_mmpbsa" else ["gasteiger", "mmff94", "am1bcc"]
+        charge_method = st.selectbox("Ligand charge method", charge_options, index=0)
     with col_b:
         box_shape = st.selectbox("Solvent box shape", ["dodecahedron", "cube", "octahedron"], index=0)
         padding_nm = st.number_input("Solvent padding (nm)", min_value=0.1, value=1.0, step=0.1)
@@ -203,6 +215,9 @@ def render() -> None:
         ionic_strength = st.number_input("Ionic strength (M)", min_value=0.0, value=0.15, step=0.05)
         temperature = st.number_input("Target temperature (K)", min_value=1.0, value=300.0, step=1.0)
         pressure = st.number_input("Target pressure (bar)", min_value=0.1, value=1.0, step=0.1)
+
+    if mmgbsa_backend == "ambertools_mmpbsa" and str(forcefield_method).startswith("openff"):
+        st.warning("AmberTools MMPBSA is most robust with Amber-compatible parameterization (e.g., GAFF2 ligand + Amber protein/water).")
 
     st.markdown("**3.2 Minimize**")
     minimization_only = st.toggle("Stop after minimization", value=False)
@@ -430,9 +445,11 @@ def render() -> None:
     if reference_smi_path:
         preview_payload["reference_smiles_path"] = str(reference_smi_path)
     preview_payload["prepared_complex_path"] = str(complex_path)
+    preview_payload["mmgbsa_backend"] = str(mmgbsa_backend)
     st.subheader("4. Run MD production" if is_production_mode else "4. Run MD system preparation")
     if st.button("Run MD production" if is_production_mode else "Run MD system preparation", type="primary"):
         run_id = str(uuid4())
+        lock_ok, lock_info = acquire_gpu_job_lock("bound-ligand-md" if is_production_mode else "md-system-prep", run_id)
         output_dir = (_run_root() / "bound-ligand-md" / run_id) if is_production_mode else (_run_root() / "md-system-prep" / run_id)
         output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -500,6 +517,7 @@ def render() -> None:
         if reference_smi_path:
             input_payload["reference_smiles_path"] = str(reference_smi_path)
         input_payload["prepared_complex_path"] = str(complex_path)
+        input_payload["mmgbsa_backend"] = str(mmgbsa_backend)
         # Persist MD input structure as a file in this run folder and keep input.json lightweight.
         final_input_protein_host = output_dir / "final_input_protein_refined.pdb"
         final_input_protein_host.write_text(protein_pdb_data if protein_pdb_data.endswith("\n") else protein_pdb_data + "\n")
@@ -510,11 +528,22 @@ def render() -> None:
         with st.expander("Docker command", expanded=True):
             st.code(shlex.join(command))
 
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            st.success(f"MD production completed: {run_id}" if is_production_mode else f"MD system preparation completed: {run_id}")
-        else:
-            st.error(f"Workflow failed with exit code {result.returncode}")
+        if not lock_ok:
+            queue_gpu_job(output_dir, "bound-ligand-md" if is_production_mode else "md-system-prep", run_id, command)
+            st.warning(
+                "GPU busy; job queued. "
+                f"Active: {lock_info.get('workflow')} ({lock_info.get('run_id')}). "
+                f"Queued run: {run_id}."
+            )
+            return
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                st.success(f"MD production completed: {run_id}" if is_production_mode else f"MD system preparation completed: {run_id}")
+            else:
+                st.error(f"Workflow failed with exit code {result.returncode}")
+        finally:
+            release_gpu_job_lock(run_id)
         st.code(str(output_dir))
 
         if result_json.exists():

@@ -129,7 +129,7 @@ def render() -> None:
     if raw_sdf and refined_sdf:
         _render_ligand_2d_pair(str(raw_sdf), str(refined_sdf))
     else:
-        st.info("No ligand raw/refined SDF preview artifacts found for this run.")
+        st.info("No generated OpenMM files (raw/refined ligand SDF preview) found for this run.")
 
     st.markdown("#### Refined complex (final)")
     if complex_pdb_data and selected_ligand:

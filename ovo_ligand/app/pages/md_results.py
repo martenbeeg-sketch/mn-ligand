@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 from pathlib import Path
 from statistics import mean, stdev
@@ -31,8 +32,12 @@ def _build_mmgbsa_recompute_command(
     start_pct: float,
     end_pct: float,
     stride: int,
+    backend: str,
 ) -> list[str]:
     command = ["docker", "run", "--rm"]
+    shm_size = os.getenv("OVO_MD_DOCKER_SHM_SIZE", "64g").strip()
+    if shm_size:
+        command += ["--shm-size", shm_size]
     if use_gpu:
         command += ["--gpus", "all"]
     command += [
@@ -59,6 +64,8 @@ def _build_mmgbsa_recompute_command(
         str(end_pct),
         "--stride",
         str(stride),
+        "--backend",
+        str(backend),
     ]
     return command
 
@@ -193,6 +200,7 @@ def _render_mmgbsa_summary_at_end(result_payload: dict, run_dir: Path, metadata:
                 start_pct=start_pct,
                 end_pct=end_pct,
                 stride=stride,
+                backend=str(input_payload.get("mmgbsa_backend", "openmm_gbsa")),
             )
             proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if proc.returncode == 0:
@@ -207,25 +215,36 @@ def _render_mmgbsa_summary_at_end(result_payload: dict, run_dir: Path, metadata:
                 with st.expander("stderr"):
                     st.code(proc.stderr)
 
+    def _render_delta_metrics(delta_payload: dict, title: str) -> None:
+        st.markdown(f"**{title}**")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("ΔG_bind total", f"{float(delta_payload.get('delta_g_bind_total_kj_mol', 0.0)):.3f} kJ/mol")
+        c1.caption(f"{float(delta_payload.get('delta_g_bind_total_kcal_mol', 0.0)):.3f} kcal/mol")
+        c2.metric("ΔMM", f"{float(delta_payload.get('delta_mm_kj_mol', 0.0)):.3f} kJ/mol")
+        c2.caption(f"{float(delta_payload.get('delta_mm_kcal_mol', 0.0)):.3f} kcal/mol")
+        c3.metric("ΔGBSA/PBSA", f"{float(delta_payload.get('delta_gbsa_kj_mol', 0.0)):.3f} kJ/mol")
+        c3.caption(f"{float(delta_payload.get('delta_gbsa_kcal_mol', 0.0)):.3f} kcal/mol")
+        c4.metric("ΔNonpolar", f"{float(delta_payload.get('delta_nonpolar_kj_mol', 0.0)):.3f} kJ/mol")
+        c4.caption(f"{float(delta_payload.get('delta_nonpolar_kcal_mol', 0.0)):.3f} kcal/mol")
+
     mmgbsa = result_payload.get("mmgbsa") or {}
     status = str(mmgbsa.get("status") or "unknown")
     if status == "success":
-        delta = mmgbsa.get("delta") or {}
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("ΔG_bind total", f"{float(delta.get('delta_g_bind_total_kj_mol', 0.0)):.3f} kJ/mol")
-        c1.caption(f"{float(delta.get('delta_g_bind_total_kcal_mol', 0.0)):.3f} kcal/mol")
-        c2.metric("ΔMM", f"{float(delta.get('delta_mm_kj_mol', 0.0)):.3f} kJ/mol")
-        c2.caption(f"{float(delta.get('delta_mm_kcal_mol', 0.0)):.3f} kcal/mol")
-        c3.metric("ΔGBSA", f"{float(delta.get('delta_gbsa_kj_mol', 0.0)):.3f} kJ/mol")
-        c3.caption(f"{float(delta.get('delta_gbsa_kcal_mol', 0.0)):.3f} kcal/mol")
-        c4.metric("ΔNonpolar", f"{float(delta.get('delta_nonpolar_kj_mol', 0.0)):.3f} kJ/mol")
-        c4.caption(f"{float(delta.get('delta_nonpolar_kcal_mol', 0.0)):.3f} kcal/mol")
+        gb_block = mmgbsa.get("gb") or {}
+        pb_block = mmgbsa.get("pb") or {}
+        if gb_block.get("delta"):
+            _render_delta_metrics(gb_block.get("delta") or {}, "MM/GBSA (GB)")
+        if pb_block.get("delta"):
+            _render_delta_metrics(pb_block.get("delta") or {}, "MM/PBSA (PB)")
+        if not gb_block.get("delta") and not pb_block.get("delta"):
+            delta = mmgbsa.get("delta") or {}
+            _render_delta_metrics(delta, "MM/GBSA")
         st.caption(f"Method: {mmgbsa.get('method', '-')}")
         st.caption(f"Trajectory: {mmgbsa.get('trajectory_path', '-')}")
         st.caption(f"Topology: {mmgbsa.get('topology_path', '-')}")
         artifacts = mmgbsa.get("artifacts") or {}
         if artifacts:
-            st.markdown("**Artifacts**")
+            st.markdown("**Generated Amber files**")
             st.table([{"name": k, "path": v} for k, v in artifacts.items()])
     elif status == "failed":
         st.error(f"MM/GBSA failed: {mmgbsa.get('error', 'Unknown error')}")

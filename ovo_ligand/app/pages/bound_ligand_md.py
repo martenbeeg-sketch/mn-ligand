@@ -19,6 +19,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from ovo_ligand.app.pages.common import (
+    acquire_gpu_job_lock,
+    release_gpu_job_lock,
+    queue_gpu_job,
+    try_dispatch_next_queued_gpu_job,
+)
 from ovo_ligand.app.components.molstar_viewer import (
     ChainVisualization,
     StructureVisualization,
@@ -171,6 +177,9 @@ def _build_command(
     use_gpu: bool,
 ) -> list[str]:
     command = ["docker", "run", "--rm"]
+    shm_size = os.getenv("OVO_MD_DOCKER_SHM_SIZE", "64g").strip()
+    if shm_size:
+        command += ["--shm-size", shm_size]
     if use_gpu:
         command += ["--gpus", "all"]
     command += [
@@ -201,6 +210,9 @@ def _build_prepare_command(
     use_gpu: bool,
 ) -> list[str]:
     command = ["docker", "run", "--rm"]
+    shm_size = os.getenv("OVO_MD_DOCKER_SHM_SIZE", "64g").strip()
+    if shm_size:
+        command += ["--shm-size", shm_size]
     if use_gpu:
         command += ["--gpus", "all"]
     command += [
@@ -1809,6 +1821,7 @@ def _render_run_construction(
 
 
 def render() -> None:
+    try_dispatch_next_queued_gpu_job()
     now_milan = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M %Z")
     with st.sidebar:
         st.markdown("### App Status")
@@ -2029,6 +2042,7 @@ def render() -> None:
     rendered_results = False
     if st.button("Run bound ligand MD", type="primary", disabled=disabled):
         run_id = str(uuid4())
+        lock_ok, lock_info = acquire_gpu_job_lock("bound-ligand-md", run_id)
         output_dir = _run_root() / "bound-ligand-md" / run_id
         output_dir.mkdir(parents=True, exist_ok=False)
         ligand_source = _current_ligand_source()
@@ -2070,11 +2084,23 @@ def render() -> None:
         with st.expander("Docker command", expanded=True):
             st.code(shlex.join(command))
 
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            st.success(f"Workflow completed: {run_id}")
-        else:
-            st.error(f"Workflow failed with exit code {result.returncode}")
+        if not lock_ok:
+            queue_gpu_job(output_dir, "bound-ligand-md", run_id, command)
+            st.warning(
+                "GPU busy; job queued. "
+                f"Active: {lock_info.get('workflow')} ({lock_info.get('run_id')}). "
+                f"Queued run: {run_id}."
+            )
+            return
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                st.success(f"Workflow completed: {run_id}")
+            else:
+                st.error(f"Workflow failed with exit code {result.returncode}")
+        finally:
+            release_gpu_job_lock(run_id)
         st.write("Output directory")
         st.code(str(output_dir))
         if result_json.exists():

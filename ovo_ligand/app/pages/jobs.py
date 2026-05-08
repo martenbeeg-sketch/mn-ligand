@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from ovo_ligand.app.pages.bound_ligand_md import _run_root, _short_job_code
+from ovo_ligand.app.pages.common import reconcile_run_metadata_status
 
 
 def _read_json(path: Path) -> dict:
@@ -46,6 +47,7 @@ def _collect_bound_md_runs() -> list[dict]:
     runs_root.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
     for run_dir in sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+        reconcile_run_metadata_status(run_dir)
         metadata_path = run_dir / "metadata.json"
         result_path = run_dir / "result.json"
         metadata = _read_json(metadata_path) if metadata_path.exists() else {}
@@ -86,6 +88,7 @@ def _collect_md_system_prep_runs() -> list[dict]:
     runs_root.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
     for run_dir in sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+        reconcile_run_metadata_status(run_dir)
         metadata_path = run_dir / "metadata.json"
         result_path = run_dir / "result.json"
         input_path = run_dir / "input.json"

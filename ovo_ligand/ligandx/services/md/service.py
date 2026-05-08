@@ -439,13 +439,14 @@ class MDOptimizationService:
             # Step 1: Environment validation
             self._validate_environment()
 
-            # Step 2: Ligand preparation (skipped in protein-only mode)
-            if not config.is_protein_only:
+            # Step 2: Ligand preparation (skipped in protein-only mode and amber-native mode)
+            amber_native = str(getattr(config, "md_backend", "openmm_openff")).strip().lower() == "amber_native"
+            if not config.is_protein_only and not amber_native:
                 prepared_ligand = self._prepare_ligand(config)
                 if not prepared_ligand:
                     return {"status": "error", "error": f"Ligand preparation failed for {config.ligand_id}"}
             else:
-                logger.info("=== STEP 2: SKIPPED (protein-only mode) ===")
+                logger.info("=== STEP 2: SKIPPED (protein-only or amber-native mode) ===")
             
             # Step 3 & 4: Protein preparation and System creation
             prepared_protein_path, system_result = self._prepare_and_create_system(config)
@@ -517,6 +518,19 @@ class MDOptimizationService:
     
     def _prepare_and_create_system(self, config: MDOptimizationConfig) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Prepare protein and create solvated system."""
+        if str(getattr(config, "md_backend", "openmm_openff")).strip().lower() == "amber_native":
+            logger.info("=== AMBER-NATIVE MODE: BUILDING SIMULATION FROM PRMTOP/INPCRD ===")
+            amber_result = self._create_system_from_amber_artifacts(config)
+            valid, error = validate_system_result(amber_result)
+            if not valid:
+                raise RuntimeError(error)
+            prepared_protein_path = str(
+                getattr(config, "amber_system_pdb_path", None)
+                or getattr(config, "resume_system_pdb_path", None)
+                or ""
+            )
+            return prepared_protein_path, amber_result
+
         # Checkpoint-resume path: rebuild simulation directly from original system PDB,
         # bypassing protein cleanup on NPT/final snapshots.
         if getattr(config, "resume_from_checkpoint_path", None):
@@ -616,6 +630,88 @@ class MDOptimizationService:
             raise RuntimeError(error)
 
         return prepared_protein_path, system_result
+
+    def _create_system_from_amber_artifacts(self, config: MDOptimizationConfig) -> Dict[str, Any]:
+        from openmm import LangevinMiddleIntegrator, MonteCarloBarostat, unit
+        from openmm.app import AmberPrmtopFile, AmberInpcrdFile, HBonds, PME, CutoffNonPeriodic, PDBFile
+
+        def _resolve(path_value: Optional[str]) -> Optional[str]:
+            p = str(path_value or "").strip()
+            if not p:
+                return None
+            if os.path.exists(p):
+                return p
+            marker = "ovo-ligand/"
+            if marker in p:
+                mapped = os.path.join("/ovo-ligand", p.split(marker, 1)[1])
+                if os.path.exists(mapped):
+                    return mapped
+            if p.startswith("/output/"):
+                mapped = os.path.join(self.output_dir, p.removeprefix("/output/"))
+                if os.path.exists(mapped):
+                    return mapped
+            return None
+
+        prmtop_path = _resolve(getattr(config, "amber_complex_prmtop_path", None))
+        inpcrd_path = _resolve(getattr(config, "amber_complex_inpcrd_path", None))
+        if not prmtop_path or not inpcrd_path:
+            return {
+                "status": "error",
+                "error": (
+                    "Amber-native backend requires readable amber_complex_prmtop_path and "
+                    "amber_complex_inpcrd_path."
+                ),
+            }
+
+        prmtop = AmberPrmtopFile(prmtop_path)
+        inpcrd = AmberInpcrdFile(inpcrd_path)
+        periodic = inpcrd.boxVectors is not None
+        openmm_system = prmtop.createSystem(
+            nonbondedMethod=(PME if periodic else CutoffNonPeriodic),
+            nonbondedCutoff=1.0 * unit.nanometer,
+            constraints=HBonds,
+            rigidWater=True,
+        )
+        if periodic:
+            openmm_system.addForce(
+                MonteCarloBarostat(
+                    float(config.pressure) * unit.bar,
+                    float(config.temperature) * unit.kelvin,
+                    25,
+                )
+            )
+        integrator = LangevinMiddleIntegrator(
+            float(config.temperature) * unit.kelvin,
+            1.0 / unit.picosecond,
+            0.004 * unit.picoseconds,
+        )
+        simulation, platform_name = self.solvated_system_builder._create_simulation_with_fallback(
+            prmtop.topology, openmm_system, integrator
+        )
+        simulation.context.setPositions(inpcrd.positions)
+        if inpcrd.boxVectors is not None:
+            simulation.context.setPeriodicBoxVectors(*inpcrd.boxVectors)
+
+        system_pdb_path = _resolve(getattr(config, "amber_system_pdb_path", None))
+        if not system_pdb_path:
+            system_pdb_path = os.path.join(self.output_dir, f"{config.system_id}_amber_system.pdb")
+            with open(system_pdb_path, "w") as handle:
+                PDBFile.writeFile(prmtop.topology, inpcrd.positions, handle, keepIds=True)
+
+        return {
+            "status": "success",
+            "simulation": simulation,
+            "platform": platform_name,
+            "total_atoms": prmtop.topology.getNumAtoms(),
+            "system_pdb_path": system_pdb_path,
+            "system_info": {
+                "total_atoms": prmtop.topology.getNumAtoms(),
+                "residues": prmtop.topology.getNumResidues(),
+                "chains": prmtop.topology.getNumChains(),
+                "source": "amber_prmtop_inpcrd",
+                "periodic": bool(periodic),
+            },
+        }
     
     def _get_prepared_ligand(self, config: MDOptimizationConfig) -> Any:
         """Get prepared ligand, using cached result from _prepare_ligand() if available."""
@@ -675,6 +771,10 @@ class MDOptimizationService:
             allow_restrained_production=getattr(config, "allow_restrained_production", False),
             force_unrestrained_production=getattr(config, "force_unrestrained_production", True),
             resume_from_checkpoint_path=getattr(config, "resume_from_checkpoint_path", None),
+            resume_state_xml_path=getattr(config, "resume_state_xml_path", None),
+            resume_system_xml_path=getattr(config, "resume_system_xml_path", None),
+            resume_integrator_xml_path=getattr(config, "resume_integrator_xml_path", None),
+            production_only_from_prepared=bool(getattr(config, "production_only_from_prepared", False)),
             temperature=config.temperature,
             pressure=config.pressure
         )

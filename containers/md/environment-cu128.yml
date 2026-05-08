@@ -42,6 +42,9 @@ dependencies:
   - pdbfixer
   - mdtraj
   - mdanalysis
+  - ambertools
+  - openmpi
+  - mpi4py
   - openff-toolkit
   - openff-interchange
   
@@ -65,4 +68,3 @@ dependencies:
     # Task queue (for worker-gpu)
     - celery>=5.3.0
     - redis>=5.0.0
-

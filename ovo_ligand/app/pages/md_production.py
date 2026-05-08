@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -23,6 +24,12 @@ from ovo_ligand.app.pages.bound_ligand_md import (
     _write_run_metadata,
     parse_bound_ligands,
     _parse_protein_chains,
+)
+from ovo_ligand.app.pages.common import (
+    acquire_gpu_job_lock,
+    release_gpu_job_lock,
+    queue_gpu_job,
+    try_dispatch_next_queued_gpu_job,
 )
 from ovo_ligand.app.pages.md import _collect_md_system_prep_jobs
 
@@ -55,6 +62,7 @@ def _host_path_to_container_path(path: Path | None) -> str:
 
 
 def render() -> None:
+    try_dispatch_next_queued_gpu_job()
     st.title("MD Production")
     st.caption("MD Production UI revision: 2026-05-07-preset-fix-r4")
     st.caption("Select a prepared MD system, review the carried-over system parameters, inspect the exact structure, then run production.")
@@ -118,6 +126,18 @@ def render() -> None:
     npt_checkpoint_path = Path(npt_checkpoint_str) if npt_checkpoint_str else None
     if npt_checkpoint_path and not npt_checkpoint_path.exists():
         npt_checkpoint_path = None
+    npt_state_xml_str = str(output_files.get("npt_state_xml") or "").strip()
+    npt_state_xml_path = Path(npt_state_xml_str) if npt_state_xml_str else None
+    if npt_state_xml_path and not npt_state_xml_path.exists():
+        npt_state_xml_path = None
+    npt_system_xml_str = str(output_files.get("npt_system_xml") or "").strip()
+    npt_system_xml_path = Path(npt_system_xml_str) if npt_system_xml_str else None
+    if npt_system_xml_path and not npt_system_xml_path.exists():
+        npt_system_xml_path = None
+    npt_integrator_xml_str = str(output_files.get("npt_integrator_xml") or "").strip()
+    npt_integrator_xml_path = Path(npt_integrator_xml_str) if npt_integrator_xml_str else None
+    if npt_integrator_xml_path and not npt_integrator_xml_path.exists():
+        npt_integrator_xml_path = None
     restart_mode = st.selectbox(
         "Restart mode",
         options=["Checkpoint (exact continuation)", "NPT-final PDB (coordinate restart)"],
@@ -218,27 +238,29 @@ def render() -> None:
             {"parameter": "Pressure (bar)", "value": str(prep_input.get("pressure", 1.0))},
         ]
     )
-    st.caption("Production input mapping")
-    st.table(
-        [
-            {
-                "role": "Production start coordinates (required)",
-                "file": str(production_start_path),
-            },
-            {
-                "role": "Production restart checkpoint",
-                "file": str(npt_checkpoint_path) if npt_checkpoint_path else "not available",
-            },
-            {
-                "role": "Checkpoint rebuild system PDB",
-                "file": str(prep_system_pdb_path) if prep_system_pdb_path else "not available",
-            },
-            {"role": "Restart mode", "file": restart_mode},
-            {"role": "Production ligand chemistry", "file": str(refined_sdf_path) if refined_sdf_path else "not available"},
-            {"role": "Reference SMILES (optional)", "file": str(reference_smi_path) if reference_smi_path else "not available"},
-            {"role": "Combined runtime protein file in run dir", "file": "final_input_protein_refined.pdb -> /output/final_input_protein_refined.pdb"},
-        ]
+    mm_backend = str(prep_input.get("mmgbsa_backend") or "openmm_gbsa")
+    amber_complex_prmtop = str(output_files.get("amber_complex_prmtop") or "").strip()
+    amber_complex_inpcrd = str(output_files.get("amber_complex_inpcrd") or "").strip()
+    amber_runtime_ready = bool(
+        mm_backend == "ambertools_mmpbsa"
+        and amber_complex_prmtop
+        and amber_complex_inpcrd
+        and Path(amber_complex_prmtop).exists()
+        and Path(amber_complex_inpcrd).exists()
     )
+    st.markdown("**Runtime Topology Mode**")
+    if amber_runtime_ready:
+        st.success("Amber-native runtime selected: production will use prepared Amber topology files.")
+        st.caption(f"Amber `complex.prmtop`: `{amber_complex_prmtop}`")
+        st.caption(f"Amber `complex.inpcrd`: `{amber_complex_inpcrd}`")
+    elif mm_backend == "ambertools_mmpbsa":
+        st.warning(
+            "Amber MM/GBSA backend is selected, but Amber runtime topology files are missing. "
+            "Production will fall back to OpenMM/PDB runtime."
+        )
+    else:
+        st.info("OpenMM runtime selected: production will use the OpenMM/PDB workflow.")
+    st.caption(f"Restart mode: `{restart_mode}`")
 
     st.subheader("3. Structure used for production")
     st.caption("This preview is built from the production-start coordinates file above (selected chain scope + selected ligand).")
@@ -300,6 +322,7 @@ def render() -> None:
         f"Temperature and pressure are inherited from system preparation: "
         f"{prep_input.get('temperature_k', 300.0)} K, {prep_input.get('pressure', 1.0)} bar."
     )
+    st.caption(f"MM/GBSA backend from prepared system: `{mm_backend}`")
     st.markdown("**MM/GBSA at end of run**")
     mmgbsa_enabled = st.checkbox("Run MM/GBSA after MD production", value=True)
     mmc1, mmc2, mmc3 = st.columns(3)
@@ -343,6 +366,7 @@ def render() -> None:
         repeat_group_id = str(uuid4())
         for repeat_idx in range(repeat_count):
             run_id = str(uuid4())
+            lock_ok, lock_info = acquire_gpu_job_lock("bound-ligand-md", run_id)
             output_dir = _run_root() / "bound-ligand-md" / run_id
             output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -351,7 +375,7 @@ def render() -> None:
                 {
                     "created_at": _utc_now_iso(),
                     "workflow": "bound-ligand-md",
-                    "status": "running",
+                    "status": "running" if lock_ok else "queued",
                     "ligand_source": selected_job.get("source") or "unknown",
                     "structure_run_id": selected_job.get("structure_run_id") or "",
                     "md_system_prep_run_id": selected_job["run_id"],
@@ -396,23 +420,39 @@ def render() -> None:
             input_payload["source_md_system_prep_result_json"] = str(prep_result_json)
             input_payload["restart_mode"] = restart_mode
             input_payload["mmgbsa_enabled"] = bool(mmgbsa_enabled)
+            input_payload["mmgbsa_backend"] = str(mm_backend)
             input_payload["mmgbsa_start_pct"] = int(mmgbsa_start_pct)
             input_payload["mmgbsa_end_pct"] = int(mmgbsa_end_pct)
             input_payload["mmgbsa_stride"] = int(mmgbsa_stride)
+            input_payload["mmpbsa_use_mpi"] = bool(mm_backend == "ambertools_mmpbsa")
+            cpu_default = max(1, min(32, int(os.cpu_count() or 8)))
+            input_payload["mmpbsa_mpi_cores"] = int(cpu_default)
             input_payload["repeat_group_id"] = repeat_group_id
             input_payload["repeat_index"] = repeat_idx + 1
             input_payload["repeat_total"] = repeat_count
             input_payload["restart_contract"] = {
                 "npt_pdb": str(npt_final_path) if npt_final_path else None,
                 "npt_checkpoint": str(npt_checkpoint_path) if npt_checkpoint_path else None,
+                "npt_state_xml": str(npt_state_xml_path) if npt_state_xml_path else None,
+                "npt_system_xml": str(npt_system_xml_path) if npt_system_xml_path else None,
+                "npt_integrator_xml": str(npt_integrator_xml_path) if npt_integrator_xml_path else None,
                 "system_pdb": str(prep_system_pdb_path) if prep_system_pdb_path else None,
             }
             if use_checkpoint_restart and npt_checkpoint_path:
                 input_payload["resume_from_checkpoint_path"] = _host_path_to_container_path(npt_checkpoint_path)
                 input_payload["resume_system_pdb_path"] = _host_path_to_container_path(prep_system_pdb_path)
+                if npt_state_xml_path:
+                    input_payload["resume_state_xml_path"] = _host_path_to_container_path(npt_state_xml_path)
+                if npt_system_xml_path:
+                    input_payload["resume_system_xml_path"] = _host_path_to_container_path(npt_system_xml_path)
+                if npt_integrator_xml_path:
+                    input_payload["resume_integrator_xml_path"] = _host_path_to_container_path(npt_integrator_xml_path)
             else:
                 input_payload.pop("resume_from_checkpoint_path", None)
                 input_payload.pop("resume_system_pdb_path", None)
+                input_payload.pop("resume_state_xml_path", None)
+                input_payload.pop("resume_system_xml_path", None)
+                input_payload.pop("resume_integrator_xml_path", None)
 
             if refined_sdf_data:
                 input_payload["ligand_refined_sdf_data"] = refined_sdf_data
@@ -436,11 +476,22 @@ def render() -> None:
             with st.expander(f"Docker command (repeat {repeat_idx + 1}/{repeat_count})", expanded=(repeat_idx == 0)):
                 st.code(shlex.join(command))
 
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-            if result.returncode == 0:
-                st.success(f"MD production completed: {run_id} (repeat {repeat_idx + 1}/{repeat_count})")
-            else:
-                st.error(f"Workflow failed with exit code {result.returncode} for repeat {repeat_idx + 1}/{repeat_count}")
+            if not lock_ok:
+                queue_gpu_job(output_dir, "bound-ligand-md", run_id, command)
+                st.warning(
+                    "GPU busy; job queued. "
+                    f"Active: {lock_info.get('workflow')} ({lock_info.get('run_id')}). "
+                    f"Queued run: {run_id}."
+                )
+                continue
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    st.success(f"MD production completed: {run_id} (repeat {repeat_idx + 1}/{repeat_count})")
+                else:
+                    st.error(f"Workflow failed with exit code {result.returncode} for repeat {repeat_idx + 1}/{repeat_count}")
+            finally:
+                release_gpu_job_lock(run_id)
             st.code(str(output_dir))
 
             if result_json.exists():
