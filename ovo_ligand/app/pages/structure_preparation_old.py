@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 import streamlit as st
-import streamlit.components.v1 as components
 
 from ovo_ligand.app.pages.common import _input_root
 from ovo_ligand.app.pages.bound_ligand_md import (
@@ -128,108 +127,6 @@ def _render_ligand_2d_pair(raw_sdf_path: str, refined_sdf_path: str) -> None:
         st.image(Draw.MolToImage(refined_2d, size=(520, 360)))
 
 
-def _render_py3dmol_complex_preview(
-    pdb_data: str,
-    ligand_resname: str = "LIG",
-    ligand_sdf_path: str | None = None,
-    center: tuple[float, float, float] | None = None,
-    size: tuple[float, float, float] | None = None,
-) -> None:
-    import py3Dmol
-
-    ligand_resnames: set[str] = set()
-    for line in pdb_data.splitlines():
-        if not line.startswith("HETATM") or len(line) < 20:
-            continue
-        resn = line[17:20].strip().upper()
-        if not resn or resn in {"HOH", "WAT"}:
-            continue
-        ligand_resnames.add(resn)
-    if not ligand_resnames and ligand_resname:
-        ligand_resnames.add(str(ligand_resname).upper())
-
-    view = py3Dmol.view(width=1200, height=560)
-    view.addModel(pdb_data, "pdb")
-    # MN-docking style defaults.
-    view.setStyle({"cartoon": {"color": "#9ec9f5", "opacity": 0.95}})
-    view.setStyle({"resn": "HOH"}, {"line": {"hidden": True}})
-    view.addStyle({"hetflag": True}, {"stick": {"colorscheme": "magentaCarbon", "radius": 0.16}})
-    for resn in sorted(ligand_resnames):
-        view.addStyle({"resn": resn}, {"stick": {"colorscheme": "cyanCarbon", "radius": 0.22}})
-        view.addStyle({"resn": resn}, {"sphere": {"scale": 0.18, "colorscheme": "cyanCarbon"}})
-
-    # Robust ligand visibility: add the prepared ligand SDF as its own model.
-    if ligand_sdf_path:
-        try:
-            ligand_sdf = Path(str(ligand_sdf_path))
-            if ligand_sdf.exists():
-                sdf_block = ligand_sdf.read_text()
-                if sdf_block.strip():
-                    view.addModel(sdf_block, "sdf")
-                    # Last model is the explicit ligand model.
-                    view.setStyle(
-                        {"model": -1},
-                        {"stick": {"colorscheme": "cyanCarbon", "radius": 0.22},
-                         "sphere": {"scale": 0.18, "colorscheme": "cyanCarbon"}},
-                    )
-        except Exception:
-            pass
-
-    if center is not None and size is not None:
-        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
-        sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
-        hx, hy, hz = sx / 2.0, sy / 2.0, sz / 2.0
-        corners = [
-            (cx - hx, cy - hy, cz - hz),
-            (cx + hx, cy - hy, cz - hz),
-            (cx + hx, cy + hy, cz - hz),
-            (cx - hx, cy + hy, cz - hz),
-            (cx - hx, cy - hy, cz + hz),
-            (cx + hx, cy - hy, cz + hz),
-            (cx + hx, cy + hy, cz + hz),
-            (cx - hx, cy + hy, cz + hz),
-        ]
-        edges = [
-            (0, 1), (1, 2), (2, 3), (3, 0),
-            (4, 5), (5, 6), (6, 7), (7, 4),
-            (0, 4), (1, 5), (2, 6), (3, 7),
-        ]
-        for x, y, z in corners:
-            view.addSphere(
-                {
-                    "center": {"x": x, "y": y, "z": z},
-                    "radius": 0.45,
-                    "color": "#d9f2ff",
-                    "opacity": 0.95,
-                }
-            )
-        for i0, i1 in edges:
-            p0 = corners[i0]
-            p1 = corners[i1]
-            view.addCylinder(
-                {
-                    "start": {"x": p0[0], "y": p0[1], "z": p0[2]},
-                    "end": {"x": p1[0], "y": p1[1], "z": p1[2]},
-                    "radius": 0.10,
-                    "color": "#22d3ee",
-                    "fromCap": 1,
-                    "toCap": 1,
-                }
-            )
-        view.addLabel(
-            f"Box center: {cx:.2f}, {cy:.2f}, {cz:.2f}",
-            {
-                "position": {"x": cx, "y": cy, "z": cz},
-                "fontSize": 11,
-                "backgroundColor": "#ffffff",
-                "backgroundOpacity": 0.6,
-                "fontColor": "#111827",
-            },
-        )
-    view.zoomTo()
-    components.html(view._make_html(), height=580, scrolling=False)
-
-
 def _sdf_quick_summary(sdf_path: str) -> dict:
     try:
         from rdkit import Chem
@@ -318,107 +215,6 @@ def _infer_center_from_sdf(sdf_path: Path) -> tuple[float, float, float] | None:
         return None
 
 
-def _pdb_atom_identity(line: str) -> dict:
-    """Return a compact identity record for a PDB ATOM/HETATM line."""
-    return {
-        "atom_name": line[12:16].strip(),
-        "resname": line[17:20].strip(),
-        "chain": line[21].strip() or "_",
-        "resseq": line[22:26].strip(),
-        "icode": line[26].strip() or "_",
-        "serial": line[6:11].strip(),
-    }
-
-
-def _remove_terminal_oxt_atoms(pdb_data: str) -> tuple[str, list[str]]:
-    """Remove terminal OXT atoms from a PDB block.
-
-    PDBFixer/OpenMM may emit terminal OXT atoms. In some prepared receptors,
-    RDKit/Meeko infers an impossible proximity bond to OXT, for example
-    CA-OXT, producing valence errors such as `C, 5, is greater than permitted`.
-    This repair is applied only after the original receptor fails RDKit
-    validation in `_prepare_receptor_pdb_for_meeko`.
-    """
-    kept: list[str] = []
-    removed: list[str] = []
-
-    for line in pdb_data.splitlines():
-        if line.startswith(("ATOM", "HETATM")) and line[12:16].strip() == "OXT":
-            removed.append(line)
-            continue
-        kept.append(line)
-
-    return "\n".join(kept) + "\n", removed
-
-
-def _rdkit_validate_pdb_for_meeko(pdb_data: str) -> tuple[bool, str]:
-    """Validate a receptor PDB with RDKit in the same failure mode Meeko hits.
-
-    Meeko converts ProDy atoms to RDKit molecules and sanitizes them. Using
-    `proximityBonding=True` here catches distance-inferred overbonding before
-    `mk_prepare_receptor.py` is called.
-    """
-    try:
-        from rdkit import Chem
-
-        mol = Chem.MolFromPDBBlock(
-            pdb_data,
-            sanitize=False,
-            removeHs=False,
-            proximityBonding=True,
-        )
-        if mol is None:
-            return False, "RDKit could not parse receptor PDB"
-
-        Chem.SanitizeMol(mol)
-        return True, "OK"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-
-def _prepare_receptor_pdb_for_meeko(pdb_data: str) -> tuple[str, dict]:
-    """Return a Meeko-safe receptor PDB plus a repair report.
-
-    Policy:
-    1. Validate the original receptor with RDKit.
-    2. If validation fails, remove terminal OXT atoms.
-    3. Validate again.
-    4. Return the repaired PDB and a JSON-serializable report.
-
-    This keeps normal receptors unchanged while automatically fixing the known
-    PDBFixer/OpenMM terminal OXT case observed for 4LNW ASP A 263.
-    """
-    report = {
-        "original_valid": False,
-        "final_valid": False,
-        "original_error": "",
-        "final_error": "",
-        "removed_oxt_count": 0,
-        "removed_oxt_atoms": [],
-        "repair_applied": False,
-    }
-
-    original = pdb_data if pdb_data.endswith("\n") else pdb_data + "\n"
-    ok, msg = _rdkit_validate_pdb_for_meeko(original)
-    report["original_valid"] = bool(ok)
-    report["original_error"] = "" if ok else msg
-
-    if ok:
-        report["final_valid"] = True
-        return original, report
-
-    cleaned, removed_oxt = _remove_terminal_oxt_atoms(original)
-    report["removed_oxt_count"] = len(removed_oxt)
-    report["removed_oxt_atoms"] = [_pdb_atom_identity(line) for line in removed_oxt]
-    report["repair_applied"] = bool(removed_oxt)
-
-    ok2, msg2 = _rdkit_validate_pdb_for_meeko(cleaned)
-    report["final_valid"] = bool(ok2)
-    report["final_error"] = "" if ok2 else msg2
-
-    return cleaned, report
-
-
 def _collect_refined_structure_jobs() -> list[dict]:
     runs_root = _run_root() / "structure-jobs"
     runs_root.mkdir(parents=True, exist_ok=True)
@@ -452,16 +248,6 @@ def _collect_refined_structure_jobs() -> list[dict]:
     return rows
 
 
-def _split_ligand_id_and_smiles(value: str, fallback_ligand_id: str = "LIG") -> tuple[str, str]:
-    raw = str(value or "").strip()
-    if not raw:
-        return fallback_ligand_id, ""
-    if "," in raw:
-        left, right = raw.split(",", 1)
-        return (left.strip() or fallback_ligand_id), right.strip()
-    return fallback_ligand_id, raw
-
-
 RE_VINA = re.compile(r"REMARK VINA RESULT:\s*(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)")
 
 
@@ -484,23 +270,16 @@ def _run_udp_redocking_from_prepared_structure(
     structure_job_code: str,
     pdb_id: str,
     ligand_key: str,
-    ligand_id: str,
     protein_pdb: Path,
     ligand_sdf: Path,
     ligand_smiles: str,
     center: tuple[float, float, float],
     size: tuple[float, float, float],
-    docking_mode: str,
-    search_mode: str,
-    use_scrub: bool,
-    scrub_ph: float,
-    scrub_skip_tautomer: bool,
-    extra_udp_args: str = "",
+    exhaustiveness: int,
     docker_image: str = "avgu-docking-suite-cuda:latest",
 ) -> dict:
     run_id = str(uuid4())
-    # Docking run itself is a structure job folder so downstream MD/FEP can consume it directly.
-    run_dir = _run_root() / "structure-jobs" / run_id
+    run_dir = _run_root() / "structure-jobs" / structure_run_id / "docking_runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     work_dir = run_dir / "work"
     input_dir = work_dir / "input"
@@ -512,22 +291,8 @@ def _run_udp_redocking_from_prepared_structure(
 
     protein_local = input_dir / protein_pdb.name
     ligand_local = input_dir / ligand_sdf.name
-
-    # Validate/repair receptor before Meeko. PDBFixer/OpenMM can emit terminal
-    # OXT atoms that RDKit/Meeko may overbond by proximity, causing valence
-    # errors during `mk_prepare_receptor.py`.
-    protein_text = protein_pdb.read_text()
-    protein_text_for_meeko, receptor_repair_report = _prepare_receptor_pdb_for_meeko(protein_text)
-    protein_local.write_text(protein_text_for_meeko)
+    protein_local.write_bytes(protein_pdb.read_bytes())
     ligand_local.write_bytes(ligand_sdf.read_bytes())
-
-    receptor_repair_report_path = input_dir / "receptor_meeko_repair_report.json"
-    receptor_repair_report_path.write_text(json.dumps(receptor_repair_report, indent=2))
-    if not receptor_repair_report.get("final_valid"):
-        raise RuntimeError(
-            "Prepared receptor is still not RDKit/Meeko-safe after automatic repair: "
-            + str(receptor_repair_report.get("final_error") or receptor_repair_report.get("original_error") or "unknown error")
-        )
 
     ligand_smiles_path = input_dir / "ligand_input.smi"
     ligand_smiles_path.write_text((ligand_smiles.strip() + "\n") if ligand_smiles.strip() else "\n")
@@ -544,50 +309,22 @@ def _run_udp_redocking_from_prepared_structure(
             f"size_x = {float(size[0]):.3f}\n"
             f"size_y = {float(size[1]):.3f}\n"
             f"size_z = {float(size[2]):.3f}\n"
+            f"exhaustiveness = {int(exhaustiveness)}\n"
         )
     )
     ligand_index.write_text("prepared/ligand.pdbqt\n")
-    safe_search_mode = str(search_mode or "detail").strip().lower()
-    if safe_search_mode not in {"fast", "balance", "detail"}:
-        safe_search_mode = "detail"
-    safe_docking_mode = str(docking_mode or "classic").strip().lower()
-    if safe_docking_mode not in {"classic", "hybrid"}:
-        safe_docking_mode = "classic"
-    safe_scrub_ph = float(scrub_ph)
-    safe_scrub_skip_tautomer = bool(scrub_skip_tautomer)
-    udp_extra_cli = str(extra_udp_args or "").strip()
-    reference_arg = "--reference_ligand prepared/ligand.pdbqt " if safe_docking_mode == "hybrid" else ""
-    ligand_prepare_cmd = (
-        "mk_prepare_ligand.py -i input/" + shlex.quote(ligand_local.name) + " -o prepared/ligand.pdbqt; "
-    )
-    if bool(use_scrub):
-        scrub_flag = " --skip_tautomer" if safe_scrub_skip_tautomer else ""
-        ligand_prepare_cmd = (
-            "scrub.py input/" + shlex.quote(ligand_local.name)
-            + " -o prepared/ligand_scrubbed.sdf"
-            + f" --ph {safe_scrub_ph:.2f}"
-            + scrub_flag
-            + "; "
-            + "mk_prepare_ligand.py -i prepared/ligand_scrubbed.sdf -o prepared/ligand.pdbqt; "
-        )
 
     shell_cmd = (
         "set -euo pipefail; "
-        + "cd /workspace/work; "
-        + "mk_prepare_receptor.py -i input/" + shlex.quote(protein_local.name) + " -o prepared/receptor -p; "
-        + ligand_prepare_cmd
-        + "udp --receptor prepared/receptor.pdbqt "
-        + reference_arg
-        + "--ligand_index ligand_index.txt "
-        + "--config config.txt "
-        + "--dir results "
-        + f"--search_mode {safe_search_mode} "
-        + (udp_extra_cli + " " if udp_extra_cli else "")
-        + "; "
-        + "if [[ -f results/ligand_out.pdbqt ]]; then "
-        + "obabel results/ligand_out.pdbqt -O results/ligand_out.pdb >/dev/null 2>&1 || true; "
-        + "obabel results/ligand_out.pdbqt -O results/ligand_out.sdf >/dev/null 2>&1 || true; "
-        + "fi"
+        "cd /workspace/work; "
+        "mk_prepare_receptor.py -i input/" + shlex.quote(protein_local.name) + " -o prepared/receptor -p; "
+        "mk_prepare_ligand.py -i input/" + shlex.quote(ligand_local.name) + " -o prepared/ligand.pdbqt; "
+        "udp --receptor prepared/receptor.pdbqt "
+        "--reference_ligand prepared/ligand.pdbqt "
+        "--ligand_index ligand_index.txt "
+        "--config config.txt "
+        "--dir results "
+        "--search_mode balance"
     )
     command = [
         "docker",
@@ -607,25 +344,16 @@ def _run_udp_redocking_from_prepared_structure(
         "job_code": _short_job_code(run_id),
         "status": "running",
         "workflow": "UDP_REDOCKING",
-        "job_type": "structure",
-        "source": "udp",
         "engine": "udp",
         "source_structure_run_id": structure_run_id,
         "source_structure_job_code": structure_job_code,
         "pdb_id": pdb_id,
         "ligand_key": ligand_key,
-        "ligand_id": ligand_id,
         "ligand_smiles": ligand_smiles,
         "center": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])},
         "size": {"x": float(size[0]), "y": float(size[1]), "z": float(size[2])},
-        "docking_mode": safe_docking_mode,
-        "search_mode": safe_search_mode,
-        "use_scrub": bool(use_scrub),
-        "scrub_ph": safe_scrub_ph,
-        "scrub_skip_tautomer": safe_scrub_skip_tautomer,
-        "extra_udp_args": udp_extra_cli,
+        "exhaustiveness": int(exhaustiveness),
         "docker_image": docker_image,
-        "receptor_meeko_repair": receptor_repair_report,
         "created_at": _utc_now_iso(),
         "updated_at": _utc_now_iso(),
     }
@@ -652,95 +380,6 @@ def _run_udp_redocking_from_prepared_structure(
     return {"run_id": run_id, "run_dir": str(run_dir), "metadata": metadata, "result": result, "command": command}
 
 
-def _materialize_docked_structure_outputs(
-    *,
-    source_structure: dict,
-    docking_run: dict,
-) -> str | None:
-    result = docking_run.get("result", {}) or {}
-    if not bool(result.get("success")):
-        return None
-    dock_run_dir = Path(str(docking_run.get("run_dir") or ""))
-    dock_result_dir = dock_run_dir / "work" / "results"
-    protein_src = Path(str(source_structure.get("protein_pdb") or ""))
-    ligand_sdf_src = dock_result_dir / "ligand_out.sdf"
-    ligand_pdb_src = dock_result_dir / "ligand_out.pdb"
-    if not protein_src.exists() or not ligand_sdf_src.exists():
-        return None
-
-    try:
-        protein_text = protein_src.read_text().rstrip() + "\n"
-        ligand_text = ligand_pdb_src.read_text() if ligand_pdb_src.exists() else ""
-        ligand_lines = [ln for ln in ligand_text.splitlines() if ln.startswith(("ATOM", "HETATM", "CONECT"))]
-        merged_complex = protein_text + "\n".join(ligand_lines) + "\nEND\n"
-    except Exception:
-        merged_complex = protein_src.read_text().rstrip() + "\nEND\n"
-
-    pdb_id = str(source_structure.get("pdb_id") or "dock").lower()
-    job_dir = Path(str(docking_run.get("run_dir") or ""))
-    if not job_dir.exists():
-        return None
-    meta_path = job_dir / "metadata.json"
-    meta = {}
-    try:
-        meta = json.loads(meta_path.read_text())
-    except Exception:
-        meta = {}
-    meta.update(
-        {
-            "source": "udp",
-            "source_structure_run_id": source_structure.get("run_id"),
-            "source_structure_job_code": source_structure.get("job_code"),
-            "source_docking_run_id": docking_run.get("run_id"),
-            "pdb_id": str(source_structure.get("pdb_id") or ""),
-            "ligand_key": str(source_structure.get("ligand_key") or "LIG|A|1|_"),
-            "status": "completed",
-            "ligand_count": 1,
-            "updated_at": _utc_now_iso(),
-        }
-    )
-    meta_path.write_text(json.dumps(meta, indent=2))
-    job_code = str(meta.get("job_code") or _short_job_code(str(job_dir.name)))
-    ligand_id = str(meta.get("ligand_id") or source_structure.get("ligand_id") or "lig").strip().lower()
-    ligand_id = re.sub(r"[^a-z0-9]+", "-", ligand_id).strip("-") or "lig"
-    file_prefix = f"docked_{job_code.lower()}_{ligand_id}"
-    protein_dst = job_dir / f"{file_prefix}_protein_refined.pdb"
-    complex_dst = job_dir / f"{file_prefix}_complex_refined.pdb"
-    protein_dst.write_text(protein_src.read_text())
-    complex_dst.write_text(merged_complex)
-
-    # Run the same ligand correction/refinement helper used by PDB preparation,
-    # using docked pose geometry (PDB) and the selected/reference SMILES template.
-    ligand_pdb_text = ligand_pdb_src.read_text() if ligand_pdb_src.exists() else ""
-    reference_smiles = str((docking_run.get("metadata") or {}).get("ligand_smiles") or "").strip()
-    artifacts: dict = {}
-    if ligand_pdb_text.strip():
-        try:
-            artifacts = _build_ligand_sdf_artifacts(
-                ligand_pdb=ligand_pdb_text,
-                ligand_resname="LIG",
-                output_dir=job_dir,
-                file_prefix=file_prefix,
-                reference_smiles=reference_smiles if reference_smiles else None,
-            )
-        except Exception:
-            artifacts = {}
-
-    # Ensure required output files exist even if strict refinement path is unavailable.
-    ligand_refined = Path(str(artifacts.get("ligand_refined_sdf") or job_dir / f"{file_prefix}_ligand_refined.sdf"))
-    ligand_raw = Path(str(artifacts.get("ligand_raw_sdf") or job_dir / f"{file_prefix}_ligand_raw.sdf"))
-    if not ligand_refined.exists():
-        ligand_refined.write_text(ligand_sdf_src.read_text())
-    if not ligand_raw.exists():
-        ligand_raw.write_text(ligand_sdf_src.read_text())
-
-    # Persist reference/template SMILES in result folder for traceability.
-    smiles_dst = Path(str(artifacts.get("ligand_ref_smi") or job_dir / f"{file_prefix}_ligand_ref.smi"))
-    if reference_smiles:
-        smiles_dst.write_text(reference_smiles + "\n")
-    return job_code
-
-
 def render() -> None:
     st.title("Structure Preparation")
     st.caption("Prepare protein-ligand systems that can be reused by MD, free energy, and property workflows.")
@@ -748,7 +387,7 @@ def render() -> None:
     tabs = st.tabs(
         [
             "From PDB",
-            "From docking",
+            "From Vina docking",
             "From Boltz prediction",
             "From custom files",
         ]
@@ -1102,8 +741,8 @@ def render() -> None:
                     st.error(f"Selected preparation failed: {exc}")
 
     with tabs[1]:
-        st.markdown("#### Prepared complex from docking")
-        st.caption("Run re-/docking directly from an existing prepared structure job (refined protein + refined ligand).")
+        st.markdown("#### Docking result -> Prepared complex")
+        st.caption("Run redocking directly from an existing prepared structure job (refined protein + refined ligand).")
         prepared_rows = _collect_refined_structure_jobs()
         if not prepared_rows:
             st.info("No compatible prepared structure jobs found yet. Create one first in the `From PDB` tab.")
@@ -1129,28 +768,17 @@ def render() -> None:
             if inferred_center is None:
                 inferred_center = (0.0, 0.0, 0.0)
 
-            ligand_key_value = str(selected.get("ligand_key") or "")
-            ligand_id_default = ligand_key_value.split("|", 1)[0].strip() if ligand_key_value else "LIG"
             if smi_path is not None and smi_path.exists():
                 default_smiles = _read_text(smi_path).strip().splitlines()[0] if _read_text(smi_path).strip() else ""
             else:
                 default_smiles = _sdf_quick_summary(str(ligand_path)).get("smiles", "")
 
-            st.markdown("#### Setup")
-            docking_engine = st.selectbox(
-                "Docking engine",
-                options=["udp", "vina", "gnina"],
-                index=0,
-                key="prep_docking_engine_selector",
-                help="Choose docking backend. Currently, only UDP is implemented in this tab.",
-            )
+            st.markdown("#### Redocking setup")
             smiles_value = st.text_input(
-                "Ligand ID, SMILES",
-                value=(f"{ligand_id_default}, {default_smiles}" if default_smiles else f"{ligand_id_default}, "),
+                "Ligand SMILES (default from prepared structure; editable)",
+                value=default_smiles,
                 key=f"prep_docking_smiles_{selected['run_id']}",
-                help="Format: LigandID, SMILES (example: T3, O=C...).",
             )
-            ligand_id_value, smiles_only = _split_ligand_id_and_smiles(smiles_value, fallback_ligand_id=ligand_id_default)
             center_cols = st.columns(3)
             center_x = center_cols[0].number_input(
                 "center_x",
@@ -1177,45 +805,8 @@ def render() -> None:
             size_x = size_cols[0].number_input("size_x", value=22.0, min_value=1.0, step=1.0, key=f"prep_docking_size_x_{selected['run_id']}")
             size_y = size_cols[1].number_input("size_y", value=22.0, min_value=1.0, step=1.0, key=f"prep_docking_size_y_{selected['run_id']}")
             size_z = size_cols[2].number_input("size_z", value=22.0, min_value=1.0, step=1.0, key=f"prep_docking_size_z_{selected['run_id']}")
-            search_mode = size_cols[3].selectbox(
-                "search_mode",
-                options=["fast", "balance", "detail"],
-                index=2,
-                key=f"prep_docking_search_mode_{selected['run_id']}",
-                help="UDP search mode: fast (quick), balance, detail (most thorough; default).",
-            )
-            docking_mode = st.selectbox(
-                "docking_mode",
-                options=["classic", "hybrid"],
-                index=0,
-                key=f"prep_docking_mode_{selected['run_id']}",
-                help="classic: receptor-only UDP command. hybrid: adds --reference_ligand.",
-            )
-            scrub_cols = st.columns(3)
-            use_scrub = scrub_cols[0].checkbox(
-                "Use scrub.py",
-                value=True,
-                key=f"prep_docking_use_scrub_{selected['run_id']}",
-                help="Apply scrub.py ligand preprocessing before mk_prepare_ligand.py.",
-            )
-            scrub_ph = scrub_cols[1].number_input(
-                "scrub pH",
-                min_value=0.0,
-                max_value=14.0,
-                value=7.4,
-                step=0.1,
-                key=f"prep_docking_scrub_ph_{selected['run_id']}",
-            )
-            scrub_skip_tautomer = scrub_cols[2].checkbox(
-                "skip tautomer",
-                value=True,
-                key=f"prep_docking_scrub_skip_taut_{selected['run_id']}",
-            )
-            extra_udp_args = st.text_input(
-                "Additional UDP args (optional)",
-                value="",
-                key=f"prep_docking_extra_args_{selected['run_id']}",
-                help="Advanced: append extra arguments passed directly to `udp`.",
+            exhaustiveness = int(
+                size_cols[3].number_input("exhaustiveness", value=8, min_value=1, step=1, key=f"prep_docking_exh_{selected['run_id']}")
             )
 
             st.caption(
@@ -1225,64 +816,45 @@ def render() -> None:
             if complex_path is not None and complex_path.exists():
                 try:
                     complex_pdb_data = _read_text(complex_path)
-                    st.markdown("#### Prepared complex preview")
-                    st.caption("Prepared complex used as docking source.")
-                    _render_py3dmol_complex_preview(
-                        complex_pdb_data,
-                        ligand_resname="LIG",
-                        ligand_sdf_path=str(ligand_path),
-                        center=(float(center_x), float(center_y), float(center_z)),
-                        size=(float(size_x), float(size_y), float(size_z)),
-                    )
+                    complex_ligands = parse_bound_ligands(complex_pdb_data)
+                    selected_lig = next((lig for lig in complex_ligands if lig.get("resname") == "LIG"), complex_ligands[0] if complex_ligands else None)
+                    selected_chains = [c["chain"] for c in _parse_protein_chains(complex_pdb_data)]
+                    if selected_lig is not None:
+                        _render_structure_view(
+                            complex_pdb_data,
+                            complex_ligands if complex_ligands else [selected_lig],
+                            selected_lig,
+                            selected_chains,
+                            show_molstar_tools=True,
+                            key_suffix=f"prep_docking_preview_{selected['run_id']}",
+                            title="Prepared complex preview",
+                            caption="Prepared complex used as docking source.",
+                        )
                 except Exception as exc:
                     st.warning(f"Preview unavailable: {exc}")
 
             if st.button("Run docking from this prepared structure", type="primary", key=f"prep_docking_run_{selected['run_id']}"):
                 try:
-                    if docking_engine != "udp":
-                        st.error(
-                            f"Selected engine `{docking_engine}` is not implemented yet in this tab. "
-                            "Please use `udp` for now."
-                        )
-                        st.stop()
                     with st.spinner("Running UDP redocking from prepared structure..."):
                         run = _run_udp_redocking_from_prepared_structure(
                             structure_run_id=str(selected["run_id"]),
                             structure_job_code=str(selected["job_code"]),
                             pdb_id=str(selected.get("pdb_id") or ""),
                             ligand_key=str(selected.get("ligand_key") or ""),
-                            ligand_id=str(ligand_id_value),
                             protein_pdb=protein_path,
                             ligand_sdf=ligand_path,
-                            ligand_smiles=smiles_only,
+                            ligand_smiles=smiles_value,
                             center=(float(center_x), float(center_y), float(center_z)),
                             size=(float(size_x), float(size_y), float(size_z)),
-                            docking_mode=str(docking_mode),
-                            search_mode=str(search_mode),
-                            use_scrub=bool(use_scrub),
-                            scrub_ph=float(scrub_ph),
-                            scrub_skip_tautomer=bool(scrub_skip_tautomer),
-                            extra_udp_args=str(extra_udp_args),
+                            exhaustiveness=int(exhaustiveness),
                             docker_image="avgu-docking-suite-cuda:latest",
                         )
                     result = run.get("result", {})
                     if bool(result.get("success")):
                         st.success(f"UDP redocking completed: {run.get('metadata', {}).get('job_code', '')}")
-                        registered_code = _materialize_docked_structure_outputs(
-                            source_structure=selected,
-                            docking_run=run,
-                        )
-                        if registered_code:
-                            st.caption(
-                                f"Docked pose saved in structure job `{registered_code}` "
-                                "for downstream MD/FEP."
-                            )
                         st.caption("Open this structure run from Jobs – Structure to inspect docking results.")
                     else:
                         st.error("UDP redocking failed.")
-                    st.code(f"Docking run directory:\n{run.get('run_dir', '')}")
-                    st.code(f"Docking pose outputs:\n{Path(str(run.get('run_dir', ''))) / 'work' / 'results'}")
-                    st.caption(f"Ligand ID used: `{ligand_id_value}`")
                     with st.expander("Docking stderr tail", expanded=not bool(result.get("success"))):
                         st.code(str(result.get("stderr_tail") or ""))
                 except Exception as exc:

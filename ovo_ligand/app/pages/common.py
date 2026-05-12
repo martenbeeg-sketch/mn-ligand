@@ -132,7 +132,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "abfe_container",
         "gpu": True,
         "defaults": {
-            "abfe_container": "ovolig-abfe-cu128:latest",
+            "abfe_container": "ovolig-md-cu128:latest",
         },
         "files": {
             "protein_pdb": ["pdb"],
@@ -147,7 +147,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "rbfe_container",
         "gpu": True,
         "defaults": {
-            "rbfe_container": "ovolig-rbfe-cu128:latest",
+            "rbfe_container": "ovolig-md-cu128:latest",
         },
         "files": {
             "protein_pdb": ["pdb"],
@@ -168,7 +168,10 @@ def _input_root() -> Path:
 
 
 def _run_root() -> Path:
-    root = Path(os.getenv("OVO_LIGAND_RUN_DIR", "/tmp/ovo-ligand-runs"))
+    # Keep run storage consistent with MD pages/jobs:
+    # default to project-local .ovo-home/workdir/runs.
+    default_root = Path(__file__).resolve().parents[3] / ".ovo-home" / "workdir" / "runs"
+    root = Path(os.getenv("OVO_LIGAND_RUN_DIR", str(default_root)))
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -355,6 +358,43 @@ def _build_smoke_script(workflow_key: str, params: dict[str, Any], container_inp
         ]
     )
 
+def _read_text_file(path: str) -> str:
+    try:
+        return Path(path).read_text()
+    except Exception:
+        return ""
+
+
+def _build_openfe_payload(workflow_key: str, params: dict[str, Any], run_id: str) -> dict[str, Any]:
+    if workflow_key == "abfe":
+        return {
+            "job_id": run_id,
+            "protein_pdb_data": _read_text_file(str(params.get("protein_pdb") or "")),
+            "ligand_sdf_data": _read_text_file(str(params.get("ligand_sdf") or "")),
+            "ligand_id": "ligand",
+            "protein_id": "protein",
+            "protocol_settings": dict(params.get("protocol_settings") or {}),
+        }
+    if workflow_key == "rbfe":
+        sdf_text = _read_text_file(str(params.get("ligands_sdf") or ""))
+        blocks = [b.strip() for b in sdf_text.split("$$$$") if b.strip()]
+        ligands: list[dict[str, Any]] = []
+        for idx, block in enumerate(blocks, start=1):
+            ligands.append({"id": f"ligand_{idx}", "data": block + "\n$$$$\n", "format": "sdf"})
+        return {
+            "job_id": run_id,
+            "protein_pdb_data": _read_text_file(str(params.get("protein_pdb") or "")),
+            "ligands": ligands,
+            "network_topology": str(params.get("network_topology") or "mst"),
+            "central_ligand": params.get("central_ligand") or None,
+            "atom_mapper": str(params.get("atom_mapper") or "kartograf"),
+            "atom_map_hydrogens": bool(params.get("atom_map_hydrogens", True)),
+            "lomap_max3d": float(params.get("lomap_max3d", 1.0)),
+            "protocol_settings": dict(params.get("protocol_settings") or {}),
+            "protein_id": "protein",
+        }
+    return {}
+
 
 def _build_docker_command(
     workflow_key: str,
@@ -394,32 +434,110 @@ def _build_docker_command(
             str(params.get("accelerator", "gpu")),
         ]
 
+    if workflow_key in {"abfe", "rbfe"}:
+        payload = _build_openfe_payload(workflow_key, params, output_dir.name)
+        (output_dir / "openfe_input.json").write_text(json.dumps(payload, indent=2))
+        entry = (
+            "ABFE_OUTPUT_DIR=/output RBFE_OUTPUT_DIR=/output "
+            "python -m ovo_ligand.ligandx.services.abfe.run_abfe_job --input /output/openfe_input.json --output /output/result.json"
+            if workflow_key == "abfe"
+            else "ABFE_OUTPUT_DIR=/output RBFE_OUTPUT_DIR=/output "
+            "python -m ovo_ligand.ligandx.services.rbfe.run_rbfe_job --input /output/openfe_input.json --output /output/result.json"
+        )
+        return command + [
+            "-v",
+            f"{Path(__file__).resolve().parents[3]}:/work:ro",
+            "-w",
+            "/work",
+            image,
+            "/bin/bash",
+            "-lc",
+            entry,
+        ]
+
     script = _build_smoke_script(workflow_key, params, container_inputs)
     return command + [image, "/bin/bash", "-lc", script]
 
 
 def _run_docker_workflow(workflow_key: str, workflow: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     run_id = str(uuid4())
+    generated_job_code = run_id.replace("-", "")[:3].upper()
+    output_dir = _run_root() / workflow_key / run_id
+    output_dir.mkdir(parents=True, exist_ok=False)
+    metadata_path = output_dir / "metadata.json"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    metadata_payload = {
+        "run_id": run_id,
+        "workflow": workflow_key.upper(),
+        "workflow_key": workflow_key,
+        "job_code": generated_job_code,
+        "openfe_job_code": generated_job_code,
+        "status": "running",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    # Preserve any structured metadata passed by the page layer.
+    extra_meta = params.get("metadata")
+    if isinstance(extra_meta, dict):
+        # Preserve source fields without overwriting generated OpenFE run code.
+        source_code = extra_meta.get("job_code")
+        if source_code:
+            metadata_payload["source_job_code"] = str(source_code)
+        extra_meta = {k: v for k, v in extra_meta.items() if k != "job_code"}
+        metadata_payload.update(extra_meta)
+    try:
+        metadata_path.write_text(json.dumps(metadata_payload, indent=2))
+    except Exception:
+        pass
+
+    command = _build_docker_command(workflow_key, workflow, params, output_dir)
     lock_acquired = False
     if workflow.get("gpu"):
         lock_acquired, lock_info = acquire_gpu_job_lock(workflow_key, run_id)
         if not lock_acquired:
+            # Queue like MD workflows instead of failing immediately.
+            queue_gpu_job(output_dir, workflow_key, run_id, command)
+            try:
+                queued_meta = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+            except Exception:
+                queued_meta = {}
+            queued_meta.update(
+                {
+                    "run_id": run_id,
+                    "workflow": workflow_key.upper(),
+                    "workflow_key": workflow_key,
+                    "status": "queued",
+                    "queued_at": now_iso,
+                    "updated_at": now_iso,
+                }
+            )
+            if isinstance(extra_meta, dict):
+                queued_meta.update(extra_meta)
+            try:
+                metadata_path.write_text(json.dumps(queued_meta, indent=2))
+            except Exception:
+                pass
             return {
                 "run_id": run_id,
-                "output_dir": "",
-                "command": [],
-                "returncode": 99,
+                "output_dir": str(output_dir),
+                "command": command,
+                "returncode": 0,
+                "queued": True,
                 "stdout": "",
                 "stderr": (
-                    "GPU job lock is active. Another GPU-bound job is running: "
+                    "GPU busy; job queued behind active run "
                     f"{lock_info.get('workflow')} ({lock_info.get('run_id')})."
                 ),
             }
-    output_dir = _run_root() / workflow_key / run_id
-    output_dir.mkdir(parents=True, exist_ok=False)
-    command = _build_docker_command(workflow_key, workflow, params, output_dir)
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
+        try:
+            metadata_payload["status"] = "completed" if result.returncode == 0 else "failed"
+            metadata_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+            metadata_payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+            metadata_path.write_text(json.dumps(metadata_payload, indent=2))
+        except Exception:
+            pass
         return {
             "run_id": run_id,
             "output_dir": str(output_dir),
@@ -433,24 +551,41 @@ def _run_docker_workflow(workflow_key: str, workflow: dict[str, Any], params: di
             release_gpu_job_lock(run_id)
 
 
-def render_workflow_page(workflow_key: str) -> None:
+def render_workflow_page(
+    workflow_key: str,
+    *,
+    show_title: bool = True,
+    show_container_input: bool = True,
+    show_command_preview: bool = True,
+    show_command_in_result: bool = True,
+    title_override: str | None = None,
+    intro_text: str | None = None,
+    run_button_label: str = "Run Docker workflow",
+) -> None:
     workflow = WORKFLOWS[workflow_key]
-    st.title(workflow["title"])
-    st.caption("Direct Docker scaffold")
+    if show_title:
+        st.title(title_override or workflow["title"])
+        st.caption("Direct Docker scaffold")
 
-    st.write(
-        "This page runs a Docker container directly. Most workflows currently run a smoke-test wrapper; replace that wrapper with the ported Ligand-X tool command as each tool is migrated."
-    )
+    if intro_text is None:
+        st.write(
+            "This page runs a Docker container directly. Most workflows currently run a smoke-test wrapper; replace that wrapper with the ported Ligand-X tool command as each tool is migrated."
+        )
+    elif intro_text:
+        st.write(intro_text)
 
     params: dict[str, Any] = {}
 
-    st.subheader("Container")
     container_param = workflow["container_param"]
-    params[container_param] = st.text_input(
-        "Docker image",
-        value=workflow["defaults"][container_param],
-        help="Docker image tag used by docker run.",
-    )
+    if show_container_input:
+        st.subheader("Container")
+        params[container_param] = st.text_input(
+            "Docker image",
+            value=workflow["defaults"][container_param],
+            help="Docker image tag used by docker run.",
+        )
+    else:
+        params[container_param] = workflow["defaults"][container_param]
 
     st.subheader("Inputs")
     for param_name, extensions in workflow["files"].items():
@@ -469,15 +604,16 @@ def render_workflow_page(workflow_key: str) -> None:
         for param_name, default in workflow["params"].items():
             params[param_name] = _render_scalar_input(param_name, default)
 
-    with st.expander("Docker command preview", expanded=True):
-        try:
-            preview_dir = _run_root() / workflow_key / "preview"
-            preview_command = _build_docker_command(workflow_key, workflow, params, preview_dir)
-            st.code(shlex.join(preview_command))
-        except Exception as exc:
-            st.info(str(exc))
+    if show_command_preview:
+        with st.expander("Docker command preview", expanded=True):
+            try:
+                preview_dir = _run_root() / workflow_key / "preview"
+                preview_command = _build_docker_command(workflow_key, workflow, params, preview_dir)
+                st.code(shlex.join(preview_command))
+            except Exception as exc:
+                st.info(str(exc))
 
-    if st.button("Run Docker workflow", type="primary"):
+    if st.button(run_button_label, type="primary"):
         try:
             run = _run_docker_workflow(workflow_key, workflow, params)
             if run["returncode"] == 0:
@@ -486,8 +622,9 @@ def render_workflow_page(workflow_key: str) -> None:
                 st.error(f"Docker run failed with exit code {run['returncode']}")
             st.write("Output directory")
             st.code(run["output_dir"])
-            with st.expander("Command"):
-                st.code(shlex.join(run["command"]))
+            if show_command_in_result:
+                with st.expander("Command"):
+                    st.code(shlex.join(run["command"]))
             if run["stdout"]:
                 with st.expander("stdout"):
                     st.code(run["stdout"])

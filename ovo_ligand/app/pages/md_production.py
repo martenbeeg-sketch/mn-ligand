@@ -38,6 +38,36 @@ def _steps_to_ns(steps: int | float) -> float:
     return float(steps) * 0.000004
 
 
+def _ensure_ligand_resname_lig(pdb_text: str) -> str:
+    out: list[str] = []
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 20:
+            fixed = line[:17] + f"{'LIG':>3}" + line[20:]
+            if fixed.startswith("ATOM  "):
+                fixed = "HETATM" + fixed[6:]
+            out.append(fixed)
+        else:
+            out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _try_rebuild_complex_with_ligand(run_dir: Path, protein_pdb_data: str) -> str | None:
+    ligand_raw_pdb = next(iter(sorted(run_dir.glob("*_ligand_raw.pdb"))), None)
+    if ligand_raw_pdb is None or not ligand_raw_pdb.exists():
+        return None
+    try:
+        lig_text = _ensure_ligand_resname_lig(ligand_raw_pdb.read_text())
+        lig_lines = [ln for ln in lig_text.splitlines() if ln.startswith(("HETATM", "ATOM", "CONECT"))]
+        if not lig_lines:
+            return None
+        merged = protein_pdb_data.rstrip() + "\n" + "\n".join(lig_lines) + "\nEND\n"
+        if parse_bound_ligands(merged):
+            return merged
+    except Exception:
+        return None
+    return None
+
+
 PRODUCTION_REPORT_INTERVAL_PRESETS = {
     "Preview": 500,
     "Short MD": 1000,
@@ -190,6 +220,11 @@ def render() -> None:
     ligands = parse_bound_ligands(protein_pdb_data)
     if not ligands:
         ligands = parse_bound_ligands(complex_pdb_data)
+    if not ligands:
+        rebuilt = _try_rebuild_complex_with_ligand(complex_path.parent, protein_pdb_data)
+        if rebuilt:
+            complex_pdb_data = rebuilt
+            ligands = parse_bound_ligands(complex_pdb_data)
     if not ligands:
         st.error("No ligand found in selected prepared complex.")
         return

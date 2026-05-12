@@ -80,33 +80,12 @@ def main() -> None:
         url_path="structure-results",
         visibility="hidden",
     )
-
-    pipeline_pages = [
-        _make_page(
-            package_root,
-            "ovo_ligand.app.pages.bound_ligand_md",
-            "PDB -> Prepare -> MD -> Analysis",
-            "pipeline-pdb-prepare-md-analysis",
-        ),
-        _make_page(
-            package_root,
-            "ovo_ligand.app.pages.docking",
-            "PDB -> Prepare -> Docking -> MD -> Analysis",
-            "pipeline-pdb-prepare-docking-md-analysis",
-        ),
-        _make_page(
-            package_root,
-            "ovo_ligand.app.pages.abfe",
-            "Prepare -> ABFE",
-            "pipeline-prepare-abfe",
-        ),
-        _make_page(
-            package_root,
-            "ovo_ligand.app.pages.rbfe",
-            "Prepare series -> RBFE",
-            "pipeline-prepare-series-rbfe",
-        ),
-    ]
+    openfe_results_page = st.Page(
+        page=str(package_root / "app/pages/openfe_results.py"),
+        title="OpenFE Results",
+        url_path="openfe-results",
+        visibility="hidden",
+    )
 
     task_pages = [
         _make_page(
@@ -129,21 +108,15 @@ def main() -> None:
         ),
         _make_page(
             package_root,
-            "ovo_ligand.app.pages.bound_ligand_md",
-            "Analysis (RMSD, energies, MM/GBSA, MM/PBSA)",
-            "workspace-analysis",
+            "ovo_ligand.app.pages.abfe",
+            "Free Energy (ABFE/RBFE)",
+            "workspace-free-energy",
         ),
         _make_page(
             package_root,
             "ovo_ligand.app.pages.admet",
             "Ligand Properties (ADMET/QC)",
             "workspace-ligand-properties",
-        ),
-        _make_page(
-            package_root,
-            "ovo_ligand.app.pages.abfe",
-            "Free Energy (ABFE/RBFE)",
-            "workspace-free-energy",
         ),
     ]
     structure_preparation_legacy_pages = [
@@ -164,9 +137,8 @@ def main() -> None:
     pg = st.navigation(
         {
             "Jobs": [jobs_structure_page, jobs_md_system_page, jobs_md_page, jobs_openfe_page],
-            "Pipelines": pipeline_pages,
             "Task": task_pages,
-            "Internal": [md_results_page, structure_results_page, jobs_md_legacy_page, *structure_preparation_legacy_pages],
+            "Internal": [md_results_page, structure_results_page, openfe_results_page, jobs_md_legacy_page, *structure_preparation_legacy_pages],
         },
         position="sidebar",
     )

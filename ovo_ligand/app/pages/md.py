@@ -39,6 +39,36 @@ def _steps_to_ns(steps: int | float) -> float:
     return float(steps) * 0.000004
 
 
+def _ensure_ligand_resname_lig(pdb_text: str) -> str:
+    out: list[str] = []
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 20:
+            fixed = line[:17] + f"{'LIG':>3}" + line[20:]
+            if fixed.startswith("ATOM  "):
+                fixed = "HETATM" + fixed[6:]
+            out.append(fixed)
+        else:
+            out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _try_rebuild_complex_with_ligand(run_dir: Path, protein_pdb_data: str) -> str | None:
+    ligand_raw_pdb = next(iter(sorted(run_dir.glob("*_ligand_raw.pdb"))), None)
+    if ligand_raw_pdb is None or not ligand_raw_pdb.exists():
+        return None
+    try:
+        lig_text = _ensure_ligand_resname_lig(ligand_raw_pdb.read_text())
+        lig_lines = [ln for ln in lig_text.splitlines() if ln.startswith(("HETATM", "ATOM", "CONECT"))]
+        if not lig_lines:
+            return None
+        merged = protein_pdb_data.rstrip() + "\n" + "\n".join(lig_lines) + "\nEND\n"
+        if parse_bound_ligands(merged):
+            return merged
+    except Exception:
+        return None
+    return None
+
+
 def _collect_structure_jobs() -> list[dict]:
     runs_root = _run_root() / "structure-jobs"
     runs_root.mkdir(parents=True, exist_ok=True)
@@ -169,6 +199,11 @@ def render() -> None:
         protein_pdb_data = pdb_data
 
     ligands = parse_bound_ligands(pdb_data)
+    if not ligands:
+        rebuilt = _try_rebuild_complex_with_ligand(structure_job_dir, protein_pdb_data)
+        if rebuilt:
+            pdb_data = rebuilt
+            ligands = parse_bound_ligands(pdb_data)
     if not ligands:
         st.error("No ligand found in selected prepared complex.")
         return

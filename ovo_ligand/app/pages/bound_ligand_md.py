@@ -132,7 +132,7 @@ def _write_run_metadata(run_dir: Path, update: dict) -> dict:
 def _current_ligand_source() -> str:
     prepared = st.session_state.get("prepared_structure_last", {}) or {}
     source = str(prepared.get("source", "")).strip().lower()
-    if source in {"pdb", "vina", "boltz", "custom"}:
+    if source in {"pdb", "vina", "udp", "boltz", "custom"}:
         return source
     return "pdb"
 
