@@ -36,6 +36,77 @@ MODIFIED_RESIDUE_MAPPINGS = {
 }
 
 
+def _resolve_output_path(path_value: Any, output_dir: Path) -> str:
+    if not isinstance(path_value, str) or not path_value:
+        return ""
+    if path_value.startswith("/output/"):
+        return str(output_dir / path_value.removeprefix("/output/"))
+    return path_value
+
+
+def _rewrite_pdb_with_imaged_molecules(path: Path) -> bool:
+    try:
+        import mdtraj as md
+    except Exception:
+        return False
+
+    try:
+        raw_pdb_text = path.read_text()
+        frame = md.load_pdb(str(path))
+        if frame.n_frames == 0 or frame.unitcell_lengths is None:
+            return False
+
+        protein_sel = frame.topology.select("protein")
+        molecules = frame.topology.find_molecules()
+        anchor_molecules = []
+        if len(protein_sel) > 10:
+            protein_atom_set = set(protein_sel)
+            anchor_molecules = [
+                sorted(list(mol), key=lambda atom: atom.index)
+                for mol in molecules
+                if any(atom.index in protein_atom_set for atom in mol)
+            ]
+        if not anchor_molecules and molecules:
+            largest = max(molecules, key=len)
+            anchor_molecules = [sorted(list(largest), key=lambda atom: atom.index)]
+        if anchor_molecules:
+            frame.image_molecules(inplace=True, anchor_molecules=anchor_molecules)
+        else:
+            frame.image_molecules(inplace=True)
+
+        xyz_angstrom = frame.xyz[0] * 10.0
+        atom_index = 0
+        lines: list[str] = []
+        for line in raw_pdb_text.splitlines():
+            if line.startswith(("ATOM", "HETATM")) and atom_index < len(xyz_angstrom):
+                x, y, z = xyz_angstrom[atom_index]
+                line = f"{line[:30]}{x:8.3f}{y:8.3f}{z:8.3f}{line[54:]}"
+                atom_index += 1
+            lines.append(line)
+        path.write_text("\n".join(lines + ["END", ""]))
+        return True
+    except Exception:
+        return False
+
+
+def _image_stage_pdb_outputs(md_result: dict, output_dir: Path) -> None:
+    output_files = md_result.get("output_files") or {}
+    stage_keys = ("system_pdb", "minimized_pdb", "nvt_pdb", "npt_pdb", "production_pdb")
+    repaired: dict[str, bool] = {}
+    for key in stage_keys:
+        path_text = _resolve_output_path(output_files.get(key), output_dir)
+        if not path_text:
+            continue
+        path = Path(path_text)
+        if path.exists():
+            repaired[key] = _rewrite_pdb_with_imaged_molecules(path)
+    if repaired:
+        md_result["pdb_periodic_imaging"] = {
+            "mode": "molecules_imaged_around_protein",
+            "files": repaired,
+        }
+
+
 def download_pdb(pdb_id: str) -> str:
     pdb_id = pdb_id.strip().upper()
     if len(pdb_id) != 4 or not pdb_id.isalnum():
@@ -1686,6 +1757,8 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
             break
         if "Ligand preparation failed" not in error_msg:
             break
+    if isinstance(result, dict) and str(result.get("status", "")) != "error":
+        _image_stage_pdb_outputs(result, output_dir)
     if mm_backend == "ambertools_mmpbsa" and str(result.get("status", "")) == "error":
         error_payload = {
             "success": False,

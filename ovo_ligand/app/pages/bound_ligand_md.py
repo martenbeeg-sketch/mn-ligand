@@ -377,6 +377,59 @@ def _protein_ligand_only_pdb(pdb_data: str) -> str:
     return "\n".join(lines + ["END", ""])
 
 
+@st.cache_data(show_spinner=False)
+def _imaged_snapshot_pdb(snapshot_pdb_path: str, include_solvent: bool) -> str | None:
+    try:
+        import mdtraj as md
+    except Exception:
+        return None
+
+    try:
+        path = Path(snapshot_pdb_path)
+        raw_pdb_text = path.read_text()
+        frame = md.load_pdb(str(path))
+        if frame.n_frames == 0:
+            return None
+
+        if frame.unitcell_lengths is not None:
+            try:
+                protein_sel = frame.topology.select("protein")
+                molecules = frame.topology.find_molecules()
+                anchor_molecules = []
+                if len(protein_sel) > 10:
+                    protein_atom_set = set(protein_sel)
+                    anchor_molecules = [
+                        sorted(list(mol), key=lambda a: a.index)
+                        for mol in molecules
+                        if any(atom.index in protein_atom_set for atom in mol)
+                    ]
+                if not anchor_molecules and molecules:
+                    largest = max(molecules, key=len)
+                    anchor_molecules = [sorted(list(largest), key=lambda a: a.index)]
+                if anchor_molecules:
+                    frame.image_molecules(inplace=True, anchor_molecules=anchor_molecules)
+                else:
+                    frame.image_molecules(inplace=True)
+            except Exception:
+                pass
+
+        xyz_angstrom = frame.xyz[0] * 10.0
+        atom_index = 0
+        lines: list[str] = []
+        for line in raw_pdb_text.splitlines():
+            if line.startswith(("ATOM", "HETATM")) and atom_index < len(xyz_angstrom):
+                x, y, z = xyz_angstrom[atom_index]
+                line = f"{line[:30]}{x:8.3f}{y:8.3f}{z:8.3f}{line[54:]}"
+                atom_index += 1
+            lines.append(line)
+        pdb_text = "\n".join(lines + ["END", ""])
+        if not include_solvent:
+            pdb_text = _protein_ligand_only_pdb(pdb_text)
+        return normalize_nonpolymer_residue_ids_in_pdb_block(pdb_text)
+    except Exception:
+        return None
+
+
 def _count_pdb_contents(pdb_data: str) -> dict[str, int]:
     counts = {"protein_atoms": 0, "ligand_atoms": 0, "water_atoms": 0, "ion_atoms": 0, "total_atoms": 0}
     for line in pdb_data.splitlines():
@@ -1484,8 +1537,14 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         )
         show_box = st.checkbox("Show periodic box contour", value=False, key=f"snapshot_box_{run_dir.name}_{snapshot_label}")
         st.caption(str(snapshot_path))
-        raw_snapshot_pdb = snapshot_path.read_text()
-        snapshot_pdb = raw_snapshot_pdb if snapshot_mode == "Full solvent box" else _protein_ligand_only_pdb(raw_snapshot_pdb)
+        include_snapshot_solvent = snapshot_mode == "Full solvent box"
+        snapshot_pdb = _imaged_snapshot_pdb(str(snapshot_path), include_snapshot_solvent)
+        if snapshot_pdb:
+            st.caption("Snapshot display is periodic-box imaged around the protein.")
+        else:
+            raw_snapshot_pdb = snapshot_path.read_text()
+            snapshot_pdb = raw_snapshot_pdb if include_snapshot_solvent else _protein_ligand_only_pdb(raw_snapshot_pdb)
+            st.caption("Snapshot display uses raw PDB coordinates; imaging was unavailable.")
         counts = _count_pdb_contents(snapshot_pdb)
         st.caption(
             " | ".join(

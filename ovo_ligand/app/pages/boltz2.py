@@ -1,5 +1,4 @@
-from ovo_ligand.app.pages.common import render_workflow_page
+from ovo_ligand.app.pages.boltz2_ui import render_boltz2_page
 
 
-render_workflow_page("boltz2")
-
+render_boltz2_page()

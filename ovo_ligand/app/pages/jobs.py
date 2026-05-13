@@ -23,7 +23,7 @@ def _read_json(path: Path) -> dict:
 
 def _normalize_ligand_source(value: str | None) -> str:
     v = (value or "").strip().lower()
-    if v in {"pdb", "vina", "udp", "boltz", "custom"}:
+    if v in {"pdb", "vina", "gnina", "udp", "boltz", "custom"}:
         return v
     if v == "costume":
         return "custom"
@@ -302,6 +302,55 @@ def _collect_openfe_jobs() -> list[dict]:
                     "success": result.get("success"),
                 }
             )
+    return rows
+
+
+def _collect_admet_jobs() -> list[dict]:
+    runs_root = _run_root() / "admet"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    for run_dir in sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+        reconcile_run_metadata_status(run_dir)
+        metadata = _read_json(run_dir / "metadata.json")
+        result = _read_json(run_dir / "result.json")
+        rows.append(
+            {
+                "run_id": run_dir.name,
+                "job_code": metadata.get("job_code") or _short_job_code(run_dir.name),
+                "status": metadata.get("status") or ("completed" if result else "unknown"),
+                "input_smiles": (metadata.get("input_smiles") or "")[:120],
+                "source_job_code": metadata.get("source_job_code") or "",
+                "created_at": metadata.get("created_at") or "",
+                "completed_at": metadata.get("completed_at") or "",
+                "success": result.get("success"),
+            }
+        )
+    return rows
+
+
+def _collect_qc_jobs() -> list[dict]:
+    runs_root = _run_root() / "qc"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    for run_dir in sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+        reconcile_run_metadata_status(run_dir)
+        metadata = _read_json(run_dir / "metadata.json")
+        result = _read_json(run_dir / "result.json")
+        rows.append(
+            {
+                "run_id": run_dir.name,
+                "job_code": metadata.get("job_code") or _short_job_code(run_dir.name),
+                "status": metadata.get("status") or ("completed" if result else "unknown"),
+                "source_job_code": metadata.get("source_job_code") or "",
+                "method": metadata.get("qc_method") or "",
+                "basis": metadata.get("qc_basis") or "",
+                "charge": metadata.get("qc_charge"),
+                "multiplicity": metadata.get("qc_multiplicity"),
+                "created_at": metadata.get("created_at") or "",
+                "completed_at": metadata.get("completed_at") or "",
+                "success": result.get("success"),
+            }
+        )
     return rows
 
 
@@ -684,3 +733,88 @@ def render_openfe_jobs() -> None:
         key="jobs_openfe_table_editor",
     )
     st.caption("`job_code` is the OpenFE run code. `source_structure_job` shows the originating structure-preparation job.")
+
+
+def render_admet_jobs() -> None:
+    st.title("Jobs – ADMET")
+    rows = _collect_admet_jobs()
+    _enable_jobs_auto_refresh(rows, "admet")
+    if not rows:
+        st.info("No ADMET jobs found yet.")
+        return
+    df = pd.DataFrame(rows)
+    table = df[["job_code", "status", "source_job_code", "input_smiles", "created_at", "completed_at", "success", "run_id"]].copy()
+    table["job_code_link"] = table.apply(
+        lambda r: f"./admet-results?run_id={r['run_id']}&label={r['job_code']}",
+        axis=1,
+    )
+    table["delete"] = False
+    edited_rows = st.data_editor(
+        table[["delete", "job_code_link", "status", "source_job_code", "input_smiles", "created_at", "completed_at", "success"]],
+        hide_index=True,
+        use_container_width=True,
+        disabled=["job_code_link", "status", "source_job_code", "input_smiles", "created_at", "completed_at", "success"],
+        column_config={
+            "delete": st.column_config.CheckboxColumn("delete", help="Select ADMET run for deletion"),
+            "job_code_link": st.column_config.LinkColumn("job_code", display_text=r"label=([^&]+)"),
+            "source_job_code": st.column_config.TextColumn("source_structure_job"),
+        },
+        key="jobs_admet_table_editor",
+    )
+    selected_indices = edited_rows.index[edited_rows["delete"] == True].tolist()  # noqa: E712
+    selected_for_delete = table.iloc[selected_indices]["run_id"].astype(str).tolist()
+    st.caption("Use `job_code` to inspect ADMET results. Select rows with `delete` to remove runs.")
+    confirm_delete = st.checkbox(
+        "I understand this permanently deletes selected ADMET job folders",
+        value=False,
+        key="jobs_delete_admet_confirm_checkbox",
+    )
+    if st.button(
+        "Delete selected ADMET jobs",
+        type="secondary",
+        disabled=(not selected_for_delete) or (not confirm_delete),
+        key="jobs_delete_admet_selected_button",
+    ):
+        deleted: list[str] = []
+        failed: list[str] = []
+        for run_id in selected_for_delete:
+            run_dir = _run_root() / "admet" / run_id
+            try:
+                if run_dir.exists():
+                    shutil.rmtree(run_dir)
+                deleted.append(run_id)
+            except Exception as exc:
+                failed.append(f"{run_id}: {exc}")
+        if deleted:
+            st.success(f"Deleted {len(deleted)} ADMET run(s).")
+        if failed:
+            st.error("Some runs could not be deleted:\n" + "\n".join(failed))
+        st.rerun()
+
+
+def render_qc_jobs() -> None:
+    st.title("Jobs – QC")
+    rows = _collect_qc_jobs()
+    _enable_jobs_auto_refresh(rows, "qc")
+    if not rows:
+        st.info("No QC jobs found yet.")
+        return
+    df = pd.DataFrame(rows)
+    table = df[
+        ["job_code", "status", "source_job_code", "method", "basis", "charge", "multiplicity", "created_at", "completed_at", "success", "run_id"]
+    ].copy()
+    table["job_code_link"] = table.apply(
+        lambda r: f"./qc-results?run_id={r['run_id']}&label={r['job_code']}",
+        axis=1,
+    )
+    st.data_editor(
+        table[["job_code_link", "status", "source_job_code", "method", "basis", "charge", "multiplicity", "created_at", "completed_at", "success"]],
+        hide_index=True,
+        use_container_width=True,
+        disabled=["job_code_link", "status", "source_job_code", "method", "basis", "charge", "multiplicity", "created_at", "completed_at", "success"],
+        column_config={
+            "job_code_link": st.column_config.LinkColumn("job_code", display_text=r"label=([^&]+)"),
+            "source_job_code": st.column_config.TextColumn("source_structure_job"),
+        },
+        key="jobs_qc_table_editor",
+    )

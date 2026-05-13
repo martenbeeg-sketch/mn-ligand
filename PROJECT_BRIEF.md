@@ -2,22 +2,23 @@
 
 ## 1) App overview
 `ovo-ligand` is a Streamlit-based, Docker-backed ligand workflow app. It is intentionally separated from the larger OVO design platform and focuses on small-molecule/protein workflows. The app currently includes:
-- Structure preparation (PDB-centric, with cleaning/repair and ligand refinement artifacts)
+- Structure preparation (PDB-centric and docking-from-prepared-structure paths with cleaning/repair and ligand refinement artifacts)
 - MD system preparation
 - MD production from prepared systems
 - Results and job tracking pages
-- Placeholder/task pages for additional workflows (ADMET/QC/ABFE/RBFE and others)
+- Active task pages for ADMET/QC/OpenFE and docking engines (UDP/Vina/Gnina) in the structure workflow
 
 The app is implemented as a Python package with CLI entrypoint `ovo-ligand`, and an app runtime rooted at:
 - `/home/user/programs/git-projects/ovo-ligand/.ovo-home`
 
 ## 2) Current goal
-Stabilize and complete the new modular workflow split:
-1. **Structure Preparation** task produces reusable refined artifacts.
+Stabilize and complete the modular workflow split with consistent artifact handoff:
+1. **Structure Preparation** task produces reusable refined artifacts (including docking-derived refined outputs).
 2. **MD System Preparation** task performs setup + short equilibration through NPT and writes restart assets.
-3. **MD Production** task starts from system-prep outputs, preferably via checkpoint continuation.
+3. **MD Production** task starts from system-prep outputs with explicit provenance and restart controls.
+4. **OpenFE/ADMET/QC** tasks run as tracked jobs with consistent run folders and result pages.
 
-The immediate objective is deterministic, reproducible production continuation and clean UX around restart mode selection and run provenance.
+Immediate objective: keep all task outputs deterministic, discoverable in job tables, and consumable by downstream tasks without ambiguous fallback behavior.
 
 ## 3) Tech stack (and inspiration folders)
 - Python 3.11 package (`pyproject.toml`)
@@ -34,18 +35,21 @@ Inspiration/reference folders used during implementation:
 
 ## 4) Current implementation status
 - The app has moved from a single “old landing/wizard” style toward separated tasks/pages.
-- New pages exist for:
-  - MD system prep jobs
-  - MD system preparation run
-  - MD production run
-- Production restart mode selector exists:
-  - `Checkpoint (exact continuation)` (recommended)
-  - `NPT-final PDB (coordinate restart)` (less exact)
-- Checkpoint-mode bugfixes were applied so production input includes resume paths.
-- A path-mapping fix was applied so host paths are mapped to container-visible paths in production restart inputs.
+- Implemented task flows include:
+  - Structure preparation from PDB
+  - Structure preparation from docking of prepared structures (UDP/Vina/Gnina)
+  - MD system preparation
+  - MD production
+  - OpenFE ABFE/RBFE job flow
+  - ADMET and QC minimal job flows with result pages
+- Job tables are in place across major tasks with links on job codes and auto-refresh behavior.
+- Structure results include docking metadata and ligand overlay/RMSD-oriented views.
+- Production restart handling and run provenance were hardened (input/result/metadata consistency).
 
-Status caveat:
-- Overall UX is still in transition and can show behavior mismatches between legacy and new page flows.
+Status caveats:
+- **Boltz2 prediction route in structure preparation is not completed** (`To be confirmed`).
+- **From custom files route (upload + cleaning for uploaded PDB/SDF) is not completed** (`To be confirmed`).
+- Some legacy-to-modular UX transitions still have edge-case inconsistencies.
 
 ## 5) Most important files/folders
 - App entry and navigation:
@@ -72,9 +76,10 @@ Status caveat:
 - PDB download/inspection and bound ligand selection flow (legacy and modularized variants)
 - Protein cleaning/repair pipeline integration
 - Ligand refined chemistry handoff via SDF/SMILES inputs
+- Docking-from-prepared-structure workflow with engine selection (`udp`, `vina`, `gnina`)
 - MD setup/equilibration in Docker
 - MD production launch and results rendering
-- Job tables for multiple run classes (structure, MD system prep, MD production/OpenFE pages in varying completeness)
+- Job tables for multiple run classes (structure, MD system prep, MD production, OpenFE, ADMET, QC)
 - 3D visualization (Mol* and py3Dmol-based views in different contexts)
 
 ## 7) Known bugs or fragile areas
@@ -83,22 +88,23 @@ Status caveat:
 - Coordinate-restart mode is more error-prone than checkpoint restart.
 - Some status/report fields can be inconsistent across job types during refactor.
 - Production and system-prep file contracts are still evolving (checkpoint, system PDB, NPT final PDB dependencies).
-- Optional features (e.g., MM/GBSA in Ligand-X original) remain marked not implemented.
+- Feature parity gaps remain:
+  - Boltz2 structure-prep path (`To be confirmed`)
+  - Custom-file upload+cleaning route (`To be confirmed`)
 
 ## 8) Immediate next steps
-1. Validate checkpoint restart end-to-end on multiple new system-prep runs.
-2. Harden contracts:
-   - required files for each restart mode
+1. Finish **Boltz2 prediction** path in structure preparation (`To be confirmed`).
+2. Finish **From custom files** path with robust upload validation + cleaning (uploaded PDB/SDF) (`To be confirmed`).
+3. Keep downstream compatibility checks strict:
+   - structure outputs -> MD system prep
+   - structure outputs -> OpenFE
+4. Continue hardening run contracts:
+   - required files for each task
    - explicit errors and no silent fallback
-3. Simplify/align MD production UI:
-   - concise “what is used” summary
-   - clear structure preview source
-4. Clean up legacy navigation leftovers and remove confusing internal links from user-facing flow.
 5. Add regression tests for:
-   - checkpoint mode
-   - coordinate restart mode
-   - path translation host→container
-6. Decide and lock production policy defaults per task (system-prep vs production).
+   - docking-derived structure to MD handoff
+   - checkpoint continuation
+   - host→container path translation
 
 ## 9) Rules for future LLMs
 - Do **not** reintroduce hidden fallback logic for production continuation without explicit UI/metadata warning.
@@ -121,4 +127,4 @@ Status caveat:
 - Build images:
   - `docker compose build`
 
-Last Updated: 2026-05-07
+Last Updated: 2026-05-12

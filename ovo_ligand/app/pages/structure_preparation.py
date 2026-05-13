@@ -21,6 +21,8 @@ from ovo_ligand.app.pages.bound_ligand_md import (
     _run_root,
     _short_job_code,
 )
+from ovo_ligand.app.pages.boltz2_ui import render_boltz2_inline
+
 from ovo_ligand.workflows.bound_ligand_md import (
     MODIFIED_RESIDUE_MAPPINGS,
     _build_ligand_sdf_artifacts,
@@ -463,6 +465,9 @@ def _split_ligand_id_and_smiles(value: str, fallback_ligand_id: str = "LIG") -> 
 
 
 RE_VINA = re.compile(r"REMARK VINA RESULT:\s*(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)")
+RE_GNINA_MIN_AFF = re.compile(r"REMARK\s+minimizedAffinity\s+(-?\d+(?:\.\d+)?)")
+RE_GNINA_CNNSCORE = re.compile(r"REMARK\s+CNNscore\s+(-?\d+(?:\.\d+)?)")
+RE_GNINA_CNNAFF = re.compile(r"REMARK\s+CNNaffinity\s+(-?\d+(?:\.\d+)?)")
 
 
 def _parse_best_vina_score(pdbqt_path: Path) -> float | None:
@@ -478,8 +483,35 @@ def _parse_best_vina_score(pdbqt_path: Path) -> float | None:
     return None
 
 
-def _run_udp_redocking_from_prepared_structure(
+def _parse_gnina_scores(pdbqt_path: Path) -> dict[str, float | None]:
+    out = {
+        "minimized_affinity_kcal_mol": None,
+        "cnnscore": None,
+        "cnnaffinity": None,
+    }
+    if not pdbqt_path.exists():
+        return out
+    try:
+        for line in pdbqt_path.read_text().splitlines():
+            m1 = RE_GNINA_MIN_AFF.search(line)
+            if m1 and out["minimized_affinity_kcal_mol"] is None:
+                out["minimized_affinity_kcal_mol"] = float(m1.group(1))
+            m2 = RE_GNINA_CNNSCORE.search(line)
+            if m2 and out["cnnscore"] is None:
+                out["cnnscore"] = float(m2.group(1))
+            m3 = RE_GNINA_CNNAFF.search(line)
+            if m3 and out["cnnaffinity"] is None:
+                out["cnnaffinity"] = float(m3.group(1))
+            if all(v is not None for v in out.values()):
+                break
+    except Exception:
+        return out
+    return out
+
+
+def _run_docking_from_prepared_structure(
     *,
+    engine: str,
     structure_run_id: str,
     structure_job_code: str,
     pdb_id: str,
@@ -492,10 +524,12 @@ def _run_udp_redocking_from_prepared_structure(
     size: tuple[float, float, float],
     docking_mode: str,
     search_mode: str,
+    exhaustiveness: int,
     use_scrub: bool,
     scrub_ph: float,
     scrub_skip_tautomer: bool,
     extra_udp_args: str = "",
+    extra_vina_args: str = "",
     docker_image: str = "avgu-docking-suite-cuda:latest",
 ) -> dict:
     run_id = str(uuid4())
@@ -547,6 +581,10 @@ def _run_udp_redocking_from_prepared_structure(
         )
     )
     ligand_index.write_text("prepared/ligand.pdbqt\n")
+    safe_engine = str(engine or "udp").strip().lower()
+    if safe_engine not in {"udp", "vina", "gnina"}:
+        safe_engine = "udp"
+
     safe_search_mode = str(search_mode or "detail").strip().lower()
     if safe_search_mode not in {"fast", "balance", "detail"}:
         safe_search_mode = "detail"
@@ -555,8 +593,12 @@ def _run_udp_redocking_from_prepared_structure(
         safe_docking_mode = "classic"
     safe_scrub_ph = float(scrub_ph)
     safe_scrub_skip_tautomer = bool(scrub_skip_tautomer)
+    safe_exhaustiveness = int(exhaustiveness or 30)
+    if safe_exhaustiveness < 1:
+        safe_exhaustiveness = 1
     udp_extra_cli = str(extra_udp_args or "").strip()
-    reference_arg = "--reference_ligand prepared/ligand.pdbqt " if safe_docking_mode == "hybrid" else ""
+    vina_extra_cli = str(extra_vina_args or "").strip()
+    reference_arg = "--reference_ligand prepared/ligand.pdbqt " if (safe_engine == "udp" and safe_docking_mode == "hybrid") else ""
     ligand_prepare_cmd = (
         "mk_prepare_ligand.py -i input/" + shlex.quote(ligand_local.name) + " -o prepared/ligand.pdbqt; "
     )
@@ -571,18 +613,33 @@ def _run_udp_redocking_from_prepared_structure(
             + "mk_prepare_ligand.py -i prepared/ligand_scrubbed.sdf -o prepared/ligand.pdbqt; "
         )
 
-    shell_cmd = (
-        "set -euo pipefail; "
-        + "cd /workspace/work; "
-        + "mk_prepare_receptor.py -i input/" + shlex.quote(protein_local.name) + " -o prepared/receptor -p; "
-        + ligand_prepare_cmd
-        + "udp --receptor prepared/receptor.pdbqt "
+    docking_cmd = (
+        "udp --receptor prepared/receptor.pdbqt "
         + reference_arg
         + "--ligand_index ligand_index.txt "
         + "--config config.txt "
         + "--dir results "
         + f"--search_mode {safe_search_mode} "
         + (udp_extra_cli + " " if udp_extra_cli else "")
+    )
+    if safe_engine in {"vina", "gnina"}:
+        engine_bin = "gnina" if safe_engine == "gnina" else "vina"
+        docking_cmd = (
+            f"{engine_bin} "
+            + "--receptor prepared/receptor.pdbqt "
+            + "--ligand prepared/ligand.pdbqt "
+            + "--config config.txt "
+            + f"--exhaustiveness {safe_exhaustiveness} "
+            + (vina_extra_cli + " " if vina_extra_cli else "")
+            + "--out results/ligand_out.pdbqt "
+        )
+
+    shell_cmd = (
+        "set -euo pipefail; "
+        + "cd /workspace/work; "
+        + "mk_prepare_receptor.py -i input/" + shlex.quote(protein_local.name) + " -o prepared/receptor -p; "
+        + ligand_prepare_cmd
+        + docking_cmd
         + "; "
         + "if [[ -f results/ligand_out.pdbqt ]]; then "
         + "obabel results/ligand_out.pdbqt -O results/ligand_out.pdb >/dev/null 2>&1 || true; "
@@ -606,10 +663,10 @@ def _run_udp_redocking_from_prepared_structure(
         "run_id": run_id,
         "job_code": _short_job_code(run_id),
         "status": "running",
-        "workflow": "UDP_REDOCKING",
+        "workflow": "DOCKING_REDOCKING",
         "job_type": "structure",
-        "source": "udp",
-        "engine": "udp",
+        "source": safe_engine,
+        "engine": safe_engine,
         "source_structure_run_id": structure_run_id,
         "source_structure_job_code": structure_job_code,
         "pdb_id": pdb_id,
@@ -618,12 +675,26 @@ def _run_udp_redocking_from_prepared_structure(
         "ligand_smiles": ligand_smiles,
         "center": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])},
         "size": {"x": float(size[0]), "y": float(size[1]), "z": float(size[2])},
-        "docking_mode": safe_docking_mode,
-        "search_mode": safe_search_mode,
+        "docking_mode": (safe_docking_mode if safe_engine == "udp" else ""),
+        "search_mode": (safe_search_mode if safe_engine == "udp" else ""),
+        "exhaustiveness": (safe_exhaustiveness if safe_engine in {"vina", "gnina"} else None),
+        "engine_call": {
+            "engine": safe_engine,
+            "receptor": "prepared/receptor.pdbqt",
+            "ligand_input_mode": "ligand_index.txt" if safe_engine == "udp" else "prepared/ligand.pdbqt",
+            "config": "config.txt",
+            "output": "results/ligand_out.pdbqt" if safe_engine in {"vina", "gnina"} else "results/",
+            "search_mode": (safe_search_mode if safe_engine == "udp" else None),
+            "docking_mode": (safe_docking_mode if safe_engine == "udp" else None),
+            "reference_ligand_used": bool(safe_engine == "udp" and safe_docking_mode == "hybrid"),
+            "exhaustiveness": (safe_exhaustiveness if safe_engine in {"vina", "gnina"} else None),
+            "extra_args": (udp_extra_cli if safe_engine == "udp" else vina_extra_cli),
+        },
         "use_scrub": bool(use_scrub),
         "scrub_ph": safe_scrub_ph,
         "scrub_skip_tautomer": safe_scrub_skip_tautomer,
-        "extra_udp_args": udp_extra_cli,
+        "extra_udp_args": (udp_extra_cli if safe_engine == "udp" else ""),
+        "extra_vina_args": (vina_extra_cli if safe_engine in {"vina", "gnina"} else ""),
         "docker_image": docker_image,
         "receptor_meeko_repair": receptor_repair_report,
         "created_at": _utc_now_iso(),
@@ -634,14 +705,22 @@ def _run_udp_redocking_from_prepared_structure(
     out_files = sorted(output_dir.rglob("*_out.pdbqt"))
     best_file = out_files[0] if out_files else None
     best_score = _parse_best_vina_score(best_file) if best_file is not None else None
+    gnina_scores = _parse_gnina_scores(best_file) if (best_file is not None and safe_engine == "gnina") else {
+        "minimized_affinity_kcal_mol": None,
+        "cnnscore": None,
+        "cnnaffinity": None,
+    }
     result = {
         "success": proc.returncode == 0,
-        "engine": "udp",
+        "engine": safe_engine,
         "returncode": int(proc.returncode),
         "stdout_tail": (proc.stdout or "")[-12000:],
         "stderr_tail": (proc.stderr or "")[-12000:],
         "best_pose_pdbqt": str(best_file) if best_file is not None else "",
         "best_score_kcal_mol": best_score,
+        "minimized_affinity_kcal_mol": gnina_scores.get("minimized_affinity_kcal_mol"),
+        "cnnscore": gnina_scores.get("cnnscore"),
+        "cnnaffinity": gnina_scores.get("cnnaffinity"),
         "result_files_count": len(out_files),
     }
     (run_dir / "result.json").write_text(json.dumps(result, indent=2))
@@ -688,7 +767,7 @@ def _materialize_docked_structure_outputs(
         meta = {}
     meta.update(
         {
-            "source": "udp",
+            "source": str((docking_run.get("metadata") or {}).get("engine") or (docking_run.get("metadata") or {}).get("source") or "udp"),
             "source_structure_run_id": source_structure.get("run_id"),
             "source_structure_job_code": source_structure.get("job_code"),
             "source_docking_run_id": docking_run.get("run_id"),
@@ -1142,7 +1221,7 @@ def render() -> None:
                 options=["udp", "vina", "gnina"],
                 index=0,
                 key="prep_docking_engine_selector",
-                help="Choose docking backend. Currently, only UDP is implemented in this tab.",
+                help="Choose docking backend.",
             )
             smiles_value = st.text_input(
                 "Ligand ID, SMILES",
@@ -1177,20 +1256,36 @@ def render() -> None:
             size_x = size_cols[0].number_input("size_x", value=22.0, min_value=1.0, step=1.0, key=f"prep_docking_size_x_{selected['run_id']}")
             size_y = size_cols[1].number_input("size_y", value=22.0, min_value=1.0, step=1.0, key=f"prep_docking_size_y_{selected['run_id']}")
             size_z = size_cols[2].number_input("size_z", value=22.0, min_value=1.0, step=1.0, key=f"prep_docking_size_z_{selected['run_id']}")
-            search_mode = size_cols[3].selectbox(
-                "search_mode",
-                options=["fast", "balance", "detail"],
-                index=2,
-                key=f"prep_docking_search_mode_{selected['run_id']}",
-                help="UDP search mode: fast (quick), balance, detail (most thorough; default).",
-            )
-            docking_mode = st.selectbox(
-                "docking_mode",
-                options=["classic", "hybrid"],
-                index=0,
-                key=f"prep_docking_mode_{selected['run_id']}",
-                help="classic: receptor-only UDP command. hybrid: adds --reference_ligand.",
-            )
+            search_mode = "detail"
+            exhaustiveness = 30
+            if docking_engine == "udp":
+                search_mode = size_cols[3].selectbox(
+                    "search_mode",
+                    options=["fast", "balance", "detail"],
+                    index=2,
+                    key=f"prep_docking_search_mode_{selected['run_id']}",
+                    help="UDP search mode: fast (quick), balance, detail (most thorough; default).",
+                )
+            else:
+                exhaustiveness = int(
+                    size_cols[3].number_input(
+                        "exhaustiveness",
+                        min_value=1,
+                        value=30,
+                        step=1,
+                        key=f"prep_docking_exhaustiveness_{selected['run_id']}",
+                        help="Vina search exhaustiveness (higher = slower/more thorough).",
+                    )
+                )
+            docking_mode = "classic"
+            if docking_engine == "udp":
+                docking_mode = st.selectbox(
+                    "docking_mode",
+                    options=["classic", "hybrid"],
+                    index=0,
+                    key=f"prep_docking_mode_{selected['run_id']}",
+                    help="classic: receptor-only UDP command. hybrid: adds --reference_ligand.",
+                )
             scrub_cols = st.columns(3)
             use_scrub = scrub_cols[0].checkbox(
                 "Use scrub.py",
@@ -1211,12 +1306,22 @@ def render() -> None:
                 value=True,
                 key=f"prep_docking_scrub_skip_taut_{selected['run_id']}",
             )
-            extra_udp_args = st.text_input(
-                "Additional UDP args (optional)",
-                value="",
-                key=f"prep_docking_extra_args_{selected['run_id']}",
-                help="Advanced: append extra arguments passed directly to `udp`.",
-            )
+            extra_udp_args = ""
+            extra_vina_args = ""
+            if docking_engine == "udp":
+                extra_udp_args = st.text_input(
+                    "Additional UDP args (optional)",
+                    value="",
+                    key=f"prep_docking_extra_args_{selected['run_id']}",
+                    help="Advanced: append extra arguments passed directly to `udp`.",
+                )
+            elif docking_engine in {"vina", "gnina"}:
+                extra_vina_args = st.text_input(
+                    f"Additional {str(docking_engine).capitalize()} args (optional)",
+                    value="",
+                    key=f"prep_docking_extra_vina_args_{selected['run_id']}",
+                    help=f"Advanced: append extra arguments passed directly to `{docking_engine}`.",
+                )
 
             st.caption(
                 f"Inferred ligand COM center: ({inferred_center[0]:.3f}, {inferred_center[1]:.3f}, {inferred_center[2]:.3f})"
@@ -1239,14 +1344,9 @@ def render() -> None:
 
             if st.button("Run docking from this prepared structure", type="primary", key=f"prep_docking_run_{selected['run_id']}"):
                 try:
-                    if docking_engine != "udp":
-                        st.error(
-                            f"Selected engine `{docking_engine}` is not implemented yet in this tab. "
-                            "Please use `udp` for now."
-                        )
-                        st.stop()
-                    with st.spinner("Running UDP redocking from prepared structure..."):
-                        run = _run_udp_redocking_from_prepared_structure(
+                    with st.spinner(f"Running {docking_engine.upper()} redocking from prepared structure..."):
+                        run = _run_docking_from_prepared_structure(
+                            engine=str(docking_engine),
                             structure_run_id=str(selected["run_id"]),
                             structure_job_code=str(selected["job_code"]),
                             pdb_id=str(selected.get("pdb_id") or ""),
@@ -1259,15 +1359,17 @@ def render() -> None:
                             size=(float(size_x), float(size_y), float(size_z)),
                             docking_mode=str(docking_mode),
                             search_mode=str(search_mode),
+                            exhaustiveness=int(exhaustiveness),
                             use_scrub=bool(use_scrub),
                             scrub_ph=float(scrub_ph),
                             scrub_skip_tautomer=bool(scrub_skip_tautomer),
                             extra_udp_args=str(extra_udp_args),
+                            extra_vina_args=str(extra_vina_args),
                             docker_image="avgu-docking-suite-cuda:latest",
                         )
                     result = run.get("result", {})
                     if bool(result.get("success")):
-                        st.success(f"UDP redocking completed: {run.get('metadata', {}).get('job_code', '')}")
+                        st.success(f"{str(docking_engine).upper()} redocking completed: {run.get('metadata', {}).get('job_code', '')}")
                         registered_code = _materialize_docked_structure_outputs(
                             source_structure=selected,
                             docking_run=run,
@@ -1279,7 +1381,7 @@ def render() -> None:
                             )
                         st.caption("Open this structure run from Jobs – Structure to inspect docking results.")
                     else:
-                        st.error("UDP redocking failed.")
+                        st.error(f"{str(docking_engine).upper()} redocking failed.")
                     st.code(f"Docking run directory:\n{run.get('run_dir', '')}")
                     st.code(f"Docking pose outputs:\n{Path(str(run.get('run_dir', ''))) / 'work' / 'results'}")
                     st.caption(f"Ligand ID used: `{ligand_id_value}`")
@@ -1291,9 +1393,7 @@ def render() -> None:
     with tabs[2]:
         st.markdown("#### Boltz output -> Prepared complex")
         st.caption("Use Boltz-2 predicted structures and normalize them for downstream workflows.")
-        st.info("Generate or import a Boltz result, then map/select chain+ligand for preparation.")
-        if st.button("Open Ligand Boltz-2 prediction page", key="goto_boltz"):
-            _switch_to("app/pages/boltz2.py")
+        render_boltz2_inline()
 
     with tabs[3]:
         st.markdown("#### Custom protein + ligand files")

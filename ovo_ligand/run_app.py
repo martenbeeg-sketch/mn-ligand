@@ -49,14 +49,8 @@ def main() -> None:
     )
     jobs_md_system_page = st.Page(
         page=str(package_root / "app/pages/jobs_md_system.py"),
-        title="Jobs – MD System Prep",
+        title="Jobs – MMxPSA System Prep",
         url_path="jobs-md-system-prep",
-    )
-    jobs_md_legacy_page = st.Page(
-        page=str(package_root / "app/pages/legacy_jobs_redirect.py"),
-        title="Jobs (Legacy)",
-        url_path="jobs",
-        visibility="hidden",
     )
     jobs_structure_page = st.Page(
         page=str(package_root / "app/pages/jobs_structure.py"),
@@ -68,24 +62,48 @@ def main() -> None:
         title="Jobs – OpenFE",
         url_path="jobs-openfe",
     )
-    md_results_page = st.Page(
-        page=str(package_root / "app/pages/md_results.py"),
-        title="MD Results",
-        url_path="md-results",
-        visibility="hidden",
+    jobs_admet_page = st.Page(
+        page=str(package_root / "app/pages/jobs_admet.py"),
+        title="Jobs – ADMET",
+        url_path="jobs-admet",
     )
-    structure_results_page = st.Page(
-        page=str(package_root / "app/pages/structure_results.py"),
-        title="Structure Results",
-        url_path="structure-results",
-        visibility="hidden",
+    jobs_qc_page = st.Page(
+        page=str(package_root / "app/pages/jobs_qc.py"),
+        title="Jobs – QC",
+        url_path="jobs-qc",
     )
-    openfe_results_page = st.Page(
-        page=str(package_root / "app/pages/openfe_results.py"),
-        title="OpenFE Results",
-        url_path="openfe-results",
-        visibility="hidden",
-    )
+    hidden_results_pages = [
+        st.Page(
+            page=str(package_root / "app/pages/structure_results.py"),
+            title="Structure Results",
+            url_path="structure-results",
+            visibility="hidden",
+        ),
+        st.Page(
+            page=str(package_root / "app/pages/md_results.py"),
+            title="MD Results",
+            url_path="md-results",
+            visibility="hidden",
+        ),
+        st.Page(
+            page=str(package_root / "app/pages/openfe_results.py"),
+            title="OpenFE Results",
+            url_path="openfe-results",
+            visibility="hidden",
+        ),
+        st.Page(
+            page=str(package_root / "app/pages/admet_results.py"),
+            title="ADMET Results",
+            url_path="admet-results",
+            visibility="hidden",
+        ),
+        st.Page(
+            page=str(package_root / "app/pages/qc_results.py"),
+            title="QC Results",
+            url_path="qc-results",
+            visibility="hidden",
+        ),
+    ]
 
     task_pages = [
         _make_page(
@@ -97,13 +115,13 @@ def main() -> None:
         _make_page(
             package_root,
             "ovo_ligand.app.pages.md_system_preparation",
-            "MD System Preparation",
+            "MMxPSA System Preparation",
             "workspace-md-system-preparation",
         ),
         _make_page(
             package_root,
             "ovo_ligand.app.pages.md_production",
-            "MD Production",
+            "MMxPSA Production",
             "workspace-md-production",
         ),
         _make_page(
@@ -115,30 +133,21 @@ def main() -> None:
         _make_page(
             package_root,
             "ovo_ligand.app.pages.admet",
-            "Ligand Properties (ADMET/QC)",
-            "workspace-ligand-properties",
+            "Ligand Properties (ADMET)",
+            "workspace-admet",
+        ),
+        _make_page(
+            package_root,
+            "ovo_ligand.app.pages.qc",
+            "Quantum Chemistry (QC)",
+            "workspace-qc",
         ),
     ]
-    structure_preparation_legacy_pages = [
-        st.Page(
-            page=str(package_root / "app/pages/legacy_structure_preparation_redirect.py"),
-            title="Structure Preparation (Legacy)",
-            url_path="structure-preparation",
-            visibility="hidden",
-        ),
-        st.Page(
-            page=str(package_root / "app/pages/legacy_structure_preparation_redirect.py"),
-            title="Structure Preparation (Legacy 2)",
-            url_path="structure_preparation",
-            visibility="hidden",
-        ),
-    ]
-
     pg = st.navigation(
         {
-            "Jobs": [jobs_structure_page, jobs_md_system_page, jobs_md_page, jobs_openfe_page],
+            "Jobs": [jobs_structure_page, jobs_md_system_page, jobs_md_page, jobs_openfe_page, jobs_admet_page, jobs_qc_page],
             "Task": task_pages,
-            "Internal": [md_results_page, structure_results_page, openfe_results_page, jobs_md_legacy_page, *structure_preparation_legacy_pages],
+            "": hidden_results_pages,
         },
         position="sidebar",
     )
