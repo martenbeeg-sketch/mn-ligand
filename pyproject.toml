@@ -3,29 +3,31 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ovo-ligand"
+name = "mn-ligand"
 version = "0.0.1"
-description = "OVO plugin for Docker-backed ligand modelling workflows"
+description = "Standalone Streamlit app for Docker-backed ligand modelling workflows"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "ovo",
+  "matplotlib",
   "mdtraj",
+  "numpy",
   "pandas",
+  "pillow",
   "py3Dmol",
+  "rdkit",
+  "streamlit",
+  "typer",
 ]
 
 [project.scripts]
-ovo-ligand = "ovo_ligand.cli:main"
-
-[project.entry-points."ovo.plugins"]
-plugin = "ovo_ligand:plugin"
+mn-ligand = "mn_ligand.cli:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["ovo_ligand*"]
+include = ["mn_ligand*"]
 
 [tool.setuptools.package-data]
 "*" = ["*"]

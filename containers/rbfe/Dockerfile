@@ -1,7 +1,7 @@
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 LABEL org.opencontainers.image.title="ovolig-rbfe"
-LABEL org.opencontainers.image.description="Blackwell-oriented OpenFE/Kartograf RBFE container for ovo-ligand"
+LABEL org.opencontainers.image.description="Blackwell-oriented OpenFE/Kartograf RBFE container for mn-ligand"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

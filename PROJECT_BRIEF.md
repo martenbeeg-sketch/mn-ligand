@@ -1,15 +1,15 @@
 # PROJECT_BRIEF
 
 ## 1) App overview
-`ovo-ligand` is a Streamlit-based, Docker-backed ligand workflow app. It is intentionally separated from the larger OVO design platform and focuses on small-molecule/protein workflows. The app currently includes:
+`mn-ligand` is a Streamlit-based, Docker-backed ligand workflow app. It is intentionally separated from the larger external design platform and focuses on small-molecule/protein workflows. The app currently includes:
 - Structure preparation (PDB-centric and docking-from-prepared-structure paths with cleaning/repair and ligand refinement artifacts)
 - MD system preparation
 - MD production from prepared systems
 - Results and job tracking pages
 - Active task pages for ADMET/QC/OpenFE and docking engines (UDP/Vina/Gnina) in the structure workflow
 
-The app is implemented as a Python package with CLI entrypoint `ovo-ligand`, and an app runtime rooted at:
-- `/home/user/programs/git-projects/ovo-ligand/.ovo-home`
+The app is implemented as a Python package with CLI entrypoint `mn-ligand`, and an app runtime rooted at:
+- `/home/user/programs/git-projects/mn-ligand/mn-ligand-workdir`
 
 ## 2) Current goal
 Stabilize and complete the modular workflow split with consistent artifact handoff:
@@ -22,15 +22,14 @@ Immediate objective: keep all task outputs deterministic, discoverable in job ta
 
 ## 3) Tech stack (and inspiration folders)
 - Python 3.11 package (`pyproject.toml`)
-- Streamlit UI pages under `ovo_ligand/app/pages`
+- Streamlit UI pages under `mn_ligand/app/pages`
 - Docker execution (`docker run`) from app pages
-- Ligand-X-derived backend modules vendored under `ovo_ligand/ligandx`
-- Mol* viewer component vendored under `ovo_ligand/app/components/molstar_viewer`
+- Ligand-X-derived backend modules vendored under `mn_ligand/ligandx`
+- Mol* viewer component vendored under `mn_ligand/app/components/molstar_viewer`
 - MD stack in containers (OpenMM/OpenFF/RDKit-related, depending on image)
 
 Inspiration/reference folders used during implementation:
-- OVO source: `/home/user/programs/ovo/original/`
-- Ligand-X source context: `/home/user/programs/ligand-x`
+- - Ligand-X source context: `/home/user/programs/ligand-x`
 - HiQBind workflow reference was also discussed and inspected by user context: `/home/user/programs/HiQBind/workflow/` (use status: partial/To be confirmed)
 
 ## 4) Current implementation status
@@ -53,24 +52,24 @@ Status caveats:
 
 ## 5) Most important files/folders
 - App entry and navigation:
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/run_app.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/run_app.py`
 - Main legacy/new workflow pages:
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/bound_ligand_md.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/structure_preparation.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/md_system_preparation.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/md_production.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/jobs.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/jobs_md_system.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/app/pages/md_results.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/bound_ligand_md.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/structure_preparation.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/md_system_preparation.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/md_production.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/jobs.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/jobs_md_system.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/app/pages/md_results.py`
 - MD workflow wrapper:
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/workflows/bound_ligand_md.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/workflows/bound_ligand_md.py`
 - Core MD service/config/runner:
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/ligandx/services/md/config.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/ligandx/services/md/service.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/ligandx/services/md/workflow/equilibration_runner.py`
-  - `/home/user/programs/git-projects/ovo-ligand/ovo_ligand/ligandx/services/md/workflow/system_builder.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/ligandx/services/md/config.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/ligandx/services/md/service.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/ligandx/services/md/workflow/equilibration_runner.py`
+  - `/home/user/programs/git-projects/mn-ligand/mn_ligand/ligandx/services/md/workflow/system_builder.py`
 - Runtime outputs:
-  - `/home/user/programs/git-projects/ovo-ligand/.ovo-home/workdir/runs/`
+  - `/home/user/programs/git-projects/mn-ligand/mn-ligand-workdir/workdir/runs/`
 
 ## 6) Core features
 - PDB download/inspection and bound ligand selection flow (legacy and modularized variants)
@@ -110,20 +109,20 @@ Status caveats:
 - Do **not** reintroduce hidden fallback logic for production continuation without explicit UI/metadata warning.
 - Prefer deterministic checkpoint continuation for production.
 - If a detail is unknown, record `Unknown` or `To be confirmed` instead of guessing.
-- Keep `ovo-ligand` self-contained; do not modify OVO core install unless explicitly requested.
+- Keep `mn-ligand` self-contained; do not modify external platform installs unless explicitly requested.
 - Preserve run provenance in `input.json`, `result.json`, and `metadata.json`.
 - When changing restart logic, inspect a real failed run folder under:
-  - `/home/user/programs/git-projects/ovo-ligand/.ovo-home/workdir/runs/`
-- Keep container path visibility in mind (`/ovo-ligand` and `/output` mounts).
+  - `/home/user/programs/git-projects/mn-ligand/mn-ligand-workdir/workdir/runs/`
+- Keep container path visibility in mind (`/mn-ligand` and `/output` mounts).
 - Avoid broad refactors during bug-fix passes; make scoped, traceable changes.
 
 ## Commands (known)
 - Activate env (example):
   - `source /home/user/mambaforge/etc/profile.d/conda.sh`
-  - `conda activate ovo-ligand`
+  - `conda activate mn-ligand`
 - Run app:
-  - `ovo-ligand init`
-  - `ovo-ligand app`
+  - `mn-ligand init`
+  - `mn-ligand app`
 - Build images:
   - `docker compose build`
 

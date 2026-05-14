@@ -1,9 +1,15 @@
-name: ovo-ligand
+name: mn-ligand
 channels:
   - conda-forge
 dependencies:
   - python=3.11
+  - matplotlib
   - mdtraj
+  - numpy
   - pandas
+  - pillow
   - py3dmol
+  - rdkit
+  - streamlit
+  - typer
   - pip

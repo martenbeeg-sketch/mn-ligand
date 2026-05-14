@@ -4,8 +4,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.mplconfig/
+data/
 .nextflow*
-.ovo-home/
+mn-ligand-workdir/
 .tmp/
 work/
 output/
@@ -13,3 +15,5 @@ results/
 .venv/
 dist/
 build/
+!mn_ligand/app/components/molstar_viewer/frontend/build/
+!mn_ligand/app/components/molstar_viewer/frontend/build/**
