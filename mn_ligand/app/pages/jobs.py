@@ -8,10 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from mn_ligand.app.pages.bound_ligand_md import _run_root, _short_job_code
-from mn_ligand.app.pages.common import reconcile_run_metadata_status
-
-
-_ACTIVE_JOB_STATUSES = {"queued", "running", "preparing"}
+from mn_ligand.app.pages.common import reconcile_run_metadata_status, try_dispatch_next_queued_gpu_job
 
 
 def _read_json(path: Path) -> dict:
@@ -93,6 +90,9 @@ def _collect_bound_md_runs() -> list[dict]:
         rows.append(
             {
                 "run_id": run_dir.name,
+                "repeat_group_id": str(metadata.get("repeat_group_id") or run_dir.name),
+                "repeat_index": int(metadata.get("repeat_index") or 1),
+                "repeat_total": int(metadata.get("repeat_total") or 1),
                 "job_code": metadata.get("job_code") or result.get("job_code") or _short_job_code(run_dir.name),
                 "status": metadata.get("status") or ("completed" if result else "unknown"),
                 "ligand_source": _infer_ligand_source(metadata, result),
@@ -354,22 +354,10 @@ def _collect_qc_jobs() -> list[dict]:
     return rows
 
 
-def _enable_jobs_auto_refresh(rows: list[dict], scope_key: str, interval_seconds: int = 10) -> None:
-    """Auto-refresh jobs page while active jobs exist."""
-    has_active = any(str(r.get("status") or "").strip().lower() in _ACTIVE_JOB_STATUSES for r in rows)
-    if not has_active:
-        return
-    st.caption(f"Auto-refresh active ({scope_key}): every {interval_seconds}s while jobs are running/queued.")
-    st.markdown(
-        f"<meta http-equiv='refresh' content='{int(max(3, interval_seconds))}'>",
-        unsafe_allow_html=True,
-    )
-
-
 def render_md_jobs() -> None:
     st.title("Jobs – MD Production")
+    try_dispatch_next_queued_gpu_job()
     rows = _collect_bound_md_runs()
-    _enable_jobs_auto_refresh(rows, "md-production")
     if not rows:
         st.info("No bound-ligand MD runs found yet.")
         return
@@ -394,10 +382,53 @@ def render_md_jobs() -> None:
         st.caption("No MD jobs match current filters.")
         return
 
-    table_rows = filtered[
+    group_rows: list[dict] = []
+    grouped = filtered.groupby("repeat_group_id", dropna=False)
+    for group_id, g in grouped:
+        g2 = g.sort_values(by="created_at", ascending=True)
+        first = g2.iloc[0]
+        latest = g2.iloc[-1]
+        finished = g2[g2["status"].isin(["completed", "failed"])].sort_values(by="completed_at", ascending=True)
+        open_target = finished.iloc[-1] if not finished.empty else latest
+        total = int(g2["repeat_total"].max()) if "repeat_total" in g2 else len(g2)
+        total = max(total, len(g2))
+        completed = int((g2["status"] == "completed").sum())
+        running = int((g2["status"] == "running").sum())
+        queued = int((g2["status"] == "queued").sum())
+        failed = int((g2["status"] == "failed").sum())
+        if running > 0:
+            group_status = "running"
+        elif queued > 0:
+            group_status = "queued"
+        elif failed > 0:
+            group_status = "failed"
+        elif completed == total:
+            group_status = "completed"
+        else:
+            group_status = str(latest.get("status") or "unknown")
+
+        progress = f"{completed}/{total}"
+        group_rows.append(
+            {
+                "group_id": str(group_id),
+                "run_id": str(open_target["run_id"]),
+                "job_code": str(first["job_code"]),
+                "status": group_status,
+                "repeat_progress": progress,
+                "ligand_source": str(first["ligand_source"]),
+                "pdb_id": str(first["pdb_id"]),
+                "ligand_id": str(first["ligand_id"]),
+                "created_at": str(first["created_at"]),
+                "completed_at": str(latest["completed_at"]),
+                "success": bool((g2["success"] == True).all()),  # noqa: E712
+                "has_production": bool((g2["has_production"] == True).any()),  # noqa: E712
+            }
+        )
+
+    table_rows = pd.DataFrame(group_rows)[
         [
-            "job_code", "status", "ligand_source", "pdb_id", "ligand_id",
-            "created_at", "completed_at", "success", "has_production", "run_id",
+            "job_code", "status", "repeat_progress", "ligand_source", "pdb_id", "ligand_id",
+            "created_at", "completed_at", "success", "has_production", "run_id", "group_id",
         ]
     ].copy()
     table_rows["job_code_link"] = table_rows.apply(
@@ -409,14 +440,14 @@ def render_md_jobs() -> None:
         table_rows[
             [
                 "delete", "job_code_link", "status", "ligand_source", "pdb_id",
-                "ligand_id", "created_at", "completed_at", "success", "has_production",
+                "ligand_id", "repeat_progress", "created_at", "completed_at", "success", "has_production",
             ]
         ],
         hide_index=True,
         use_container_width=True,
         disabled=[
-            "job_code_link", "status", "ligand_source", "pdb_id", "ligand_id",
-            "created_at", "completed_at", "success", "has_production",
+                "job_code_link", "status", "ligand_source", "pdb_id", "ligand_id",
+            "repeat_progress", "created_at", "completed_at", "success", "has_production",
         ],
         column_config={
             "delete": st.column_config.CheckboxColumn("delete", help="Select run for deletion"),
@@ -425,7 +456,7 @@ def render_md_jobs() -> None:
         key="jobs_md_table_editor",
     )
     selected_indices = edited_rows.index[edited_rows["delete"] == True].tolist()  # noqa: E712
-    selected_for_delete = table_rows.iloc[selected_indices]["run_id"].astype(str).tolist()
+    selected_for_delete = table_rows.iloc[selected_indices]["group_id"].astype(str).tolist()
     st.caption("Use `Open` to view results. Select rows with `delete` to remove them.")
     confirm_delete = st.checkbox(
         "I understand this permanently deletes selected MD job folders",
@@ -440,16 +471,23 @@ def render_md_jobs() -> None:
     ):
         deleted: list[str] = []
         failed: list[str] = []
-        for run_id in selected_for_delete:
-            run_dir = _run_root() / "bound-ligand-md" / run_id
-            try:
-                if run_dir.exists():
-                    shutil.rmtree(run_dir)
-                deleted.append(run_id)
-            except Exception as exc:
-                failed.append(f"{run_id}: {exc}")
+        all_rows = _collect_bound_md_runs()
+        by_group: dict[str, list[str]] = {}
+        for row in all_rows:
+            gid = str(row.get("repeat_group_id") or row["run_id"])
+            by_group.setdefault(gid, []).append(str(row["run_id"]))
+        for group_id in selected_for_delete:
+            run_ids = by_group.get(group_id, [group_id])
+            for run_id in run_ids:
+                run_dir = _run_root() / "bound-ligand-md" / run_id
+                try:
+                    if run_dir.exists():
+                        shutil.rmtree(run_dir)
+                    deleted.append(run_id)
+                except Exception as exc:
+                    failed.append(f"{run_id}: {exc}")
         if deleted:
-            st.success(f"Deleted {len(deleted)} MD run(s).")
+            st.success(f"Deleted {len(deleted)} MD run folder(s).")
         if failed:
             st.error("Some runs could not be deleted:\n" + "\n".join(failed))
         st.rerun()
@@ -458,7 +496,6 @@ def render_md_jobs() -> None:
 def render_md_system_prep_jobs() -> None:
     st.title("Jobs – MD System Preparation")
     rows = _collect_md_system_prep_runs()
-    _enable_jobs_auto_refresh(rows, "md-system-prep")
     if not rows:
         st.info("No MD system preparation runs found yet.")
         return
@@ -572,7 +609,6 @@ def render_md_system_prep_jobs() -> None:
 def render_structure_jobs() -> None:
     st.title("Jobs – Structure")
     rows = _collect_structure_jobs()
-    _enable_jobs_auto_refresh(rows, "structure")
     if not rows:
         st.info("No structure preparation jobs found yet.")
         return
@@ -681,7 +717,6 @@ def render_structure_jobs() -> None:
 def render_openfe_jobs() -> None:
     st.title("Jobs – OpenFE")
     rows = _collect_openfe_jobs()
-    _enable_jobs_auto_refresh(rows, "openfe")
     if not rows:
         st.info("No OpenFE/ABFE/RBFE jobs found yet.")
         return
@@ -694,16 +729,17 @@ def render_openfe_jobs() -> None:
             "created_at", "completed_at", "success", "workflow_key", "run_id"
         ]
     ].copy()
+    table["delete"] = False
     table["job_code_link"] = table.apply(
         lambda r: (
             f"./openfe-results?run_type={r['workflow_key']}&run_id={r['run_id']}&job_code={r['job_code']}"
         ),
         axis=1,
     )
-    st.data_editor(
+    edited_rows = st.data_editor(
         table[
             [
-                "job_code_link", "source_job_code", "workflow", "pdb_id", "ligand_id",
+                "delete", "job_code_link", "source_job_code", "workflow", "pdb_id", "ligand_id",
                 "preset", "prod_ns", "eq_ns", "repeats", "timeout_h",
                 "status", "stage", "progress_pct", "current_step", "total_steps", "steps_remaining", "eta_h_remaining", "status_message",
                 "created_at", "completed_at", "success"
@@ -718,6 +754,7 @@ def render_openfe_jobs() -> None:
             "created_at", "completed_at", "success"
         ],
         column_config={
+            "delete": st.column_config.CheckboxColumn("delete", help="Select OpenFE run for deletion"),
             "job_code_link": st.column_config.LinkColumn("job_code", display_text=r".*job_code=([^&]+).*"),
             "source_job_code": st.column_config.TextColumn("source_structure_job"),
             "prod_ns": st.column_config.NumberColumn("prod_ns"),
@@ -732,13 +769,47 @@ def render_openfe_jobs() -> None:
         },
         key="jobs_openfe_table_editor",
     )
-    st.caption("`job_code` is the OpenFE run code. `source_structure_job` shows the originating structure-preparation job.")
+    selected_indices = edited_rows.index[edited_rows["delete"] == True].tolist()  # noqa: E712
+    selected_for_delete = table.iloc[selected_indices]["run_id"].astype(str).tolist()
+    selected_workflow_keys = table.iloc[selected_indices]["workflow_key"].astype(str).tolist()
+
+    st.caption("`job_code` is the OpenFE run code. `source_structure_job` shows the originating structure-preparation job. Select rows with `delete` to remove runs.")
+    confirm_delete = st.checkbox(
+        "I understand this permanently deletes selected OpenFE job folders",
+        value=False,
+        key="jobs_delete_openfe_confirm_checkbox",
+    )
+    if st.button(
+        "Delete selected OpenFE jobs",
+        type="secondary",
+        disabled=(not selected_for_delete) or (not confirm_delete),
+        key="jobs_delete_openfe_selected_button",
+    ):
+        deleted: list[str] = []
+        failed: list[str] = []
+        for run_id, wf_key in zip(selected_for_delete, selected_workflow_keys):
+            if wf_key == "abfe":
+                run_dir = _run_root() / "abfe" / run_id
+            elif wf_key == "rbfe":
+                run_dir = _run_root() / "rbfe" / run_id
+            else:
+                run_dir = _run_root() / "openfe" / run_id
+            try:
+                if run_dir.exists():
+                    shutil.rmtree(run_dir)
+                deleted.append(run_id)
+            except Exception as exc:
+                failed.append(f"{run_id}: {exc}")
+        if deleted:
+            st.success(f"Deleted {len(deleted)} OpenFE run(s).")
+        if failed:
+            st.error("Some runs could not be deleted:\n" + "\n".join(failed))
+        st.rerun()
 
 
 def render_admet_jobs() -> None:
     st.title("Jobs – ADMET")
     rows = _collect_admet_jobs()
-    _enable_jobs_auto_refresh(rows, "admet")
     if not rows:
         st.info("No ADMET jobs found yet.")
         return
@@ -795,7 +866,6 @@ def render_admet_jobs() -> None:
 def render_qc_jobs() -> None:
     st.title("Jobs – QC")
     rows = _collect_qc_jobs()
-    _enable_jobs_auto_refresh(rows, "qc")
     if not rows:
         st.info("No QC jobs found yet.")
         return

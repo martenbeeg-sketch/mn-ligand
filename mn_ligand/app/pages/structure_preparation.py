@@ -353,6 +353,81 @@ def _remove_terminal_oxt_atoms(pdb_data: str) -> tuple[str, list[str]]:
     return "\n".join(kept) + "\n", removed
 
 
+def _remove_orphan_atoms_for_meeko(pdb_data: str) -> tuple[str, list[dict[str, str]]]:
+    """Remove atoms with zero neighbors in RDKit proximity bonding graph.
+
+    Meeko template matching assumes hydrogen atoms have a bonded heavy neighbor.
+    In some prepared receptors, isolated atom records can appear and trigger
+    `atom.GetNeighbors()[0]` crashes in Meeko.
+    """
+    try:
+        from rdkit import Chem
+
+        mol = Chem.MolFromPDBBlock(
+            pdb_data,
+            sanitize=False,
+            removeHs=False,
+            proximityBonding=True,
+        )
+        if mol is None:
+            return pdb_data, []
+
+        orphan_serials: set[str] = set()
+        orphan_atoms: list[dict[str, str]] = []
+        for atom in mol.GetAtoms():
+            if atom.GetDegree() != 0:
+                continue
+            info = atom.GetPDBResidueInfo()
+            if info is None:
+                continue
+            serial = str(info.GetSerialNumber()).strip()
+            if not serial:
+                continue
+            orphan_serials.add(serial)
+            orphan_atoms.append(
+                {
+                    "resname": info.GetResidueName().strip(),
+                    "chain": info.GetChainId().strip() or "_",
+                    "resseq": str(info.GetResidueNumber()),
+                    "icode": info.GetInsertionCode().strip() or "_",
+                    "atom": info.GetName().strip(),
+                    "element": atom.GetSymbol().strip() or "?",
+                    "serial": serial,
+                }
+            )
+        if not orphan_serials:
+            return pdb_data, []
+
+        kept: list[str] = []
+        for line in pdb_data.splitlines():
+            if line.startswith(("ATOM", "HETATM")):
+                serial = line[6:11].strip()
+                if serial in orphan_serials:
+                    continue
+            kept.append(line)
+        return "\n".join(kept) + "\n", orphan_atoms
+    except Exception:
+        return pdb_data, []
+
+
+def _remove_all_hydrogens_for_meeko(pdb_data: str) -> tuple[str, list[dict[str, str]]]:
+    """Remove all explicit hydrogen atom records from receptor PDB text."""
+    kept: list[str] = []
+    removed: list[dict[str, str]] = []
+    for line in pdb_data.splitlines():
+        if not line.startswith(("ATOM", "HETATM")):
+            kept.append(line)
+            continue
+        atom_name = line[12:16].strip().upper()
+        element = (line[76:78].strip().upper() if len(line) >= 78 else "")
+        is_h = atom_name.startswith("H") or element == "H"
+        if is_h:
+            removed.append(_pdb_atom_identity(line))
+            continue
+        kept.append(line)
+    return "\n".join(kept) + "\n", removed
+
+
 def _rdkit_validate_pdb_for_meeko(pdb_data: str) -> tuple[bool, str]:
     """Validate a receptor PDB with RDKit in the same failure mode Meeko hits.
 
@@ -397,10 +472,20 @@ def _prepare_receptor_pdb_for_meeko(pdb_data: str) -> tuple[str, dict]:
         "final_error": "",
         "removed_oxt_count": 0,
         "removed_oxt_atoms": [],
+        "removed_orphan_h_count": 0,
+        "removed_orphan_h_atoms": [],
+        "removed_all_h_count": 0,
+        "removed_all_h_atoms": [],
         "repair_applied": False,
     }
 
     original = pdb_data if pdb_data.endswith("\n") else pdb_data + "\n"
+    original, removed_orphan_h = _remove_orphan_atoms_for_meeko(original)
+    report["removed_orphan_h_count"] = len(removed_orphan_h)
+    report["removed_orphan_h_atoms"] = removed_orphan_h
+    if removed_orphan_h:
+        report["repair_applied"] = True
+
     ok, msg = _rdkit_validate_pdb_for_meeko(original)
     report["original_valid"] = bool(ok)
     report["original_error"] = "" if ok else msg
@@ -415,6 +500,17 @@ def _prepare_receptor_pdb_for_meeko(pdb_data: str) -> tuple[str, dict]:
     report["repair_applied"] = bool(removed_oxt)
 
     ok2, msg2 = _rdkit_validate_pdb_for_meeko(cleaned)
+    if not ok2:
+        no_h, removed_all_h = _remove_all_hydrogens_for_meeko(cleaned)
+        report["removed_all_h_count"] = len(removed_all_h)
+        report["removed_all_h_atoms"] = removed_all_h
+        if removed_all_h:
+            report["repair_applied"] = True
+        ok3, msg3 = _rdkit_validate_pdb_for_meeko(no_h)
+        report["final_valid"] = bool(ok3)
+        report["final_error"] = "" if ok3 else msg3
+        return no_h, report
+
     report["final_valid"] = bool(ok2)
     report["final_error"] = "" if ok2 else msg2
 
@@ -545,6 +641,7 @@ def _run_docking_from_prepared_structure(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     protein_local = input_dir / protein_pdb.name
+    protein_local_noh = input_dir / (protein_pdb.stem + "_noh.pdb")
     ligand_local = input_dir / ligand_sdf.name
 
     # Validate/repair receptor before Meeko. PDBFixer/OpenMM can emit terminal
@@ -553,6 +650,8 @@ def _run_docking_from_prepared_structure(
     protein_text = protein_pdb.read_text()
     protein_text_for_meeko, receptor_repair_report = _prepare_receptor_pdb_for_meeko(protein_text)
     protein_local.write_text(protein_text_for_meeko)
+    protein_text_noh, _removed_h_records = _remove_all_hydrogens_for_meeko(protein_text_for_meeko)
+    protein_local_noh.write_text(protein_text_noh)
     ligand_local.write_bytes(ligand_sdf.read_bytes())
 
     receptor_repair_report_path = input_dir / "receptor_meeko_repair_report.json"
@@ -599,13 +698,28 @@ def _run_docking_from_prepared_structure(
     udp_extra_cli = str(extra_udp_args or "").strip()
     vina_extra_cli = str(extra_vina_args or "").strip()
     reference_arg = "--reference_ligand prepared/ligand.pdbqt " if (safe_engine == "udp" and safe_docking_mode == "hybrid") else ""
+    ligand_source_for_prepare = "input/" + shlex.quote(ligand_local.name)
+    ligand_source_mode = "structure_sdf"
+    ligand_source_build_cmd = ""
+    if ligand_smiles.strip():
+        ligand_source_mode = "user_smiles"
+        ligand_source_for_prepare = "prepared/ligand_from_smiles.sdf"
+        ligand_source_build_cmd = (
+            "obabel -ismi input/" + shlex.quote(ligand_smiles_path.name)
+            + " -osdf -O prepared/ligand_from_smiles.sdf >/dev/null 2>&1; "
+        )
+
     ligand_prepare_cmd = (
-        "mk_prepare_ligand.py -i input/" + shlex.quote(ligand_local.name) + " -o prepared/ligand.pdbqt; "
+        ligand_source_build_cmd
+        + "mk_prepare_ligand.py -i "
+        + ligand_source_for_prepare
+        + " -o prepared/ligand.pdbqt; "
     )
     if bool(use_scrub):
         scrub_flag = " --skip_tautomer" if safe_scrub_skip_tautomer else ""
         ligand_prepare_cmd = (
-            "scrub.py input/" + shlex.quote(ligand_local.name)
+            ligand_source_build_cmd
+            + "scrub.py " + ligand_source_for_prepare
             + " -o prepared/ligand_scrubbed.sdf"
             + f" --ph {safe_scrub_ph:.2f}"
             + scrub_flag
@@ -637,7 +751,10 @@ def _run_docking_from_prepared_structure(
     shell_cmd = (
         "set -euo pipefail; "
         + "cd /workspace/work; "
-        + "mk_prepare_receptor.py -i input/" + shlex.quote(protein_local.name) + " -o prepared/receptor -p; "
+        + "if ! mk_prepare_receptor.py -i input/" + shlex.quote(protein_local.name) + " -o prepared/receptor -p; then "
+        + "echo 'retry_meeko_with_noh' > prepared/receptor_prepare_retry.txt; "
+        + "mk_prepare_receptor.py -i input/" + shlex.quote(protein_local_noh.name) + " -o prepared/receptor -p; "
+        + "fi; "
         + ligand_prepare_cmd
         + docking_cmd
         + "; "
@@ -682,6 +799,8 @@ def _run_docking_from_prepared_structure(
             "engine": safe_engine,
             "receptor": "prepared/receptor.pdbqt",
             "ligand_input_mode": "ligand_index.txt" if safe_engine == "udp" else "prepared/ligand.pdbqt",
+            "ligand_source_mode": ligand_source_mode,
+            "ligand_source_input": ligand_source_for_prepare,
             "config": "config.txt",
             "output": "results/ligand_out.pdbqt" if safe_engine in {"vina", "gnina"} else "results/",
             "search_mode": (safe_search_mode if safe_engine == "udp" else None),
@@ -716,6 +835,7 @@ def _run_docking_from_prepared_structure(
         "returncode": int(proc.returncode),
         "stdout_tail": (proc.stdout or "")[-12000:],
         "stderr_tail": (proc.stderr or "")[-12000:],
+        "receptor_prepare_retry_used": (prep_dir / "receptor_prepare_retry.txt").exists(),
         "best_pose_pdbqt": str(best_file) if best_file is not None else "",
         "best_score_kcal_mol": best_score,
         "minimized_affinity_kcal_mol": gnina_scores.get("minimized_affinity_kcal_mol"),

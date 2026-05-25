@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import shlex
-import subprocess
 from pathlib import Path
 from uuid import uuid4
 
@@ -26,9 +24,8 @@ from mn_ligand.app.pages.bound_ligand_md import (
     _parse_protein_chains,
 )
 from mn_ligand.app.pages.common import (
-    acquire_gpu_job_lock,
-    release_gpu_job_lock,
     queue_gpu_job,
+    resolve_run_artifact_path,
     try_dispatch_next_queued_gpu_job,
 )
 from mn_ligand.app.pages.md import _collect_md_system_prep_jobs
@@ -140,34 +137,25 @@ def render() -> None:
     # Normalize any container-style output paths (/output/...) to host-visible run paths.
     prep_result = _rewrite_output_paths(prep_result, md_system_prep_dir)
 
-    complex_path = Path(selected_job["complex_path"])
+    complex_path = resolve_run_artifact_path(selected_job["complex_path"], must_exist=True)
+    if complex_path is None:
+        st.error("Could not resolve selected prepared complex path from metadata.")
+        return
     protein_refined_path = next(iter(sorted(complex_path.parent.glob("*_protein_refined.pdb"))), None)
     # Require the NPT-final system snapshot from MD system preparation as production start coordinates.
     output_files = ((prep_result.get("md_result") or {}).get("output_files") or {})
     prep_system_pdb_str = str(output_files.get("system_pdb") or "").strip()
-    prep_system_pdb_path = Path(prep_system_pdb_str) if prep_system_pdb_str else None
-    if prep_system_pdb_path and not prep_system_pdb_path.exists():
-        prep_system_pdb_path = None
+    prep_system_pdb_path = resolve_run_artifact_path(prep_system_pdb_str, must_exist=True) if prep_system_pdb_str else None
     npt_final_path_str = str(output_files.get("npt_pdb") or "").strip()
-    npt_final_path = Path(npt_final_path_str) if npt_final_path_str else None
-    if npt_final_path and not npt_final_path.exists():
-        npt_final_path = None
+    npt_final_path = resolve_run_artifact_path(npt_final_path_str, must_exist=True) if npt_final_path_str else None
     npt_checkpoint_str = str(output_files.get("npt_checkpoint") or "").strip()
-    npt_checkpoint_path = Path(npt_checkpoint_str) if npt_checkpoint_str else None
-    if npt_checkpoint_path and not npt_checkpoint_path.exists():
-        npt_checkpoint_path = None
+    npt_checkpoint_path = resolve_run_artifact_path(npt_checkpoint_str, must_exist=True) if npt_checkpoint_str else None
     npt_state_xml_str = str(output_files.get("npt_state_xml") or "").strip()
-    npt_state_xml_path = Path(npt_state_xml_str) if npt_state_xml_str else None
-    if npt_state_xml_path and not npt_state_xml_path.exists():
-        npt_state_xml_path = None
+    npt_state_xml_path = resolve_run_artifact_path(npt_state_xml_str, must_exist=True) if npt_state_xml_str else None
     npt_system_xml_str = str(output_files.get("npt_system_xml") or "").strip()
-    npt_system_xml_path = Path(npt_system_xml_str) if npt_system_xml_str else None
-    if npt_system_xml_path and not npt_system_xml_path.exists():
-        npt_system_xml_path = None
+    npt_system_xml_path = resolve_run_artifact_path(npt_system_xml_str, must_exist=True) if npt_system_xml_str else None
     npt_integrator_xml_str = str(output_files.get("npt_integrator_xml") or "").strip()
-    npt_integrator_xml_path = Path(npt_integrator_xml_str) if npt_integrator_xml_str else None
-    if npt_integrator_xml_path and not npt_integrator_xml_path.exists():
-        npt_integrator_xml_path = None
+    npt_integrator_xml_path = resolve_run_artifact_path(npt_integrator_xml_str, must_exist=True) if npt_integrator_xml_str else None
     restart_mode = st.selectbox(
         "Restart mode",
         options=["Checkpoint (exact continuation)", "NPT-final PDB (coordinate restart)"],
@@ -280,8 +268,8 @@ def render() -> None:
         mm_backend == "ambertools_mmpbsa"
         and amber_complex_prmtop
         and amber_complex_inpcrd
-        and Path(amber_complex_prmtop).exists()
-        and Path(amber_complex_inpcrd).exists()
+        and (resolve_run_artifact_path(amber_complex_prmtop, must_exist=True) is not None)
+        and (resolve_run_artifact_path(amber_complex_inpcrd, must_exist=True) is not None)
     )
     st.markdown("**Runtime Topology Mode**")
     if amber_runtime_ready:
@@ -352,7 +340,7 @@ def render() -> None:
             key=report_state_key,
         )
         allow_restrained_production = st.checkbox("Allow restrained production", value=False)
-        repeat_count = int(st.number_input("Repetitions", min_value=1, value=1, step=1))
+        repeat_count = int(st.number_input("Repetitions", min_value=1, value=1, step=1, key="md_prod_repeat_count"))
     st.caption(
         f"Temperature and pressure are inherited from system preparation: "
         f"{prep_input.get('temperature_k', 300.0)} K, {prep_input.get('pressure', 1.0)} bar."
@@ -399,9 +387,9 @@ def render() -> None:
     st.subheader("5. Run MD production")
     if st.button("Run MD production", type="primary"):
         repeat_group_id = str(uuid4())
+        queued_runs: list[dict[str, str]] = []
         for repeat_idx in range(repeat_count):
             run_id = str(uuid4())
-            lock_ok, lock_info = acquire_gpu_job_lock("bound-ligand-md", run_id)
             output_dir = _run_root() / "bound-ligand-md" / run_id
             output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -410,7 +398,7 @@ def render() -> None:
                 {
                     "created_at": _utc_now_iso(),
                     "workflow": "bound-ligand-md",
-                    "status": "running" if lock_ok else "queued",
+                    "status": "queued",
                     "ligand_source": selected_job.get("source") or "unknown",
                     "structure_run_id": selected_job.get("structure_run_id") or "",
                     "md_system_prep_run_id": selected_job["run_id"],
@@ -453,6 +441,8 @@ def render() -> None:
             input_payload["prepared_complex_path"] = str(complex_path)
             input_payload["source_md_system_prep_run_id"] = selected_job["run_id"]
             input_payload["source_md_system_prep_result_json"] = str(prep_result_json)
+            # Keep all workflow outputs inside this run folder mounted at /output.
+            input_payload["output_dir"] = "/output"
             input_payload["restart_mode"] = restart_mode
             input_payload["mmgbsa_enabled"] = bool(mmgbsa_enabled)
             input_payload["mmgbsa_backend"] = str(mm_backend)
@@ -508,60 +498,29 @@ def render() -> None:
             input_json.write_text(json.dumps(input_payload, indent=2))
 
             command = _build_command(image, output_dir, input_json, result_json, use_gpu)
-            with st.expander(f"Docker command (repeat {repeat_idx + 1}/{repeat_count})", expanded=(repeat_idx == 0)):
-                st.code(shlex.join(command))
+            queue_gpu_job(output_dir, "bound-ligand-md", run_id, command)
+            queued_runs.append(
+                {
+                    "run_id": run_id,
+                    "run_dir": str(output_dir),
+                    "repeat_label": f"{repeat_idx + 1}/{repeat_count}",
+                }
+            )
 
-            if not lock_ok:
-                queue_gpu_job(output_dir, "bound-ligand-md", run_id, command)
-                st.warning(
-                    "GPU busy; job queued. "
-                    f"Active: {lock_info.get('workflow')} ({lock_info.get('run_id')}). "
-                    f"Queued run: {run_id}."
-                )
-                continue
-            try:
-                result = subprocess.run(command, capture_output=True, text=True, check=False)
-                if result.returncode == 0:
-                    st.success(f"MD production completed: {run_id} (repeat {repeat_idx + 1}/{repeat_count})")
-                else:
-                    st.error(f"Workflow failed with exit code {result.returncode} for repeat {repeat_idx + 1}/{repeat_count}")
-            finally:
-                release_gpu_job_lock(run_id)
-            st.code(str(output_dir))
+        st.success(f"Submitted {len(queued_runs)} repeat run(s) in group `{repeat_group_id}`.")
+        for item in queued_runs:
+            st.caption(f"Repeat {item['repeat_label']}: `{item['run_id']}`")
 
-            if result_json.exists():
-                result_payload = _rewrite_output_paths(json.loads(result_json.read_text()), output_dir)
-                metadata = _write_run_metadata(
-                    output_dir,
-                    {
-                        "status": "completed" if result_payload.get("success") else "failed",
-                        "completed_at": _utc_now_iso(),
-                        "result_json": str(result_json),
-                        "host_run_dir": str(output_dir),
-                        "structure_run_id": selected_job.get("structure_run_id") or "",
-                        "md_system_prep_run_id": selected_job["run_id"],
-                    },
-                )
-                result_payload["metadata"] = metadata
-                result_json.write_text(json.dumps(result_payload, indent=2))
-            else:
-                _write_run_metadata(
-                    output_dir,
-                    {
-                        "status": "failed",
-                        "completed_at": _utc_now_iso(),
-                        "failure_reason": f"process_exit_{result.returncode}",
-                        "host_run_dir": str(output_dir),
-                        "md_system_prep_run_id": selected_job["run_id"],
-                    },
-                )
-
-            if result.stdout:
-                with st.expander(f"stdout (repeat {repeat_idx + 1}/{repeat_count})"):
-                    st.code(result.stdout)
-            if result.stderr:
-                with st.expander(f"stderr (repeat {repeat_idx + 1}/{repeat_count})"):
-                    st.code(result.stderr)
+        # Try to start the first queued job immediately if GPU is currently free.
+        dispatched = try_dispatch_next_queued_gpu_job()
+        if dispatched:
+            count = int(dispatched.get("count", 1) or 1)
+            last = dispatched.get("last") or {}
+            st.info(
+                f"Dispatched {count} queued run(s). "
+                f"Last: {last.get('run_id', 'unknown')} "
+                f"({last.get('workflow', 'bound-ligand-md')})."
+            )
         st.switch_page("app/pages/jobs_md.py")
         return
 

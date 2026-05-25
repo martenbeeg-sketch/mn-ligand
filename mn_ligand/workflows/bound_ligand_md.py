@@ -369,6 +369,13 @@ def _compute_mmgbsa_openmm(
                 mapped = repo_root / rel
                 if mapped.exists():
                     cand = mapped
+            # Host absolute paths can include ".../mn-ligand-workdir/...".
+            marker2 = "/mn-ligand-workdir/"
+            if not cand.exists() and marker2 in configured_sdf_path.replace("\\", "/"):
+                rel2 = configured_sdf_path.replace("\\", "/").split(marker2, 1)[1]
+                mapped2 = repo_root / "mn-ligand-workdir" / rel2
+                if mapped2.exists():
+                    cand = mapped2
         if cand.exists():
             ligand_sdf_path = cand
 
@@ -379,10 +386,39 @@ def _compute_mmgbsa_openmm(
                 "status": "failed",
                 "error": "MM/GBSA requires `ligand_refined_sdf_path` or `ligand_refined_sdf_data`.",
             }
-        if "$$$$" not in ligand_sdf_data:
-            ligand_sdf_data = ligand_sdf_data.rstrip() + "\n$$$$\n"
+        # Normalize to a single, clean SD record for robust parsing.
+        ligand_sdf_data = ligand_sdf_data.lstrip()
+        if "$$$$" in ligand_sdf_data:
+            ligand_sdf_data = ligand_sdf_data.split("$$$$", 1)[0].rstrip()
+        if "M  END" not in ligand_sdf_data:
+            return {
+                "status": "failed",
+                "error": "MM/GBSA ligand SDF payload is malformed (missing `M  END`).",
+            }
+        ligand_sdf_data = ligand_sdf_data.rstrip() + "\n$$$$\n"
         ligand_sdf_path = output_dir / "mmgbsa_ligand_input.sdf"
         ligand_sdf_path.write_text(ligand_sdf_data)
+
+    # Normalize SDF to a clean single-record file OpenFF can parse consistently.
+    try:
+        from rdkit import Chem
+
+        supplier = Chem.SDMolSupplier(str(ligand_sdf_path), removeHs=False, sanitize=True)
+        mol = supplier[0] if supplier and len(supplier) else None
+        if mol is None:
+            supplier2 = Chem.SDMolSupplier(str(ligand_sdf_path), removeHs=False, sanitize=False)
+            mol = supplier2[0] if supplier2 and len(supplier2) else None
+        if mol is None:
+            return {
+                "status": "failed",
+                "error": f"MM/GBSA ligand SDF unreadable by RDKit: {ligand_sdf_path}",
+            }
+        writer = Chem.SDWriter(str(ligand_sdf_path))
+        writer.write(mol)
+        writer.close()
+    except Exception:
+        # If RDKit normalization is unavailable, continue with original file.
+        pass
 
     mmgbsa_start_frame = int(config.get("mmgbsa_start_frame", 0))
     mmgbsa_stop_frame = int(config.get("mmgbsa_stop_frame", -1))
@@ -1515,7 +1551,8 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
     except Exception:
         if not (strict_refined and provided_refined_sdf):
             raise
-    output_dir = Path(config.get("output_dir", "/output/md_outputs"))
+    # Always keep artifacts co-located with result.json to avoid cross-run path drift.
+    output_dir = output_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     job_id = config.get("job_id") or f"{config.get('pdb_id', 'pdb').lower()}_{selected['resname'].lower()}"
     file_prefix = f"{config.get('pdb_id', 'pdb').lower()}_{selected['resname'].lower()}"

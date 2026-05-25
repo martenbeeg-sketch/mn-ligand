@@ -67,44 +67,6 @@ RBFE_PRESET_HELP = {
     "production": "Higher confidence for final ranking/reporting.",
 }
 
-def _estimate_abfe_timeout_hours(settings: dict[str, Any]) -> tuple[float, dict[str, Any]]:
-    fast_mode = bool(settings.get("fast_mode", True))
-    prod_ns = float(settings.get("production_length_ns", 0.5 if fast_mode else 10.0))
-    equil_ns = float(settings.get("equilibration_length_ns", 0.1 if fast_mode else 1.0))
-    repeats = max(1, int(settings.get("protocol_repeats", 1 if fast_mode else 3)))
-    replicas_complex = max(1, int(settings.get("n_replicas_complex", 30)))
-    replicas_solvent = max(1, int(settings.get("n_replicas_solvent", 14)))
-    user_timeout = settings.get("dag_timeout_hours")
-    if user_timeout is not None:
-        timeout_h = max(0.25, float(user_timeout))
-        return timeout_h, {"source": "user_override"}
-
-    base_timeout_h = 6.0 if fast_mode else 48.0
-    ref_prod_ns, ref_equil_ns, ref_repeats = (0.5, 0.1, 1) if fast_mode else (10.0, 1.0, 3)
-    ref_repl_c, ref_repl_s = 30.0, 14.0
-
-    requested_units = repeats * (2.0 * prod_ns + 0.5 * equil_ns)
-    reference_units = max(0.1, ref_repeats * (2.0 * ref_prod_ns + 0.5 * ref_equil_ns))
-    base_scale = max(1.0, requested_units / reference_units)
-    replica_scale = ((float(replicas_complex) / ref_repl_c) + (float(replicas_solvent) / ref_repl_s)) / 2.0
-    replica_scale = max(0.5, replica_scale)
-    scale_factor = max(1.0, base_scale * replica_scale)
-    timeout_h = min(336.0, max(base_timeout_h, base_timeout_h * scale_factor * 1.75))
-    return timeout_h, {"source": "auto_scaled", "scale_factor": scale_factor, "replica_scale": replica_scale}
-
-def _estimate_abfe_runtime_hours(settings: dict[str, Any], timeout_hours: float) -> tuple[float, float]:
-    """Heuristic walltime estimate range for UI guidance (not a hard guarantee)."""
-    fast_mode = bool(settings.get("fast_mode", True))
-    # ABFE jobs typically complete well before timeout; keep a broad range.
-    if fast_mode:
-        low_frac, high_frac = 0.25, 0.60
-    else:
-        low_frac, high_frac = 0.35, 0.80
-    low = max(0.1, timeout_hours * low_frac)
-    high = max(low, timeout_hours * high_frac)
-    return low, high
-
-
 def _apply_abfe_preset_to_state(preset: str) -> None:
     base = ABFE_PRESETS.get(preset, ABFE_PRESETS["fast"])
     st.session_state["openfe_abfe_prod_ns"] = float(base["production_length_ns"])
@@ -228,7 +190,6 @@ def _render_selected_structure_preview(key_prefix: str, selected: dict[str, Any]
 def _run_abfe(selected: dict[str, Any]) -> None:
     settings = st.session_state.get("openfe_abfe_settings", {})
     job_code = str(selected.get("job_code") or "ABF")
-    timeout_hours, _ = _estimate_abfe_timeout_hours(settings)
     params = {
         "abfe_container": WORKFLOWS["abfe"]["defaults"]["abfe_container"],
         "protein_pdb": str(selected["protein_refined"]),
@@ -252,7 +213,6 @@ def _run_abfe(selected: dict[str, Any]) -> None:
                 "pressure_bar": float(settings.get("pressure", 0.0)),
                 "hmr": bool(float(settings.get("hydrogen_mass", 1.0)) > 1.5),
                 "timestep_fs": float(settings.get("timestep_fs", 0.0)),
-                "timeout_budget_hours_est": float(timeout_hours),
             },
         },
     }
@@ -529,18 +489,6 @@ def render() -> None:
             "timestep_fs": float(timestep_fs),
             "hydrogen_mass": 3.0 if bool(use_hmr) else 1.0,
         }
-        timeout_hours, timeout_meta = _estimate_abfe_timeout_hours(st.session_state["openfe_abfe_settings"])
-        rt_low_h, rt_high_h = _estimate_abfe_runtime_hours(st.session_state["openfe_abfe_settings"], timeout_hours)
-        st.info(
-            "Estimated ABFE timeout budget: "
-            f"~{timeout_hours:.2f} h "
-            f"({timeout_meta.get('source')})."
-        )
-        st.caption(
-            "Expected runtime (heuristic): "
-            f"~{rt_low_h:.2f}–{rt_high_h:.2f} h "
-            "(depends strongly on GPU load, convergence, and restraint-search behavior)."
-        )
         if st.button("Run OpenFE ABFE", type="primary"):
             _run_abfe(selected)
         return

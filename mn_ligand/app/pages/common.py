@@ -176,6 +176,39 @@ def _run_root() -> Path:
     return root
 
 
+def resolve_run_artifact_path(path_value: str | Path | None, *, must_exist: bool = False) -> Path | None:
+    """Resolve artifact paths across legacy and current run-root layouts.
+
+    Supports old absolute paths from:
+    .../ovo-ligand/.ovo-home/workdir/runs/<...>
+    by remapping them under the current `_run_root()`.
+    """
+    if path_value is None:
+        return None
+    raw = str(path_value).strip()
+    if not raw:
+        return None
+
+    candidate = Path(raw).expanduser()
+    if candidate.exists():
+        return candidate
+
+    marker = "/.ovo-home/workdir/runs/"
+    mapped: Path | None = None
+    normalized = raw.replace("\\", "/")
+    if marker in normalized:
+        rel = normalized.split(marker, 1)[1].lstrip("/")
+        mapped = _run_root() / rel
+    elif not candidate.is_absolute():
+        mapped = _run_root() / candidate
+
+    if mapped is None:
+        return None if must_exist else candidate
+    if must_exist and not mapped.exists():
+        return None
+    return mapped
+
+
 def _gpu_lock_path() -> Path:
     return _run_root() / ".gpu_job.lock"
 
@@ -235,55 +268,63 @@ def queue_gpu_job(run_dir: Path, workflow: str, run_id: str, command: list[str])
 
 
 def try_dispatch_next_queued_gpu_job() -> dict[str, Any] | None:
-    """Dispatch oldest queued GPU job if lock is free.
+    """Dispatch queued GPU jobs sequentially while lock is free.
 
-    Returns a small status dict when a queued job is run, otherwise None.
+    Returns a summary dict when at least one queued job was run, otherwise None.
     """
     if _gpu_lock_path().exists():
         return None
 
-    candidates: list[tuple[float, Path, dict[str, Any]]] = []
-    for meta in _run_root().glob("**/metadata.json"):
-        try:
-            payload = json.loads(meta.read_text())
-        except Exception:
-            continue
-        if str(payload.get("status")) != "queued":
-            continue
+    dispatched: list[dict[str, Any]] = []
+    while True:
+        candidates: list[tuple[float, Path, dict[str, Any]]] = []
+        for meta in _run_root().glob("**/metadata.json"):
+            try:
+                payload = json.loads(meta.read_text())
+            except Exception:
+                continue
+            if str(payload.get("status")) != "queued":
+                continue
+            cmd = payload.get("queued_command")
+            if not isinstance(cmd, list) or not cmd:
+                continue
+            run_dir = meta.parent
+            try:
+                t = run_dir.stat().st_mtime
+            except Exception:
+                t = 0.0
+            candidates.append((t, run_dir, payload))
+
+        if not candidates:
+            break
+        candidates.sort(key=lambda x: x[0])
+        _, run_dir, payload = candidates[0]
+        run_id = str(payload.get("run_id") or run_dir.name)
+        workflow = str(payload.get("workflow") or "unknown")
         cmd = payload.get("queued_command")
-        if not isinstance(cmd, list) or not cmd:
-            continue
-        run_dir = meta.parent
-        try:
-            t = run_dir.stat().st_mtime
-        except Exception:
-            t = 0.0
-        candidates.append((t, run_dir, payload))
+        lock_ok, _ = acquire_gpu_job_lock(workflow, run_id)
+        if not lock_ok:
+            break
 
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    _, run_dir, payload = candidates[0]
-    run_id = str(payload.get("run_id") or run_dir.name)
-    workflow = str(payload.get("workflow") or "unknown")
-    cmd = payload.get("queued_command")
-    lock_ok, _ = acquire_gpu_job_lock(workflow, run_id)
-    if not lock_ok:
-        return None
-
-    metadata_path = run_dir / "metadata.json"
-    payload["status"] = "running"
-    metadata_path.write_text(json.dumps(payload, indent=2))
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        payload["status"] = "completed" if result.returncode == 0 else "failed"
-        payload["returncode"] = int(result.returncode)
-        payload["stdout_tail"] = (result.stdout or "")[-8000:]
-        payload["stderr_tail"] = (result.stderr or "")[-8000:]
+        metadata_path = run_dir / "metadata.json"
+        payload["status"] = "running"
         metadata_path.write_text(json.dumps(payload, indent=2))
-        return {"run_id": run_id, "workflow": workflow, "returncode": int(result.returncode)}
-    finally:
-        release_gpu_job_lock(run_id)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            payload["status"] = "completed" if result.returncode == 0 else "failed"
+            payload["returncode"] = int(result.returncode)
+            payload["stdout_tail"] = (result.stdout or "")[-8000:]
+            payload["stderr_tail"] = (result.stderr or "")[-8000:]
+            metadata_path.write_text(json.dumps(payload, indent=2))
+            dispatched.append(
+                {"run_id": run_id, "workflow": workflow, "returncode": int(result.returncode)}
+            )
+        finally:
+            release_gpu_job_lock(run_id)
+
+    if not dispatched:
+        return None
+    return {"count": len(dispatched), "last": dispatched[-1], "runs": dispatched}
 
 
 def reconcile_run_metadata_status(run_dir: Path) -> bool:

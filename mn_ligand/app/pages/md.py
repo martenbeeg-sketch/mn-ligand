@@ -31,6 +31,7 @@ from mn_ligand.app.pages.common import (
     reconcile_run_metadata_status,
     release_gpu_job_lock,
     queue_gpu_job,
+    resolve_run_artifact_path,
     try_dispatch_next_queued_gpu_job,
 )
 
@@ -125,8 +126,9 @@ def _collect_md_system_prep_jobs() -> list[dict]:
         if not bool(result_payload.get("success")):
             continue
 
-        complex_path = str(input_payload.get("prepared_complex_path") or "").strip()
-        if not complex_path:
+        complex_path_raw = str(input_payload.get("prepared_complex_path") or "").strip()
+        complex_path = resolve_run_artifact_path(complex_path_raw, must_exist=True)
+        if complex_path is None:
             continue
         rows.append(
             {
@@ -136,7 +138,7 @@ def _collect_md_system_prep_jobs() -> list[dict]:
                 "pdb_id": metadata.get("pdb_id") or input_payload.get("pdb_id") or "",
                 "ligand_key": metadata.get("ligand_key") or "",
                 "protein_chains": input_payload.get("selected_protein_chains") or [],
-                "complex_path": complex_path,
+                "complex_path": str(complex_path),
                 "created_at": metadata.get("created_at") or "",
                 "structure_run_id": metadata.get("structure_run_id") or "",
             }
