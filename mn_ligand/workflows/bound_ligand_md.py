@@ -20,6 +20,8 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from mn_ligand.runtime import cpu_process_limit
+
 
 WATER = {"HOH", "WAT", "H2O", "TIP", "TIP3", "TIP4"}
 COMMON_IONS = {
@@ -27,12 +29,26 @@ COMMON_IONS = {
     "CD", "HG", "CL", "BR", "I", "F", "LI", "BE", "AL", "TL", "PB",
 }
 
+POLYMER_RESIDUES = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "ASX", "GLX", "SEC", "PYL", "UNK", "MSE", "HYP", "PCA", "SEP", "TPO",
+    "CSO", "PTR", "KCX", "A", "C", "G", "U", "I", "DA", "DC", "DG", "DT",
+    "DI",
+}
+ATOM_LIGAND_RESIDUES = {"LIG", "UNL"}
+
 MODIFIED_RESIDUE_MAPPINGS = {
     "CAS": {
         "target": "CYS",
         "keep_atoms": {"N", "CA", "C", "O", "CB", "SG"},
         "description": "CAS mapped to CYS by keeping protein-compatible atoms and dropping arsenic substituent atoms.",
-    }
+    },
+    "CAF": {
+        "target": "CYS",
+        "keep_atoms": {"N", "CA", "C", "O", "OXT", "CB", "SG"},
+        "description": "CAF mapped to CYS from its wwPDB L-peptide-linking identity; the cacodylate substituent is removed.",
+    },
 }
 
 
@@ -202,6 +218,60 @@ def map_modified_residues_to_standard(pdb_data: str) -> tuple[str, dict[str, Any
     return "\n".join(output_lines) + "\n", report
 
 
+def normalize_structure_for_repair(
+    structure_data: str,
+    *,
+    biological_assembly_id: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Normalize mmCIF and optional biological assemblies to PDB with Gemmi."""
+    data = structure_data.strip()
+    is_mmcif = data.startswith("data_") or ("_atom_site." in data and "loop_" in data)
+    assembly_id = str(biological_assembly_id or "").strip()
+    if not is_mmcif and not assembly_id:
+        return structure_data, {
+            "engine": "none",
+            "input_format": "pdb",
+            "biological_assembly_id": "",
+        }
+
+    import gemmi
+
+    if is_mmcif:
+        document = gemmi.cif.read_string(structure_data)
+        structure = gemmi.make_structure_from_block(document.sole_block())
+        input_format = "mmcif"
+    else:
+        structure = gemmi.read_pdb_string(structure_data)
+        input_format = "pdb"
+    structure.setup_entities()
+    available_assemblies = [str(assembly.name) for assembly in structure.assemblies]
+    if assembly_id:
+        if assembly_id not in available_assemblies:
+            raise ValueError(
+                f"Biological assembly {assembly_id!r} is unavailable; "
+                f"available assemblies: {available_assemblies or 'none'}"
+            )
+        structure.transform_to_assembly(
+            assembly_id,
+            gemmi.HowToNameCopiedChain.Short,
+        )
+    normalized = structure.make_pdb_string()
+    if not any(line.startswith(("ATOM  ", "HETATM")) for line in normalized.splitlines()):
+        raise ValueError("Gemmi conversion produced no coordinate records")
+    return normalized, {
+        "engine": "Gemmi",
+        "version": str(gemmi.__version__),
+        "input_format": input_format,
+        "output_format": "pdb",
+        "sequence_records_preserved": any(
+            line.startswith("SEQRES") for line in normalized.splitlines()
+        ),
+        "available_biological_assemblies": available_assemblies,
+        "biological_assembly_id": assembly_id,
+        "assembly_chain_naming": "Gemmi Short" if assembly_id else "",
+    }
+
+
 def _atom_occupancy(line: str) -> tuple[float, int]:
     try:
         occupancy = float(line[54:60])
@@ -216,14 +286,26 @@ def ligand_key(resname: str, chain: str, resseq: str, icode: str) -> str:
     return "|".join([resname.strip(), chain.strip() or "_", resseq.strip(), icode.strip() or "_"])
 
 
+def is_bound_ligand_atom(line: str) -> bool:
+    """Recognize PDB ligand atoms, including OpenMM/RDKit ATOM/UNL output."""
+    record = line[:6]
+    if record not in {"ATOM  ", "HETATM"} or len(line) < 27:
+        return False
+    resname = line[17:20].strip().upper()
+    if not resname or resname in WATER or resname in COMMON_IONS or resname in POLYMER_RESIDUES:
+        return False
+    if record == "HETATM":
+        return True
+    chain = line[21].strip()
+    return resname in ATOM_LIGAND_RESIDUES or not chain
+
+
 def parse_bound_ligands(pdb_data: str) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for line in pdb_data.splitlines():
-        if not line.startswith("HETATM"):
+        if not is_bound_ligand_atom(line):
             continue
         resname = line[17:20].strip()
-        if resname in WATER or resname in COMMON_IONS:
-            continue
         chain = line[21].strip() or "_"
         resseq = line[22:26].strip()
         icode = line[26].strip() or "_"
@@ -264,11 +346,11 @@ def parse_bound_ligands(pdb_data: str) -> list[dict[str, Any]]:
 def extract_ligand_pdb(pdb_data: str, selected_key: str) -> str:
     lines = []
     for line in pdb_data.splitlines():
-        if not line.startswith("HETATM"):
+        if not is_bound_ligand_atom(line):
             continue
         key = ligand_key(line[17:20], line[21], line[22:26], line[26])
         if key == selected_key:
-            lines.append(line)
+            lines.append(f"HETATM{line[6:]}" if line.startswith("ATOM  ") else line)
     if not lines:
         raise ValueError(f"Selected ligand was not found in PDB data: {selected_key}")
     return "\n".join(lines + ["END", ""])
@@ -285,17 +367,15 @@ def _split_snapshot_for_mmgbsa(pdb_data: str, selected_key: str) -> dict[str, st
     protein_lines: list[str] = []
     ligand_lines: list[str] = []
     for line in pdb_data.splitlines():
-        if line.startswith("ATOM"):
-            protein_lines.append(line)
+        if not line.startswith(("ATOM  ", "HETATM")):
             continue
-        if not line.startswith("HETATM"):
-            continue
-        resname = line[17:20].strip()
-        if resname in WATER or resname in COMMON_IONS:
+        if not is_bound_ligand_atom(line):
+            if line.startswith("ATOM  "):
+                protein_lines.append(line)
             continue
         key = ligand_key(line[17:20], line[21], line[22:26], line[26])
         if key == selected_key:
-            ligand_lines.append(line)
+            ligand_lines.append(f"HETATM{line[6:]}" if line.startswith("ATOM  ") else line)
     if not protein_lines:
         raise RuntimeError("MM/GBSA input build failed: no protein ATOM records found in snapshot.")
     if not ligand_lines:
@@ -539,10 +619,14 @@ def _parse_amber_final_results(final_results: Path) -> dict[str, float] | None:
             parts = t.split()
             if len(parts) >= 2:
                 delta_pol = float(parts[1])
-        elif t.startswith("ESURF") or t.startswith("ENPOLAR"):
+        elif (
+            t.startswith("ESURF")
+            or t.startswith("ENPOLAR")
+            or t.startswith("EDISPER")
+        ):
             parts = t.split()
             if len(parts) >= 2:
-                delta_np = float(parts[1])
+                delta_np = float(delta_np or 0.0) + float(parts[1])
     if delta_total is None:
         return None
     return {
@@ -665,6 +749,38 @@ def _compute_mmgbsa_ambertools(
                             "lig": _prep_path(prep_out.get("amber_lig_prmtop")),
                         }
                     )
+                    prep_candidates.append(
+                        {
+                            "complex": _resolve_path(
+                                str(
+                                    prep_dir
+                                    / "ambertools_topology"
+                                    / "complex.prmtop"
+                                )
+                            ),
+                            "com": _resolve_path(
+                                str(
+                                    prep_dir
+                                    / "ambertools_topology"
+                                    / "com.prmtop"
+                                )
+                            ),
+                            "rec": _resolve_path(
+                                str(
+                                    prep_dir
+                                    / "ambertools_topology"
+                                    / "rec.prmtop"
+                                )
+                            ),
+                            "lig": _resolve_path(
+                                str(
+                                    prep_dir
+                                    / "ambertools_topology"
+                                    / "lig.prmtop"
+                                )
+                            ),
+                        }
+                    )
                 except Exception:
                     pass
         top_set = next(
@@ -716,7 +832,7 @@ def _compute_mmgbsa_ambertools(
                                 return int(vals[0])
                 return -1
 
-            traj = md.load_dcd(str(traj_file), top=str(top_file))
+            traj = md.load(str(traj_file), top=str(top_file))
             if start_frame < 0:
                 start_frame = 0
             if stop_frame < 0 or stop_frame > traj.n_frames:
@@ -759,7 +875,10 @@ def _compute_mmgbsa_ambertools(
             "/\n"
         )
 
-        cores = int(config.get("mmpbsa_mpi_cores", 32) or 32)
+        cores = int(
+            config.get("mmpbsa_mpi_cores")
+            or cpu_process_limit()
+        )
         run_env = os.environ.copy()
         if not run_env.get("AMBERHOME"):
             probe_bin = Path(mmpbsa_mpi_bin or mmpbsa_bin or "")
@@ -847,7 +966,7 @@ def _compute_mmgbsa_ambertools(
         "units_secondary": "kcal/mol",
         "execution": {
             "mmpbsa_use_mpi_requested": bool(config.get("mmpbsa_use_mpi", True)),
-            "mmpbsa_mpi_requested_cores": int(config.get("mmpbsa_mpi_cores", 32) or 32),
+            "mmpbsa_mpi_requested_cores": int(cores),
             "mmpbsa_mpi_effective_cores": int(cores_effective),
             "mmpbsa_mpi_used": bool(method.startswith("ambertools_mmpbsa_mpi")),
             "mmpbsa_frame_count": int(frame_count if frame_count > 0 else -1),
@@ -903,6 +1022,47 @@ def _resolve_ligand_sdf_path(config: dict[str, Any], output_dir: Path) -> Path |
     return None
 
 
+def _amber_prmtop_natom(prmtop_path: Path) -> int:
+    """Read NATOM from an Amber topology without requiring ParmEd."""
+    lines = prmtop_path.read_text().splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "%FLAG POINTERS":
+            continue
+        if index + 2 >= len(lines):
+            break
+        values = lines[index + 2].split()
+        if values:
+            return int(values[0])
+    raise ValueError(f"Amber topology has no readable POINTERS/NATOM field: {prmtop_path}")
+
+
+def _amber_partition_atom_counts(
+    complex_prmtop: Path,
+    receptor_prmtop: Path,
+    ligand_prmtop: Path,
+) -> dict[str, int | bool]:
+    """Validate the dry complex = receptor + ligand atom partition."""
+    complex_atoms = _amber_prmtop_natom(complex_prmtop)
+    receptor_atoms = _amber_prmtop_natom(receptor_prmtop)
+    ligand_atoms = _amber_prmtop_natom(ligand_prmtop)
+    return {
+        "complex_atoms": complex_atoms,
+        "receptor_atoms": receptor_atoms,
+        "ligand_atoms": ligand_atoms,
+        "balanced": complex_atoms == receptor_atoms + ligand_atoms,
+    }
+
+
+def _source_ligand_key(selected: dict[str, Any]) -> str:
+    """Return the ligand key used by the immutable source coordinates.
+
+    MD normalizes the runtime residue name to LIG, but the source pose can use an
+    engine-specific residue name such as LG1. Amber topology construction reads
+    that immutable source PDB, so it must select with the preserved original key.
+    """
+    return str(selected.get("original_key") or selected.get("key") or "").strip()
+
+
 def _prepare_ambertools_topology_artifacts(
     config: dict[str, Any],
     selected: dict[str, Any],
@@ -925,6 +1085,61 @@ def _prepare_ambertools_topology_artifacts(
         return {"status": "skipped", "reason": "topology_pdb_not_found", "path": str(top_file)}
 
     amber_dir = output_dir / "ambertools_topology"
+    forcefield_method = str(
+        config.get("forcefield_method", "gaff2") or "gaff2"
+    ).strip().lower()
+    if forcefield_method not in {"gaff", "gaff2"}:
+        return {
+            "status": "failed",
+            "error": (
+                "AmberTools topology preparation supports ligand force fields "
+                f"'gaff' and 'gaff2', not {forcefield_method!r}"
+            ),
+        }
+    ligand_leaprc = (
+        "leaprc.gaff2" if forcefield_method == "gaff2" else "leaprc.gaff"
+    )
+    protein_forcefield_method = str(
+        config.get("protein_forcefield_method", "ff14SB") or "ff14SB"
+    ).strip()
+    protein_leaprcs = {
+        "ff14SB": "leaprc.protein.ff14SB",
+        "ff19SB": "leaprc.protein.ff19SB",
+        "ff15ipq": "leaprc.protein.ff15ipq",
+        "ff03.r1": "leaprc.protein.ff03.r1",
+    }
+    protein_leaprc = protein_leaprcs.get(protein_forcefield_method)
+    if protein_leaprc is None:
+        return {
+            "status": "failed",
+            "error": (
+                "AmberTools topology preparation does not support protein "
+                f"force field {protein_forcefield_method!r}"
+            ),
+        }
+    water_model = str(
+        config.get("water_model", "tip3p") or "tip3p"
+    ).strip().lower()
+    water_models = {
+        "tip3p": ("leaprc.water.tip3p", "TIP3PBOX"),
+        "opc": ("leaprc.water.opc", "OPCBOX"),
+        "spce": ("leaprc.water.spce", "SPCBOX"),
+        "tip4pew": ("leaprc.water.tip4pew", "TIP4PEWBOX"),
+    }
+    water_spec = water_models.get(water_model)
+    if water_spec is None:
+        return {
+            "status": "failed",
+            "error": (
+                "AmberTools topology preparation does not support water model "
+                f"{water_model!r}"
+            ),
+        }
+    water_leaprc, water_box = water_spec
+    method = (
+        "ambertools_tleap_"
+        f"{forcefield_method}_{protein_forcefield_method.lower()}_{water_model}"
+    )
     box_shape = str(config.get("box_shape", "dodecahedron") or "dodecahedron").strip().lower()
     padding_nm = float(config.get("padding_nm", 1.0) or 1.0)
     padding_ang = max(6.0, float(padding_nm) * 10.0)
@@ -939,15 +1154,32 @@ def _prepare_ambertools_topology_artifacts(
         "ligand_frcmod": amber_dir / "ligand.frcmod",
     }
     if all(path.exists() for path in expected_existing.values()):
+        partition = _amber_partition_atom_counts(
+            expected_existing["com_prmtop"],
+            expected_existing["rec_prmtop"],
+            expected_existing["lig_prmtop"],
+        )
+        if not bool(partition["balanced"]):
+            return {
+                "status": "failed",
+                "error": (
+                    "Invalid Amber receptor/ligand topology partition: dry complex has "
+                    f"{partition['complex_atoms']} atoms, receptor has "
+                    f"{partition['receptor_atoms']}, and ligand has "
+                    f"{partition['ligand_atoms']}."
+                ),
+                "partition_atom_counts": partition,
+            }
         return {
             "status": "success",
-            "method": "ambertools_tleap_gaff2_ff14sb_tip3p",
+            "method": method,
             "directory": str(amber_dir),
             "files": {k: str(v) for k, v in expected_existing.items()},
+            "partition_atom_counts": partition,
             "solvation": {
                 "box_shape": box_shape,
                 "padding_angstrom": padding_ang,
-                "mode": "explicit_periodic_tip3p",
+                "mode": f"explicit_periodic_{water_model}",
                 "ionic_strength_m": float(config.get("ionic_strength", 0.15) or 0.15),
                 "ions_added": "neutralize_only",
             },
@@ -1009,7 +1241,7 @@ def _prepare_ambertools_topology_artifacts(
                 "-fi", "sdf",
                 "-o", str(ligand_mol2),
                 "-fo", "mol2",
-                "-at", "gaff2",
+                "-at", forcefield_method,
                 "-c", ac_charge_method,
                 "-nc", str(net_charge),
                 "-rn", "LIG",
@@ -1020,9 +1252,25 @@ def _prepare_ambertools_topology_artifacts(
             capture_output=True,
             text=True,
         )
-        subprocess.run([parmchk2_bin, "-i", str(ligand_mol2), "-f", "mol2", "-o", str(ligand_frcmod)], check=True, cwd=str(amber_dir), capture_output=True, text=True)
+        subprocess.run(
+            [
+                parmchk2_bin,
+                "-i",
+                str(ligand_mol2),
+                "-f",
+                "mol2",
+                "-s",
+                forcefield_method,
+                "-o",
+                str(ligand_frcmod),
+            ],
+            check=True,
+            cwd=str(amber_dir),
+            capture_output=True,
+            text=True,
+        )
 
-        ligand_key_selected = str(selected.get("key") or "")
+        ligand_key_selected = _source_ligand_key(selected)
         ligand_atom_names = _parse_mol2_atom_names(ligand_mol2)
         complex_for_tleap = amber_dir / "complex_for_tleap.pdb"
         _build_tleap_complex_pdb(top_file, ligand_key_selected, "LIG", ligand_atom_names, complex_for_tleap)
@@ -1031,9 +1279,9 @@ def _prepare_ambertools_topology_artifacts(
 
         # Pass 1: solvate + neutralize only to get box volume
         leap_in.write_text(
-            "source leaprc.protein.ff14SB\n"
-            "source leaprc.gaff2\n"
-            "source leaprc.water.tip3p\n"
+            f"source {protein_leaprc}\n"
+            f"source {ligand_leaprc}\n"
+            f"source {water_leaprc}\n"
             f"LIG = loadmol2 {ligand_mol2.name}\n"
             f"loadamberparams {ligand_frcmod.name}\n"
             f"REC = loadpdb {protein_for_tleap.name}\n"
@@ -1043,9 +1291,9 @@ def _prepare_ambertools_topology_artifacts(
             "saveamberparm LIG lig.prmtop lig.inpcrd\n"
             f"SOLV = copy COM\n"
             + (
-                f"solvateBox SOLV TIP3PBOX {padding_ang:.3f}\n"
+                f"solvateBox SOLV {water_box} {padding_ang:.3f}\n"
                 if box_shape in {"cube", "cubic", "box", "rect"}
-                else f"solvateOct SOLV TIP3PBOX {padding_ang:.3f}\n"
+                else f"solvateOct SOLV {water_box} {padding_ang:.3f}\n"
             )
             + "addIonsRand SOLV Na+ 0\n"
             + "addIonsRand SOLV Cl- 0\n"
@@ -1062,9 +1310,9 @@ def _prepare_ambertools_topology_artifacts(
 
         # Pass 2: regenerate solvated system with neutralization + target ion pairs.
         leap_in.write_text(
-            "source leaprc.protein.ff14SB\n"
-            "source leaprc.gaff2\n"
-            "source leaprc.water.tip3p\n"
+            f"source {protein_leaprc}\n"
+            f"source {ligand_leaprc}\n"
+            f"source {water_leaprc}\n"
             f"LIG = loadmol2 {ligand_mol2.name}\n"
             f"loadamberparams {ligand_frcmod.name}\n"
             f"REC = loadpdb {protein_for_tleap.name}\n"
@@ -1074,9 +1322,9 @@ def _prepare_ambertools_topology_artifacts(
             "saveamberparm LIG lig.prmtop lig.inpcrd\n"
             f"SOLV = copy COM\n"
             + (
-                f"solvateBox SOLV TIP3PBOX {padding_ang:.3f}\n"
+                f"solvateBox SOLV {water_box} {padding_ang:.3f}\n"
                 if box_shape in {"cube", "cubic", "box", "rect"}
-                else f"solvateOct SOLV TIP3PBOX {padding_ang:.3f}\n"
+                else f"solvateOct SOLV {water_box} {padding_ang:.3f}\n"
             )
             + "addIonsRand SOLV Na+ 0\n"
             + "addIonsRand SOLV Cl- 0\n"
@@ -1087,12 +1335,30 @@ def _prepare_ambertools_topology_artifacts(
             "quit\n"
         )
         subprocess.run([tleap_bin, "-f", str(leap_in)], check=True, cwd=str(amber_dir), capture_output=True, text=True)
+        partition = _amber_partition_atom_counts(
+            amber_dir / "com.prmtop",
+            amber_dir / "rec.prmtop",
+            amber_dir / "lig.prmtop",
+        )
+        if not bool(partition["balanced"]):
+            return {
+                "status": "failed",
+                "error": (
+                    "Invalid Amber receptor/ligand topology partition: dry complex has "
+                    f"{partition['complex_atoms']} atoms, receptor has "
+                    f"{partition['receptor_atoms']}, and ligand has "
+                    f"{partition['ligand_atoms']}. The selected immutable-source ligand "
+                    f"key was {ligand_key_selected!r}."
+                ),
+                "partition_atom_counts": partition,
+                "selected_source_ligand_key": ligand_key_selected,
+            }
     except subprocess.CalledProcessError as exc:
         return {"status": "failed", "error": f"Amber topology preparation failed: {exc}", "stdout": exc.stdout, "stderr": exc.stderr}
 
     return {
         "status": "success",
-        "method": "ambertools_tleap_gaff2_ff14sb_tip3p",
+        "method": method,
         "directory": str(amber_dir),
         "files": {
             "complex_prmtop": str(amber_dir / "complex.prmtop"),
@@ -1104,10 +1370,12 @@ def _prepare_ambertools_topology_artifacts(
             "ligand_mol2": str(ligand_mol2),
             "ligand_frcmod": str(ligand_frcmod),
         },
+        "partition_atom_counts": partition,
+        "selected_source_ligand_key": ligand_key_selected,
         "solvation": {
             "box_shape": box_shape,
             "padding_angstrom": padding_ang,
-            "mode": "explicit_periodic_tip3p",
+            "mode": f"explicit_periodic_{water_model}",
             "ionic_strength_m": float(config.get("ionic_strength", 0.15) or 0.15),
             "ions_added": "neutralize_plus_target_pairs",
             "target_salt_pairs_added": int(n_pairs),
@@ -1476,11 +1744,19 @@ def prepare_structure(config: dict[str, Any], output_path: Path) -> dict[str, An
     from mn_ligand.ligandx.services.structure.processor import StructureProcessor
 
     pdb_id = config.get("pdb_id", "protein").upper()
-    raw_pdb_data = config.get("pdb_data") or download_pdb(pdb_id)
+    raw_pdb_data = config.get("pdb_data")
+    if not raw_pdb_data and config.get("pdb_path"):
+        raw_pdb_data = Path(str(config["pdb_path"])).read_text()
+    if not raw_pdb_data:
+        raw_pdb_data = download_pdb(pdb_id)
+    normalized_input, input_normalization = normalize_structure_for_repair(
+        raw_pdb_data,
+        biological_assembly_id=str(config.get("biological_assembly_id") or ""),
+    )
     if config.get("map_modified_residues", True):
-        structure_input, mapping_report = map_modified_residues_to_standard(raw_pdb_data)
+        structure_input, mapping_report = map_modified_residues_to_standard(normalized_input)
     else:
-        structure_input = raw_pdb_data
+        structure_input = normalized_input
         mapping_report = {"enabled": False, "mappings": {}}
     processor = StructureProcessor()
     processed = processor.process_structure_with_ligands(
@@ -1488,10 +1764,24 @@ def prepare_structure(config: dict[str, Any], output_path: Path) -> dict[str, An
         clean_protein=bool(config.get("clean_protein", True)),
         include_2d_images=False,
         target_pdb_id=pdb_id,
+        preserve_nonwater_heterogens=bool(
+            config.get("preserve_nonwater_heterogens", False)
+        ),
+        repair_options={
+            "ph": float(config.get("ph", 7.4)),
+            "add_missing_residues": bool(config.get("add_missing_residues", True)),
+            "skip_terminal_missing_residues": bool(
+                config.get("skip_terminal_missing_residues", True)
+            ),
+            "max_internal_gap": config.get("max_internal_gap", 15),
+            "refine_rebuilt_positions": bool(config.get("refine_rebuilt_positions", True)),
+        },
     )
+    cleaning_succeeded = bool(processed.get("cleaning_succeeded", not config.get("clean_protein", True)))
     prepared_pdb_data = processed.get("processed_structure") or raw_pdb_data
     output = {
-        "success": True,
+        "success": cleaning_succeeded,
+        "error": str(processed.get("cleaning_error") or ""),
         "pdb_id": pdb_id,
         "raw_pdb_data": raw_pdb_data,
         "mapped_input_pdb_data": structure_input,
@@ -1500,6 +1790,9 @@ def prepare_structure(config: dict[str, Any], output_path: Path) -> dict[str, An
         "protein_cleaned": bool(processed.get("protein_cleaned", False)),
         "components": processed.get("components", {}),
         "modified_residue_mapping": mapping_report,
+        "input_normalization": input_normalization,
+        "repair_report": processed.get("repair_report") or {},
+        "retained_heterogens": processed.get("retained_heterogens") or [],
     }
     output_path.write_text(json.dumps(output, indent=2))
     return output
@@ -1599,6 +1892,9 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
                     "amber_system_pdb_path": _prep_path(
                         prep_out.get("amber_complex_solvated_pdb") or prep_out.get("system_pdb")
                     ),
+                    "amber_com_prmtop_path": _prep_path(prep_out.get("amber_com_prmtop")),
+                    "amber_rec_prmtop_path": _prep_path(prep_out.get("amber_rec_prmtop")),
+                    "amber_lig_prmtop_path": _prep_path(prep_out.get("amber_lig_prmtop")),
                 }
             except Exception:
                 amber_paths = {}
@@ -1716,18 +2012,39 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
                 "job_id": job_id,
                 "charge_method": config.get("charge_method", "gasteiger"),
                 "forcefield_method": config.get("forcefield_method", "openff-2.2.0"),
+                "protein_forcefield_method": config.get(
+                    "protein_forcefield_method", "amber14-all"
+                ),
+                "water_model": config.get("water_model", "tip3p"),
                 "box_shape": config.get("box_shape", "dodecahedron"),
                 "nvt_steps": int(config.get("nvt_steps", 2500)),
                 "npt_steps": int(config.get("npt_steps", 2500)),
                 "heating_steps_per_stage": int(config.get("heating_steps_per_stage", 250)),
                 "production_steps": int(config.get("production_steps", 0)),
                 "production_report_interval": int(config.get("production_report_interval", 2500)),
+                "integration_profile": str(
+                    config.get("integration_profile", "hmr_4fs")
+                ),
+                "production_timestep_fs": float(
+                    config.get("production_timestep_fs", 4.0)
+                ),
+                "hydrogen_mass_amu": (
+                    float(config["hydrogen_mass_amu"])
+                    if config.get("hydrogen_mass_amu") is not None
+                    else None
+                ),
                 "temperature": float(config.get("temperature", 300.0)),
                 "pressure": float(config.get("pressure", 1.0)),
                 "ionic_strength": float(config.get("ionic_strength", 0.15)),
                 "padding_nm": float(config.get("padding_nm", 1.0)),
                 "minimization_max_iterations": int(config.get("minimization_max_iterations", 5000)),
                 "minimization_tolerance_kjmol_nm": float(config.get("minimization_tolerance_kjmol_nm", 10.0)),
+                "preparation_protocol": str(config.get("preparation_protocol", "current_staged")),
+                "density_stabilization_min_ns": float(config.get("density_stabilization_min_ns", 1.0)),
+                "density_stabilization_max_ns": float(config.get("density_stabilization_max_ns", 5.0)),
+                "density_stabilization_increment_ns": float(config.get("density_stabilization_increment_ns", 1.0)),
+                "density_sample_interval_ps": float(config.get("density_sample_interval_ps", 4.0)),
+                "density_plateau_required": bool(config.get("density_plateau_required", True)),
                 "heating_start_temperature": float(config.get("heating_start_temperature", 50.0)),
                 "heating_stages": int(config.get("heating_stages", 6)),
                 "npt_restraint_release_scales": str(config.get("npt_restraint_release_scales", "1.0,0.5,0.2,0.05,0.0")),
@@ -1741,22 +2058,60 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
                 "resume_state_xml_path": config.get("resume_state_xml_path"),
                 "resume_system_xml_path": config.get("resume_system_xml_path"),
                 "resume_integrator_xml_path": config.get("resume_integrator_xml_path"),
-                "production_only_from_prepared": bool(config.get("source_md_system_prep_run_id")),
+                "production_only_from_prepared": bool(
+                    config.get("production_only_from_prepared", bool(config.get("source_md_system_prep_run_id")))
+                ),
+                "strict_checkpoint_resume": bool(config.get("strict_checkpoint_resume", False)),
+                "coordinate_restart_policy": str(
+                    config.get("coordinate_restart_policy", "legacy_minimize_rethermalize")
+                ),
+                "replica_equilibration_steps": int(config.get("replica_equilibration_steps", 0)),
+                "replica_density_revalidation": bool(
+                    config.get("replica_density_revalidation", False)
+                ),
+                "replica_revalidation_max_steps": int(
+                    config.get("replica_revalidation_max_steps", 0)
+                ),
+                "replica_revalidation_increment_steps": int(
+                    config.get("replica_revalidation_increment_steps", 0)
+                ),
+                "replica_density_sample_interval_steps": int(
+                    config.get("replica_density_sample_interval_steps", 0)
+                ),
+                "replica_density_plateau_required": bool(
+                    config.get("replica_density_plateau_required", True)
+                ),
+                "replica_seed": config.get("replica_seed"),
                 "md_backend": md_backend_mode,
                 "amber_complex_prmtop_path": amber_paths.get("amber_complex_prmtop_path"),
                 "amber_complex_inpcrd_path": amber_paths.get("amber_complex_inpcrd_path"),
                 "amber_system_pdb_path": amber_paths.get("amber_system_pdb_path"),
+                "residue_mapping": config.get("residue_mapping"),
                 "minimization_only": bool(config.get("minimization_only", False)),
             }
         )
 
     # Optional runtime overrides for ligand restraints in system construction.
+    preparation_protocol = str(
+        config.get("preparation_protocol", "current_staged")
+    ).strip().lower()
+    roe_brooks_protocol = preparation_protocol == "roe_brooks_2020"
     os.environ["MN_LIGAND_ENABLE_LIGAND_RESTRAINTS"] = "1" if bool(config.get("ligand_restraints_enabled", config.get("apply_ligand_restraints_during_heating_nvt", True))) else "0"
     os.environ["MN_LIGAND_ENABLE_PROTEIN_RESTRAINTS"] = "1" if bool(config.get("apply_protein_restraints_during_heating_nvt", True)) else "0"
-    os.environ["MN_LIGAND_PROTEIN_RESTRAINT_SELECTION"] = str(config.get("protein_restraint_selection", "backbone"))
-    os.environ["MN_LIGAND_PROTEIN_RESTRAINT_K_KJMOL_NM2"] = str(config.get("protein_restraint_k", 1000.0))
+    os.environ["MN_LIGAND_PROTEIN_RESTRAINT_SELECTION"] = (
+        "roe_brooks"
+        if roe_brooks_protocol
+        else str(config.get("protein_restraint_selection", "backbone"))
+    )
+    os.environ["MN_LIGAND_PROTEIN_RESTRAINT_K_KJMOL_NM2"] = str(
+        2092.0
+        if roe_brooks_protocol
+        else config.get("protein_restraint_k", 1000.0)
+    )
     os.environ["MN_LIGAND_ENABLE_PLANARITY_RESTRAINTS"] = "1" if bool(config.get("enable_ligand_planarity_restraints", False)) else "0"
-    if "ligand_lock_k_kjmol_nm2" in config:
+    if roe_brooks_protocol:
+        os.environ["MN_LIGAND_LOCK_K_KJMOL_NM2"] = "2092.0"
+    elif "ligand_lock_k_kjmol_nm2" in config:
         os.environ["MN_LIGAND_LOCK_K_KJMOL_NM2"] = str(config.get("ligand_lock_k_kjmol_nm2"))
     if "ligand_planarity_k_kjmol_nm2" in config:
         os.environ["MN_LIGAND_PLANARITY_K_KJMOL_NM2"] = str(config.get("ligand_planarity_k_kjmol_nm2"))
@@ -1848,6 +2203,9 @@ def run_ligandx_md(config: dict[str, Any], output_path: Path) -> dict[str, Any]:
                         "complex_prmtop": amber_paths.get("amber_complex_prmtop_path"),
                         "complex_inpcrd": amber_paths.get("amber_complex_inpcrd_path"),
                         "complex_solvated_pdb": amber_paths.get("amber_system_pdb_path"),
+                        "com_prmtop": amber_paths.get("amber_com_prmtop_path"),
+                        "rec_prmtop": amber_paths.get("amber_rec_prmtop_path"),
+                        "lig_prmtop": amber_paths.get("amber_lig_prmtop_path"),
                     },
                 }
             else:
@@ -1890,6 +2248,15 @@ def recompute_mmgbsa(input_config: dict[str, Any], result_payload: dict[str, Any
     """Recompute MM/GBSA for an existing run result payload."""
     selected = result_payload.get("selected_ligand") or {}
     md_result = result_payload.get("md_result") or {}
+    if not selected and input_config.get("ligand_key"):
+        parts = str(input_config["ligand_key"]).split("|")
+        selected = {
+            "key": str(input_config["ligand_key"]),
+            "resname": parts[0] if parts and parts[0] else "LIG",
+            "chain": parts[1] if len(parts) > 1 and parts[1] != "_" else "",
+            "resseq": parts[2] if len(parts) > 2 else "",
+            "icode": parts[3] if len(parts) > 3 and parts[3] != "_" else "",
+        }
     if not selected or not md_result:
         result_payload["mmgbsa"] = {
             "status": "failed",

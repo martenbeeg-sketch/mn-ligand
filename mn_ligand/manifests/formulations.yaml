@@ -1,0 +1,113 @@
+schema_version: 1
+components:
+  - id: water
+    label: water / hydrate
+    category: solvate
+    smiles: ["O"]
+  - id: hydrochloride
+    label: hydrochloride / HCl
+    category: acid salt
+    smiles: ["Cl"]
+  - id: chloride
+    label: chloride
+    category: counterion
+    smiles: ["[Cl-]"]
+  - id: hydrobromide
+    label: hydrobromide / HBr
+    category: acid salt
+    smiles: ["Br"]
+  - id: bromide
+    label: bromide
+    category: counterion
+    smiles: ["[Br-]"]
+  - id: hydroiodide
+    label: hydroiodide / HI
+    category: acid salt
+    smiles: ["I"]
+  - id: iodide
+    label: iodide
+    category: counterion
+    smiles: ["[I-]"]
+  - id: sodium
+    label: sodium
+    category: counterion
+    smiles: ["[Na+]", "[Na]"]
+  - id: potassium
+    label: potassium
+    category: counterion
+    smiles: ["[K+]", "[K]", "[K-]"]
+  - id: calcium
+    label: calcium
+    category: counterion
+    smiles: ["[Ca+2]", "[Ca++]"]
+  - id: tfa
+    label: trifluoroacetate / TFA
+    category: acid salt
+    smiles: ["O=C(O)C(F)(F)F", "O=C([O-])C(F)(F)F"]
+  - id: citrate
+    label: citrate
+    category: acid salt
+    smiles:
+      - "O=C(O)CC(O)(CC(=O)O)C(=O)O"
+      - "O=C([O-])CC(O)(CC(=O)[O-])C(=O)[O-]"
+  - id: acetate
+    label: acetate
+    category: acid salt
+    smiles: ["CC(=O)O", "CC(=O)[O-]"]
+  - id: piperazine
+    label: piperazine
+    category: base salt
+    smiles: ["C1CNCCN1"]
+  - id: choline
+    label: choline
+    category: counterion
+    smiles: ["C[N+](C)(C)CCO"]
+  - id: meglumine
+    label: meglumine
+    category: base salt
+    smiles:
+      - "CNC[C@H](O)[C@@H](O)[C@H](O)[C@H](O)CO"
+      - "CNC[C@@H](O)[C@H](O)[C@@H](O)[C@@H](O)CO"
+  - id: lysine
+    label: lysine
+    category: amino-acid salt
+    smiles: ["NCCCC[C@H](N)C(=O)O", "NCCCC[C@@H](N)C(=O)O"]
+  - id: sulfate
+    label: sulfate
+    category: acid salt
+    smiles: ["O=S(=O)(O)O", "O=S(=O)([O-])[O-]"]
+  - id: phosphate
+    label: phosphate
+    category: acid salt
+    smiles: ["OP(=O)(O)O", "O=P([O-])([O-])[O-]"]
+  - id: mesylate
+    label: mesylate
+    category: acid salt
+    smiles: ["CS(=O)(=O)O", "CS(=O)(=O)[O-]"]
+  - id: maleate_fumarate
+    label: maleate / fumarate
+    category: acid salt
+    smiles:
+      - "O=C(O)/C=C\\C(=O)O"
+      - "O=C(O)/C=C/C(=O)O"
+      - "O=C([O-])/C=C\\C(=O)[O-]"
+  - id: succinate
+    label: succinate
+    category: acid salt
+    smiles: ["O=C(O)CCC(=O)O", "O=C([O-])CCC(=O)[O-]"]
+  - id: tartrate
+    label: tartrate
+    category: acid salt
+    smiles:
+      - "O=C(O)C(O)C(O)C(=O)O"
+      - "O=C(O)[C@@H](O)[C@H](O)C(=O)O"
+      - "O=C(O)[C@H](O)[C@@H](O)C(=O)O"
+      - "O=C([O-])C(O)C(O)C(=O)[O-]"
+  - id: oxalate
+    label: oxalate
+    category: acid salt
+    smiles: ["O=C(O)C(=O)O", "O=C([O-])C(=O)[O-]"]
+  - id: lactate
+    label: lactate
+    category: acid salt
+    smiles: ["CC(O)C(=O)O", "CC(O)C(=O)[O-]"]

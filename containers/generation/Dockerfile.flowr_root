@@ -1,0 +1,33 @@
+FROM mnprot-biohub-esm-cu128:latest
+
+ARG SOURCE_COMMIT
+
+LABEL org.opencontainers.image.title="mn-ligand FLOWR.root generation engine" \
+      org.opencontainers.image.description="FLOWR.root CUDA 12.8 runtime for Ada and Blackwell GPUs" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/jule-c/flowr_root"
+
+ENV ENGINE="flowr_root" \
+    CUDA_HOME="/usr/local/cuda" \
+    TORCH_CUDA_ARCH_LIST="8.9;12.0+PTX" \
+    PYTHONPATH="/opt/engine" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+WORKDIR /opt/engine
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir \
+      biopandas biotite datamol dill gemmi hydride lightning lmdb \
+      MDAnalysis openbabel-wheel pdbinf prolif pymol-open-source rmsd \
+      tensordict torch-ema torch-geometric==2.7.0 torchmetrics tqdm
+
+COPY tools_to_implement/flowr_root/ /opt/engine/
+COPY containers/generation/runner.py /opt/mn-ligand/generation_runner.py
+
+ENTRYPOINT ["python", "/opt/mn-ligand/generation_runner.py"]
+CMD ["--help"]

@@ -9,13 +9,13 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
-from hashlib import sha1
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -31,6 +31,15 @@ from mn_ligand.app.components.molstar_viewer import (
     molstar_custom_component,
 )
 from mn_ligand.ligandx.services.md.utils.pdb_utils import normalize_nonpolymer_residue_ids_in_pdb_block
+from mn_ligand.core.jobs import short_job_code
+from mn_ligand.core.docker_runner import (
+    DockerMount,
+    DockerRunSpec,
+    build_docker_command,
+    registered_tool,
+    write_registered_command_record,
+)
+from mn_ligand.runtime import PROJECT_DIR, runs_root
 
 from mn_ligand.workflows.bound_ligand_md import COMMON_IONS, WATER, extract_ligand_pdb, parse_bound_ligands
 
@@ -96,10 +105,7 @@ PROTOCOL_PRESETS = {
 
 
 def _run_root() -> Path:
-    default_root = Path(__file__).resolve().parents[3] / "mn-ligand-workdir" / "workdir" / "runs"
-    root = Path(os.getenv("MN_LIGAND_RUN_DIR", str(default_root)))
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return runs_root()
 
 
 def _utc_now_iso() -> str:
@@ -167,7 +173,7 @@ def _ligand_metadata(resname: str) -> dict[str, str]:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return PROJECT_DIR
 
 
 def _build_command(
@@ -177,30 +183,25 @@ def _build_command(
     result_json: Path,
     use_gpu: bool,
 ) -> list[str]:
-    command = ["docker", "run", "--rm"]
     shm_size = os.getenv("MN_MD_DOCKER_SHM_SIZE", "64g").strip()
-    if shm_size:
-        command += ["--shm-size", shm_size]
-    if use_gpu:
-        command += ["--gpus", "all"]
-    command += [
-        "-v",
-        f"{_repo_root()}:/mn-ligand:ro",
-        "-v",
-        f"{output_dir}:/output",
-        "-e",
-        "PYTHONPATH=/mn-ligand",
-        image,
-        "python",
-        "-m",
-        "mn_ligand.workflows.bound_ligand_md",
-        "run",
-        "--input",
-        f"/output/{input_json.name}",
-        "--output",
-        f"/output/{result_json.name}",
-    ]
-    return command
+    return build_docker_command(
+        DockerRunSpec(
+            tool=registered_tool("openmm_md", image=image),
+            command=(
+                "python", "-m", "mn_ligand.workflows.bound_ligand_md", "run",
+                "--input", f"/output/{input_json.name}",
+                "--output", f"/output/{result_json.name}",
+            ),
+            mounts=(
+                DockerMount(_repo_root(), "/mn-ligand", read_only=True),
+                DockerMount(output_dir, "/output"),
+            ),
+            environment={"PYTHONPATH": "/mn-ligand"},
+            gpu_enabled=use_gpu,
+            shm_size=shm_size,
+            use_host_user=False,
+        )
+    )
 
 
 def _build_prepare_command(
@@ -210,30 +211,25 @@ def _build_prepare_command(
     result_json: Path,
     use_gpu: bool,
 ) -> list[str]:
-    command = ["docker", "run", "--rm"]
     shm_size = os.getenv("MN_MD_DOCKER_SHM_SIZE", "64g").strip()
-    if shm_size:
-        command += ["--shm-size", shm_size]
-    if use_gpu:
-        command += ["--gpus", "all"]
-    command += [
-        "-v",
-        f"{_repo_root()}:/mn-ligand:ro",
-        "-v",
-        f"{output_dir}:/output",
-        "-e",
-        "PYTHONPATH=/mn-ligand",
-        image,
-        "python",
-        "-m",
-        "mn_ligand.workflows.bound_ligand_md",
-        "prepare",
-        "--input",
-        f"/output/{input_json.name}",
-        "--output",
-        f"/output/{result_json.name}",
-    ]
-    return command
+    return build_docker_command(
+        DockerRunSpec(
+            tool=registered_tool("openmm_md", image=image),
+            command=(
+                "python", "-m", "mn_ligand.workflows.bound_ligand_md", "prepare",
+                "--input", f"/output/{input_json.name}",
+                "--output", f"/output/{result_json.name}",
+            ),
+            mounts=(
+                DockerMount(_repo_root(), "/mn-ligand", read_only=True),
+                DockerMount(output_dir, "/output"),
+            ),
+            environment={"PYTHONPATH": "/mn-ligand"},
+            gpu_enabled=use_gpu,
+            shm_size=shm_size,
+            use_host_user=False,
+        )
+    )
 
 
 def _prepare_structure_with_ligandx(
@@ -260,6 +256,12 @@ def _prepare_structure_with_ligandx(
         )
     )
     command = _build_prepare_command(image, output_dir, input_json, result_json, use_gpu)
+    write_registered_command_record(
+        output_dir,
+        tool_id="openmm_md",
+        commands=(command,),
+        image=image,
+    )
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     payload = json.loads(result_json.read_text()) if result_json.exists() else {}
     payload["output_dir"] = str(output_dir)
@@ -414,6 +416,21 @@ def _imaged_snapshot_pdb(snapshot_pdb_path: str, include_solvent: bool) -> str |
             except Exception:
                 pass
 
+        if align:
+            try:
+                reference = md.load(topology_pdb_path)
+                protein_ca = frame.topology.select("protein and name CA")
+                if len(protein_ca) < 3:
+                    protein_ca = frame.topology.select("protein and backbone")
+                if len(protein_ca) >= 3:
+                    frame.superpose(
+                        reference,
+                        atom_indices=protein_ca,
+                        ref_atom_indices=protein_ca,
+                    )
+            except Exception:
+                pass
+
         xyz_angstrom = frame.xyz[0] * 10.0
         atom_index = 0
         lines: list[str] = []
@@ -429,6 +446,62 @@ def _imaged_snapshot_pdb(snapshot_pdb_path: str, include_solvent: bool) -> str |
         return normalize_nonpolymer_residue_ids_in_pdb_block(pdb_text)
     except Exception:
         return None
+
+
+def _pymol_trajectory_script(
+    topology_path: Path,
+    trajectory_path: Path,
+    ligand_resname: str | None,
+) -> str:
+    def quoted(path: Path) -> str:
+        return '"' + str(path.resolve()).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    ligand_selection = (
+        f"resn {str(ligand_resname).strip()}"
+        if ligand_resname
+        else "organic"
+    )
+    return "\n".join(
+        (
+            "reinitialize",
+            f"load {quoted(topology_path)}, md",
+            f"load_traj {quoted(trajectory_path)}, md",
+            "hide everything, md",
+            "show cartoon, md and polymer",
+            f"show sticks, md and ({ligand_selection})",
+            "hide everything, md and solvent",
+            "color gray70, md and polymer",
+            f"color cyan, md and ({ligand_selection})",
+            "intra_fit md and polymer and name CA",
+            f"orient md and ({ligand_selection})",
+            "set movie_loop, 1",
+            "",
+        )
+    )
+
+
+def _launch_local_pymol(script: str) -> tuple[bool, str]:
+    executable = shutil.which("pymol")
+    if not executable:
+        return False, "PyMOL executable was not found on the app host."
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            "w",
+            suffix=".pml",
+            prefix="mn-ligand-md-",
+            delete=False,
+        )
+        with handle:
+            handle.write(script)
+        subprocess.Popen(
+            [executable, handle.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True, handle.name
+    except OSError as exc:
+        return False, str(exc)
 
 
 def _count_pdb_contents(pdb_data: str) -> dict[str, int]:
@@ -741,6 +814,46 @@ def _render_static_line_plot(
     st.pyplot(fig, clear_figure=True, use_container_width=False)
 
 
+def _render_static_horizontal_bar_plot(
+    df: pd.DataFrame,
+    *,
+    label_column: str,
+    value_columns: list[str],
+    title: str,
+    x_label: str,
+) -> None:
+    if df.empty:
+        return
+    fig_height = max(2.0, min(5.5, 0.30 * len(df) + 0.8))
+    fig, ax = plt.subplots(figsize=(5.4, fig_height), dpi=130)
+    positions = np.arange(len(df))
+    bar_height = 0.75 / max(1, len(value_columns))
+    for offset, column in enumerate(value_columns):
+        if column not in df.columns:
+            continue
+        centered = positions + (
+            offset - (len(value_columns) - 1) / 2
+        ) * bar_height
+        ax.barh(
+            centered,
+            df[column],
+            height=bar_height,
+            label=column.replace("_", " "),
+        )
+    ax.set_yticks(positions)
+    ax.set_yticklabels(df[label_column], fontsize=7)
+    ax.invert_yaxis()
+    ax.set_xlim(left=0)
+    ax.set_title(title, fontsize=10, pad=6)
+    ax.set_xlabel(x_label, fontsize=8)
+    ax.tick_params(axis="x", labelsize=8)
+    if len(value_columns) > 1:
+        ax.legend(loc="best", fontsize=7, frameon=False)
+    ax.grid(True, axis="x", alpha=0.2, linewidth=0.6)
+    fig.tight_layout(pad=0.6)
+    st.pyplot(fig, clear_figure=True, use_container_width=False)
+
+
 def _steps_to_ns(steps: int | float) -> float:
     # 4 fs timestep in this workflow.
     return float(steps) * 0.000004
@@ -1016,9 +1129,7 @@ def _ligand_pdb_to_mol2(ligand_pdb: str) -> str | None:
 
 
 def _short_job_code(run_dir_name: str) -> str:
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    digest = sha1(run_dir_name.encode("utf-8")).digest()
-    return "".join(letters[b % 26] for b in digest[:3])
+    return short_job_code(run_dir_name)
 
 
 def _phase_token_from_traj_label(traj_label: str) -> str:
@@ -1270,6 +1381,91 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
     metric_cols[2].metric("Ions", "unknown" if ion_value is None else f"{int(ion_value):,}")
 
     minimization = md_result.get("equilibration_stats", {}).get("energy_minimization", {})
+    preparation = (
+        md_result.get("equilibration_stats", {})
+        .get("preparation_protocol", {})
+    )
+    density_stabilization = preparation.get("density_stabilization", {})
+    if not density_stabilization:
+        density_report_path = output_files.get("density_report")
+        if density_report_path and Path(density_report_path).exists():
+            try:
+                density_stabilization = json.loads(
+                    Path(density_report_path).read_text()
+                )
+            except Exception:
+                density_stabilization = {}
+    density_fit = density_stabilization.get("fit", {})
+    if density_stabilization:
+        st.markdown("#### Density stabilization")
+        plateau = density_fit.get("plateau") is True
+        density_cols = st.columns(4)
+        density_cols[0].metric(
+            "Density gate",
+            "PASS" if plateau else "NOT MET",
+        )
+        density_cols[1].metric(
+            "Stabilization",
+            f"{float(density_stabilization.get('stabilization_ns', 0.0)):.3f} ns",
+        )
+        density_cols[2].metric(
+            "Fitted final density",
+            (
+                "n/a"
+                if density_fit.get("density_final_g_ml") is None
+                else f"{float(density_fit['density_final_g_ml']):.4f} g/mL"
+            ),
+        )
+        density_cols[3].metric(
+            "Samples",
+            str(int(density_fit.get("sample_count", 0))),
+        )
+        criteria = density_fit.get("criteria", {})
+        criteria_df = pd.DataFrame(
+            [
+                {
+                    "criterion": "Final fitted slope",
+                    "value": density_fit.get("final_slope_g_ml_per_ps"),
+                    "threshold": "< 1e-6 g/mL/ps",
+                    "passed": criteria.get("slope_below_1e-6"),
+                },
+                {
+                    "criterion": "Fit vs second-half mean",
+                    "value": density_fit.get(
+                        "final_density_difference_g_ml"
+                    ),
+                    "threshold": "< 0.02 g/mL",
+                    "passed": criteria.get(
+                        "final_difference_below_0_02"
+                    ),
+                },
+                {
+                    "criterion": "Fit residual chi-square",
+                    "value": density_fit.get("chi_squared"),
+                    "threshold": "< 0.5",
+                    "passed": criteria.get("chi_squared_below_0_5"),
+                },
+            ]
+        )
+        st.dataframe(criteria_df, use_container_width=True, hide_index=True)
+        density_series_path = output_files.get("density_series")
+        if density_series_path and Path(density_series_path).exists():
+            try:
+                density_df = pd.read_csv(density_series_path)
+                if {"time_ps", "density_g_ml"}.issubset(density_df.columns):
+                    _render_static_line_plot(
+                        density_df.set_index("time_ps"),
+                        ["density_g_ml"],
+                        "Unrestrained NPT density stabilization",
+                        "g/mL",
+                        x_label="Time (ps)",
+                    )
+            except Exception as exc:
+                st.caption(f"Density series could not be plotted: {exc}")
+        st.caption(
+            "Protein and ligand positional restraints are zero throughout "
+            "this density-stabilization stage and remain zero in production."
+        )
 
     thermodynamics = analytics.get("thermodynamics", {})
     if thermodynamics.get("time_ps"):
@@ -1511,6 +1707,135 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         with st.expander("RMSD table"):
             st.dataframe(rmsd_df, use_container_width=True)
 
+    structural = analytics.get("structural_dynamics", {}) or {}
+    structural_time = [
+        float(value) / 1000.0
+        for value in structural.get("time_ps", [])
+    ]
+    rmsf = structural.get("rmsf", {}) or {}
+    rmsf_values = rmsf.get("ca_rmsf_angstrom", []) or []
+    rmsf_labels = rmsf.get("residues", []) or []
+    if rmsf_values and len(rmsf_values) == len(rmsf_labels):
+        st.markdown("#### Protein flexibility (Cα RMSF)")
+        rmsf_df = pd.DataFrame(
+            {
+                "residue": rmsf_labels,
+                "ca_rmsf_angstrom": rmsf_values,
+            }
+        )
+        plot_df = rmsf_df[["ca_rmsf_angstrom"]].copy()
+        plot_df.index = np.arange(1, len(plot_df) + 1)
+        _render_static_line_plot(
+            plot_df,
+            ["ca_rmsf_angstrom"],
+            "Per-residue Cα flexibility",
+            "RMSF (Å)",
+            x_label="Residue position in analyzed structure",
+        )
+        st.caption(
+            "RMSF is calculated from the protein-aligned production trajectory. "
+            "Peaks indicate locally mobile residues; they are not automatically failures."
+        )
+        with st.expander("Per-residue RMSF table"):
+            st.dataframe(rmsf_df, hide_index=True, width="stretch")
+
+    pocket = structural.get("pocket", {}) or {}
+    centroid_displacement = (
+        pocket.get("ligand_centroid_displacement_angstrom", []) or []
+    )
+    minimum_distance = (
+        pocket.get("minimum_protein_distance_angstrom", []) or []
+    )
+    if (
+        structural_time
+        and len(centroid_displacement) == len(structural_time)
+        and len(minimum_distance) == len(structural_time)
+    ):
+        st.markdown("#### Ligand reference-site retention")
+        retention_columns = st.columns(3)
+        retained_fraction = pocket.get("retained_fraction")
+        retention_columns[0].metric(
+            "Frames retained",
+            (
+                "n/a"
+                if retained_fraction is None
+                else f"{100.0 * float(retained_fraction):.1f}%"
+            ),
+        )
+        retention_columns[1].metric(
+            "Maximum centroid displacement",
+            f"{max(float(value) for value in centroid_displacement):.2f} Å",
+        )
+        retention_columns[2].metric(
+            "Largest minimum protein distance",
+            f"{max(float(value) for value in minimum_distance):.2f} Å",
+        )
+        pocket_df = pd.DataFrame(
+            {
+                "time_ns": structural_time,
+                "ligand_centroid_displacement_A": centroid_displacement,
+                "minimum_protein_distance_A": minimum_distance,
+            }
+        ).set_index("time_ns")
+        _render_static_line_plot(
+            pocket_df,
+            [
+                "ligand_centroid_displacement_A",
+                "minimum_protein_distance_A",
+            ],
+            "Ligand placement relative to the first production frame",
+            "Distance (Å)",
+        )
+        st.caption(
+            "A frame is classified as reference-site retained when the ligand "
+            f"centroid remains within {float(pocket.get('site_displacement_cutoff_angstrom', 5.0)):.1f} Å "
+            "of its first production-frame position and at least one protein "
+            f"contact remains within {float(pocket.get('contact_cutoff_angstrom', 4.5)):.1f} Å. "
+            "This is a transparent stability diagnostic, not proof of binding."
+        )
+
+    contacts = structural.get("contacts", {}) or {}
+    contact_rows = contacts.get("residues", []) or []
+    if contact_rows:
+        st.markdown("#### Protein–ligand interaction occupancy")
+        contact_df = pd.DataFrame(contact_rows)
+        displayed_contacts = contact_df.head(15).copy()
+        _render_static_horizontal_bar_plot(
+            displayed_contacts,
+            label_column="residue",
+            value_columns=[
+                "contact_occupancy",
+                "hydrogen_bond_occupancy",
+            ],
+            title="Most persistent protein–ligand contacts",
+            x_label="Fraction of analyzed production frames",
+        )
+        distance_series = contacts.get("distance_series", {}) or {}
+        if structural_time and distance_series:
+            valid_series = {
+                str(label): values
+                for label, values in distance_series.items()
+                if len(values) == len(structural_time)
+            }
+            if valid_series:
+                distance_df = pd.DataFrame(
+                    {"time_ns": structural_time, **valid_series}
+                ).set_index("time_ns")
+                _render_static_line_plot(
+                    distance_df,
+                    list(valid_series),
+                    "Minimum ligand distance for top-contact residues",
+                    "Distance (Å)",
+                )
+        st.caption(
+            "Contact occupancy uses a 4.5 Å heavy-atom cutoff. Hydrogen bonds "
+            "use MDTraj geometric criteria and are reported independently."
+        )
+        with st.expander("Interaction occupancy table"):
+            st.dataframe(contact_df, hide_index=True, width="stretch")
+    for warning in structural.get("warnings", []) or []:
+        st.warning(str(warning))
+
     st.markdown("#### 3D snapshots")
     snapshot_options = {
         "Prepared protein": output_files.get("protein_prepared"),
@@ -1569,7 +1894,11 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
     }
     trajectory_files = {key: value for key, value in trajectory_files.items() if value and Path(value).exists()}
     if trajectory_files:
-        st.markdown("#### Trajectory playback")
+        st.markdown("#### Trajectory frames")
+        st.caption(
+            "The browser loads one requested frame at a time. This avoids converting "
+            "and retaining the complete DCD as a large multi-model PDB."
+        )
         traj_label = st.selectbox(
             "Trajectory",
             list(trajectory_files),
@@ -1585,12 +1914,12 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         traj_cols = st.columns(3)
         with traj_cols[0]:
             stride = st.number_input(
-                "Frame stride",
+                "Frame sampling stride",
                 min_value=1,
                 max_value=500,
                 value=1,
                 step=1,
-                help="Use a larger stride for faster loading and smaller playback files.",
+                help="Use a larger stride to browse a coarser set of trajectory frames.",
                 key=f"trajectory_stride_{run_dir.name}",
             )
         with traj_cols[1]:
@@ -1606,99 +1935,48 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
         sampled_frames = (total_frames + int(stride) - 1) // int(stride) if total_frames else None
         if total_frames:
             st.caption(
-                f"Frame estimate before generation: total `{total_frames}` frame(s), "
-                f"with stride `{int(stride)}` -> about `{sampled_frames}` frame(s) to render."
+                f"Available frames: `{total_frames}`; stride `{int(stride)}` "
+                f"provides about `{sampled_frames}` selectable positions."
             )
         else:
-            st.caption("Frame estimate unavailable (could not read DCD header); generation will still work.")
+            st.caption(
+                "Frame count is unavailable, so the first frame will be shown."
+            )
         show_box_trajectory = st.checkbox(
             "Show periodic box contour",
             value=False,
             key=f"trajectory_box_{run_dir.name}_{traj_label}",
         )
         if topology_path:
-            if st.button("Generate trajectory viewer", key=f"trajectory_view_{run_dir.name}_{traj_label}"):
-                with st.spinner("Converting DCD frames to a Py3Dmol trajectory..."):
-                    try:
-                        processed = _trajectory_to_multimodel_pdb(
-                            trajectory_files[traj_label],
-                            str(topology_path),
-                            int(stride),
-                            align_trajectory,
-                            include_solvent_trajectory,
+            if sampled_frames:
+                quick_frame = st.segmented_control(
+                    "Frame position",
+                    ["First", "Middle", "Last", "Custom"],
+                    default="Last",
+                    key=f"trajectory_quick_frame_{run_dir.name}_{traj_label}",
+                )
+                quick_indices = {
+                    "First": 0,
+                    "Middle": max(0, sampled_frames // 2),
+                    "Last": max(0, sampled_frames - 1),
+                }
+                if quick_frame == "Custom":
+                    selected_frame_idx = int(
+                        st.slider(
+                            "Sampled frame",
+                            min_value=0,
+                            max_value=max(0, sampled_frames - 1),
+                            value=max(0, sampled_frames - 1),
+                            step=1,
+                            key=f"trajectory_frame_{run_dir.name}_{traj_label}",
                         )
-                    except Exception as exc:
-                        processed = {"error": str(exc), "pdb_data": ""}
-                if processed.get("error"):
-                    st.error(f"Trajectory conversion failed: {processed['error']}")
-                    st.info("Install MDTraj in the mn-ligand environment to enable DCD playback: conda install -c conda-forge mdtraj")
-                elif processed.get("pdb_data"):
-                    st.session_state[f"trajectory_pdb_{run_dir.name}_{traj_label}"] = processed["pdb_data"]
-                    st.session_state[f"trajectory_unitcell_{run_dir.name}_{traj_label}"] = processed.get("unitcell_data")
-                    st.session_state[f"trajectory_frames_{run_dir.name}_{traj_label}"] = _count_multimodel_frames(
-                        processed["pdb_data"]
                     )
-            trajectory_pdb = st.session_state.get(f"trajectory_pdb_{run_dir.name}_{traj_label}")
-            trajectory_frames = st.session_state.get(f"trajectory_frames_{run_dir.name}_{traj_label}", 0)
-            if trajectory_pdb:
-                st.caption("Trajectory export mode: template frame download from DCD + stage topology (authoritative path).")
-                counts = _count_pdb_contents(trajectory_pdb)
-                st.caption(
-                    f"Multi-model PDB playback: {counts['total_atoms']:,} atom records, {trajectory_frames} frame(s). "
-                    "Right-click/drag and scroll controls still work."
-                )
-                if trajectory_frames <= 1:
-                    st.warning(
-                        "Only one frame is available, so playback appears static. "
-                        "Use a smaller stride (typically 1) and regenerate."
-                    )
-                play_state_key = f"trajectory_playing_{run_dir.name}_{traj_label}"
-                frame_state_key = f"trajectory_frame_idx_{run_dir.name}_{traj_label}"
-                frame_widget_key = f"{frame_state_key}_widget"
-                if play_state_key not in st.session_state:
-                    st.session_state[play_state_key] = trajectory_frames > 1
-                if frame_state_key not in st.session_state:
-                    st.session_state[frame_state_key] = 0
-                if frame_widget_key not in st.session_state:
-                    st.session_state[frame_widget_key] = int(st.session_state[frame_state_key])
-
-                b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
-                with b1:
-                    if st.button("Play", key=f"trajectory_play_{run_dir.name}_{traj_label}", disabled=trajectory_frames <= 1):
-                        st.session_state[play_state_key] = True
-                with b2:
-                    if st.button("Pause", key=f"trajectory_pause_{run_dir.name}_{traj_label}", disabled=trajectory_frames <= 1):
-                        st.session_state[play_state_key] = False
-                with b3:
-                    prev_clicked = st.button(
-                        "Prev", key=f"trajectory_prev_{run_dir.name}_{traj_label}", disabled=trajectory_frames <= 1
-                    )
-                    if prev_clicked and st.session_state[frame_state_key] > 0:
-                        st.session_state[play_state_key] = False
-                        st.session_state[frame_state_key] -= 1
-                        st.session_state[frame_widget_key] = int(st.session_state[frame_state_key])
-                with b4:
-                    next_clicked = st.button(
-                        "Next", key=f"trajectory_next_{run_dir.name}_{traj_label}", disabled=trajectory_frames <= 1
-                    )
-                    if next_clicked and st.session_state[frame_state_key] < max(0, trajectory_frames - 1):
-                        st.session_state[play_state_key] = False
-                        st.session_state[frame_state_key] += 1
-                        st.session_state[frame_widget_key] = int(st.session_state[frame_state_key])
-
-                slider_value = st.slider(
-                    "Frame",
-                    min_value=0,
-                    max_value=max(0, trajectory_frames - 1),
-                    value=min(st.session_state[frame_state_key], max(0, trajectory_frames - 1)),
-                    step=1,
-                    key=frame_widget_key,
-                )
-                st.session_state[frame_state_key] = int(slider_value)
-                selected_frame_idx = int(slider_value)
-                selected_frame_pdb = _frame_from_multimodel_pdb(trajectory_pdb, selected_frame_idx)
-                selected_frame_pdb = normalize_nonpolymer_residue_ids_in_pdb_block(selected_frame_pdb)
-                download_frame_pdb = _frame_from_dcd_with_topology(
+                else:
+                    selected_frame_idx = quick_indices[str(quick_frame)]
+            else:
+                selected_frame_idx = 0
+            with st.spinner("Loading selected trajectory frame..."):
+                selected_frame_pdb = _frame_from_dcd_with_topology(
                     dcd_path=trajectory_files[traj_label],
                     topology_pdb_path=str(topology_path),
                     frame_index=selected_frame_idx,
@@ -1706,58 +1984,77 @@ def _render_md_results(result_payload: dict, run_dir: Path) -> None:
                     align=align_trajectory,
                     include_solvent=include_solvent_trajectory,
                 )
-                if not download_frame_pdb:
-                    download_frame_pdb = selected_frame_pdb
-                download_frame_pdb = _add_ligand_conect_to_frame(download_frame_pdb, selected_ligand)
+            if selected_frame_pdb:
+                selected_frame_pdb = _add_ligand_conect_to_frame(
+                    selected_frame_pdb, selected_ligand
+                )
+                raw_frame_index = selected_frame_idx * int(stride)
+                if total_frames:
+                    raw_frame_index = min(raw_frame_index, total_frames - 1)
                 frame_filename = _download_frame_filename(
                     run_dir=run_dir,
                     pdb_id=pdb_id,
                     ligand=selected_ligand,
                     traj_label=traj_label,
-                    frame_idx=selected_frame_idx,
-                    frame_count=trajectory_frames,
+                    frame_idx=raw_frame_index,
+                    frame_count=total_frames or 1,
                     analytics=analytics,
                 )
-                st.caption(f"Frame {selected_frame_idx + 1} / {trajectory_frames}")
-                st.caption(f"Filename: {frame_filename}")
-                if st.session_state[play_state_key] and trajectory_frames > 1:
-                    st.caption("Playback: running")
+                st.caption(
+                    f"Raw trajectory frame {raw_frame_index + 1}"
+                    + (f" / {total_frames}" if total_frames else "")
+                )
+                _render_py3dmol_view(
+                    selected_frame_pdb,
+                    ligand_resname,
+                    height=620,
+                    animate=False,
+                    show_unit_cell=show_box_trajectory,
+                    persist_key=f"{run_dir.name}_{traj_label}_single_frame",
+                    frame_label=f"Frame {raw_frame_index + 1}",
+                )
                 st.download_button(
-                    "Download current frame (.pdb)",
-                    data=download_frame_pdb,
+                    "Download selected frame (.pdb)",
+                    data=selected_frame_pdb,
                     file_name=frame_filename,
                     mime="chemical/x-pdb",
                     key=f"trajectory_download_frame_{run_dir.name}_{traj_label}",
                 )
+            else:
+                st.error(
+                    "Could not extract the selected frame. Verify that MDTraj is "
+                    "installed and that the topology atom order matches the DCD."
+                )
 
-                if st.session_state[play_state_key] and trajectory_frames > 1:
-                    _render_py3dmol_view(
-                        trajectory_pdb,
-                        ligand_resname,
-                        height=620,
-                        animate=True,
-                        show_unit_cell=show_box_trajectory,
-                        persist_key=f"{run_dir.name}_{traj_label}",
-                        frame_label=None,
-                        frame_count=trajectory_frames,
-                        frame_index=selected_frame_idx,
-                        playing=True,
-                    )
+            st.markdown("##### Open complete trajectory in PyMOL")
+            pymol_script = _pymol_trajectory_script(
+                topology_path,
+                Path(trajectory_files[traj_label]),
+                ligand_resname,
+            )
+            launch_columns = st.columns(2)
+            launch_columns[0].download_button(
+                "Download PyMOL script (.pml)",
+                data=pymol_script,
+                file_name=f"{run_dir.name}-{traj_label.lower().replace(' ', '-')}.pml",
+                mime="text/plain",
+                key=f"pymol_script_{run_dir.name}_{traj_label}",
+            )
+            if launch_columns[1].button(
+                "Launch local PyMOL",
+                key=f"pymol_launch_{run_dir.name}_{traj_label}",
+                help=(
+                    "Starts PyMOL on the application host. This is useful only "
+                    "when the Streamlit server and desktop are the same workstation."
+                ),
+            ):
+                launched, message = _launch_local_pymol(pymol_script)
+                if launched:
+                    st.success(f"PyMOL started with temporary script `{message}`.")
                 else:
-                    _render_py3dmol_view(
-                        trajectory_pdb,
-                        ligand_resname,
-                        height=620,
-                        animate=False,
-                        show_unit_cell=show_box_trajectory,
-                        persist_key=f"{run_dir.name}_{traj_label}",
-                        frame_index=selected_frame_idx,
-                        frame_label=f"Frame {selected_frame_idx + 1} / {trajectory_frames}",
-                        frame_count=trajectory_frames,
-                        playing=False,
-                    )
+                    st.error(f"Could not launch PyMOL: {message}")
         else:
-            st.info("No topology PDB was found for trajectory playback.")
+            st.info("No topology PDB was found for trajectory frame extraction.")
 
         with st.expander("Trajectory files"):
             st.caption("DCD trajectories are also available for VMD, PyMOL, ChimeraX, or MDTraj.")
@@ -1822,7 +2119,6 @@ def _render_run_construction(
         ("Temperature K", input_payload.get("temperature") if input_payload else ""),
         ("Solvent padding nm", input_payload.get("padding_nm") if input_payload else ""),
         ("Minimization only", input_payload.get("minimization_only") if input_payload else ""),
-        ("Docker image", image),
         ("Mounted source", str(_repo_root())),
         ("GPU", use_gpu),
     ]
@@ -1903,9 +2199,9 @@ def render() -> None:
     with status_col:
         download = st.button("Download, repair, and inspect ligands", type="primary")
 
-    with st.expander("Repair/runtime settings"):
+    prepare_image = DEFAULT_MD_IMAGE
+    with st.expander("Repair settings"):
         st.caption("By default the downloaded PDB is repaired with the vendored Ligand-X/PDBFixer workflow before ligand selection.")
-        prepare_image = st.text_input("Repair Docker image", value=DEFAULT_MD_IMAGE)
         prepare_use_gpu = st.checkbox("Use GPU for repair container", value=False)
         map_modified_residues = st.checkbox("Map supported modified amino acids to standard residues", value=True)
 
@@ -2070,8 +2366,8 @@ def render() -> None:
 
     _render_protocol_timeline(heating_steps, nvt_steps, npt_steps, production_steps, minimization_only)
 
-    with st.expander("Docker/runtime settings"):
-        image = st.text_input("MD Docker image", value=prepare_image if "prepare_image" in locals() else DEFAULT_MD_IMAGE)
+    image = DEFAULT_MD_IMAGE
+    with st.expander("Runtime settings"):
         use_gpu = st.checkbox("Use GPU", value=True)
 
     preview_run_id = "preview"
@@ -2140,6 +2436,12 @@ def render() -> None:
         )
         input_json.write_text(json.dumps(input_payload, indent=2))
         command = _build_command(image, output_dir, input_json, result_json, use_gpu)
+        write_registered_command_record(
+            output_dir,
+            tool_id="openmm_md",
+            commands=(command,),
+            image=image,
+        )
 
         with st.expander("Docker command", expanded=True):
             st.code(shlex.join(command))

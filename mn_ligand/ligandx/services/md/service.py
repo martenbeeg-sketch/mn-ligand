@@ -22,7 +22,10 @@ from .validation import (
 from .preparation import ProteinPreparation, LigandPreparation, ChargeAssignment, SystemBuilder
 from .simulation import EnergyMinimization, Equilibration, TrajectoryProcessor, SimulationRunner
 from .utils import PDBWriter, EnvironmentValidator, clean_results_for_json
-from .workflow.analytics import EquilibrationAnalytics
+from .workflow.analytics import (
+    EquilibrationAnalytics,
+    ligand_formal_charges_from_sdf_data,
+)
 from .workflow import (
     SolvatedSystemBuilder,
     EquilibrationRunner,
@@ -441,12 +444,16 @@ class MDOptimizationService:
 
             # Step 2: Ligand preparation (skipped in protein-only mode and amber-native mode)
             amber_native = str(getattr(config, "md_backend", "openmm_openff")).strip().lower() == "amber_native"
-            if not config.is_protein_only and not amber_native:
+            serialized_restart = bool(getattr(config, "production_only_from_prepared", False)) and (
+                bool(getattr(config, "strict_checkpoint_resume", False))
+                or str(getattr(config, "coordinate_restart_policy", "")) == "independent_replica"
+            )
+            if not config.is_protein_only and not amber_native and not serialized_restart:
                 prepared_ligand = self._prepare_ligand(config)
                 if not prepared_ligand:
                     return {"status": "error", "error": f"Ligand preparation failed for {config.ligand_id}"}
             else:
-                logger.info("=== STEP 2: SKIPPED (protein-only or amber-native mode) ===")
+                logger.info("=== STEP 2: SKIPPED (protein-only, amber-native, or serialized restart) ===")
             
             # Step 3 & 4: Protein preparation and System creation
             prepared_protein_path, system_result = self._prepare_and_create_system(config)
@@ -461,6 +468,28 @@ class MDOptimizationService:
             equilibration_result = self._run_equilibration(config, system_result)
             if not equilibration_result:
                 return {"status": "error", "error": "Equilibration failed"}
+            if equilibration_result.get("status") == "error":
+                failed_result = dict(equilibration_result)
+                failed_result.setdefault("system_id", config.system_id)
+                failed_result.setdefault("protein_id", config.protein_id)
+                failed_result.setdefault(
+                    "total_atoms", system_result.get("total_atoms", 0)
+                )
+                failed_result.setdefault(
+                    "system_info", system_result.get("system_info", {})
+                )
+                output_files = dict(
+                    failed_result.get("output_files") or {}
+                )
+                output_files.setdefault(
+                    "protein_prepared", prepared_protein_path
+                )
+                if system_result.get("system_pdb_path"):
+                    output_files.setdefault(
+                        "system_pdb", system_result["system_pdb_path"]
+                    )
+                failed_result["output_files"] = output_files
+                return clean_results_for_json(failed_result)
             
             # Handle minimization-only or paused states
             if equilibration_result.get("status") == "minimized_ready":
@@ -518,7 +547,10 @@ class MDOptimizationService:
     
     def _prepare_and_create_system(self, config: MDOptimizationConfig) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Prepare protein and create solvated system."""
-        if str(getattr(config, "md_backend", "openmm_openff")).strip().lower() == "amber_native":
+        if (
+            str(getattr(config, "md_backend", "openmm_openff")).strip().lower() == "amber_native"
+            and str(getattr(config, "coordinate_restart_policy", "")) != "independent_replica"
+        ):
             logger.info("=== AMBER-NATIVE MODE: BUILDING SIMULATION FROM PRMTOP/INPCRD ===")
             amber_result = self._create_system_from_amber_artifacts(config)
             valid, error = validate_system_result(amber_result)
@@ -530,6 +562,80 @@ class MDOptimizationService:
                 or ""
             )
             return prepared_protein_path, amber_result
+
+        restart_policy = str(getattr(config, "coordinate_restart_policy", ""))
+        serialized_restart = bool(getattr(config, "production_only_from_prepared", False)) and (
+            bool(getattr(config, "strict_checkpoint_resume", False))
+            or restart_policy == "independent_replica"
+        )
+        if serialized_restart:
+            from openmm import XmlSerializer
+            from openmm.app import PDBFile
+
+            coordinates_path = str(getattr(config, "resume_system_pdb_path", "") or "")
+            state_xml_path = str(getattr(config, "resume_state_xml_path", "") or "")
+            system_xml_path = str(getattr(config, "resume_system_xml_path", "") or "")
+            integrator_xml_path = str(getattr(config, "resume_integrator_xml_path", "") or "")
+            required_paths = [
+                ("equilibrated topology", coordinates_path),
+                ("serialized System", system_xml_path),
+                ("serialized Integrator", integrator_xml_path),
+            ]
+            if restart_policy == "independent_replica":
+                required_paths.append(("serialized State", state_xml_path))
+            for label, path in required_paths:
+                if not path or not os.path.exists(path):
+                    raise RuntimeError(f"Independent replica is missing {label}: {path}")
+            logger.info("=== INDEPENDENT REPLICA: RESTORING PREPARED OPENMM SYSTEM ===")
+            coordinates = PDBFile(coordinates_path)
+            with open(system_xml_path, "r") as handle:
+                restored_system = XmlSerializer.deserialize(handle.read())
+            with open(integrator_xml_path, "r") as handle:
+                restored_integrator = XmlSerializer.deserialize(handle.read())
+            replica_seed = int(getattr(config, "replica_seed", 0) or 0)
+            if hasattr(restored_integrator, "setRandomNumberSeed"):
+                restored_integrator.setRandomNumberSeed(replica_seed)
+            for force_index, force in enumerate(restored_system.getForces()):
+                if hasattr(force, "setRandomNumberSeed"):
+                    force.setRandomNumberSeed((replica_seed + force_index + 1) % 2147483647)
+            if restored_system.getNumParticles() != coordinates.topology.getNumAtoms():
+                raise RuntimeError(
+                    "Independent-replica atom count does not match the serialized prepared System"
+                )
+            simulation, platform_name = self.solvated_system_builder._create_simulation_with_fallback(
+                coordinates.topology,
+                restored_system,
+                restored_integrator,
+            )
+            if restart_policy == "independent_replica":
+                with open(state_xml_path, "r") as handle:
+                    restored_state = XmlSerializer.deserialize(handle.read())
+                restored_positions = restored_state.getPositions()
+                if len(restored_positions) != coordinates.topology.getNumAtoms():
+                    raise RuntimeError("Independent-replica State atom count does not match its topology")
+                simulation.context.setPositions(restored_positions)
+                simulation.context.setPeriodicBoxVectors(*restored_state.getPeriodicBoxVectors())
+            else:
+                simulation.context.setPositions(coordinates.positions)
+                if coordinates.topology.getPeriodicBoxVectors() is not None:
+                    simulation.context.setPeriodicBoxVectors(*coordinates.topology.getPeriodicBoxVectors())
+            system_result = {
+                "status": "success",
+                "simulation": simulation,
+                "system_pdb_path": coordinates_path,
+                "total_atoms": coordinates.topology.getNumAtoms(),
+                "platform": platform_name,
+                "replica_seed": replica_seed,
+                "system_info": {
+                    "total_atoms": coordinates.topology.getNumAtoms(),
+                    "source": "serialized_prepared_system",
+                    "state_source": state_xml_path if restart_policy == "independent_replica" else None,
+                },
+            }
+            valid, error = validate_system_result(system_result)
+            if not valid:
+                raise RuntimeError(error)
+            return coordinates_path, system_result
 
         # Checkpoint-resume path: rebuild simulation directly from original system PDB,
         # bypassing protein cleanup on NPT/final snapshots.
@@ -548,14 +654,20 @@ class MDOptimizationService:
                 system_result = self.solvated_system_builder.recreate_system_from_pdb_protein_only(
                     system_pdb_data, config.system_id,
                     temperature=config.temperature,
-                    pressure=config.pressure
+                    pressure=config.pressure,
+                    production_timestep_fs=config.production_timestep_fs,
+                    hydrogen_mass_amu=config.hydrogen_mass_amu,
                 )
             else:
                 system_result = self.solvated_system_builder.recreate_system_from_pdb(
                     system_pdb_data, self._get_prepared_ligand(config), config.system_id,
                     config.forcefield_method,
+                    config.protein_forcefield_method,
+                    config.water_model,
                     temperature=config.temperature,
-                    pressure=config.pressure
+                    pressure=config.pressure,
+                    production_timestep_fs=config.production_timestep_fs,
+                    hydrogen_mass_amu=config.hydrogen_mass_amu,
                 )
             # Keep a meaningful provenance pointer even though protein prep is bypassed.
             prepared_protein_path = str(resume_system_pdb_path)
@@ -583,14 +695,20 @@ class MDOptimizationService:
                 system_result = self.solvated_system_builder.recreate_system_from_pdb_protein_only(
                     system_pdb_data, config.system_id,
                     temperature=config.temperature,
-                    pressure=config.pressure
+                    pressure=config.pressure,
+                    production_timestep_fs=config.production_timestep_fs,
+                    hydrogen_mass_amu=config.hydrogen_mass_amu,
                 )
             else:
                 system_result = self.solvated_system_builder.recreate_system_from_pdb(
                     system_pdb_data, self._get_prepared_ligand(config), config.system_id,
                     config.forcefield_method,
+                    config.protein_forcefield_method,
+                    config.water_model,
                     temperature=config.temperature,
-                    pressure=config.pressure
+                    pressure=config.pressure,
+                    production_timestep_fs=config.production_timestep_fs,
+                    hydrogen_mass_amu=config.hydrogen_mass_amu,
                 )
         else:
             # Normal flow
@@ -610,7 +728,9 @@ class MDOptimizationService:
                     padding_nm=config.padding_nm,
                     box_shape=config.box_shape,
                     temperature=config.temperature,
-                    pressure=config.pressure
+                    pressure=config.pressure,
+                    production_timestep_fs=config.production_timestep_fs,
+                    hydrogen_mass_amu=config.hydrogen_mass_amu,
                 )
             else:
                 logger.info(f"Using force field method: {config.forcefield_method}")
@@ -620,9 +740,13 @@ class MDOptimizationService:
                     padding_nm=config.padding_nm,
                     ionic_strength_m=config.ionic_strength,
                     forcefield_method=config.forcefield_method,
+                    protein_forcefield_method=config.protein_forcefield_method,
+                    water_model=config.water_model,
                     box_shape=config.box_shape,
                     temperature=config.temperature,
-                    pressure=config.pressure
+                    pressure=config.pressure,
+                    production_timestep_fs=config.production_timestep_fs,
+                    hydrogen_mass_amu=config.hydrogen_mass_amu,
                 )
 
         valid, error = validate_system_result(system_result)
@@ -671,6 +795,11 @@ class MDOptimizationService:
             nonbondedCutoff=1.0 * unit.nanometer,
             constraints=HBonds,
             rigidWater=True,
+            hydrogenMass=(
+                float(config.hydrogen_mass_amu) * unit.amu
+                if config.hydrogen_mass_amu is not None
+                else None
+            ),
         )
         if periodic:
             openmm_system.addForce(
@@ -683,7 +812,7 @@ class MDOptimizationService:
         integrator = LangevinMiddleIntegrator(
             float(config.temperature) * unit.kelvin,
             1.0 / unit.picosecond,
-            0.004 * unit.picoseconds,
+            float(config.production_timestep_fs) * unit.femtoseconds,
         )
         simulation, platform_name = self.solvated_system_builder._create_simulation_with_fallback(
             prmtop.topology, openmm_system, integrator
@@ -709,6 +838,8 @@ class MDOptimizationService:
                 "residues": prmtop.topology.getNumResidues(),
                 "chains": prmtop.topology.getNumChains(),
                 "source": "amber_prmtop_inpcrd",
+                "hydrogen_mass_amu": config.hydrogen_mass_amu,
+                "integrator_timestep_fs": config.production_timestep_fs,
                 "periodic": bool(periodic),
             },
         }
@@ -764,6 +895,12 @@ class MDOptimizationService:
             production_report_interval=config.production_report_interval,
             minimization_max_iterations=getattr(config, "minimization_max_iterations", 5000),
             minimization_tolerance_kjmol_nm=getattr(config, "minimization_tolerance_kjmol_nm", 10.0),
+            preparation_protocol=str(getattr(config, "preparation_protocol", "current_staged")),
+            density_stabilization_min_ns=float(getattr(config, "density_stabilization_min_ns", 1.0)),
+            density_stabilization_max_ns=float(getattr(config, "density_stabilization_max_ns", 5.0)),
+            density_stabilization_increment_ns=float(getattr(config, "density_stabilization_increment_ns", 1.0)),
+            density_sample_interval_ps=float(getattr(config, "density_sample_interval_ps", 4.0)),
+            density_plateau_required=bool(getattr(config, "density_plateau_required", True)),
             npt_restraint_release_scales_csv=getattr(config, "npt_restraint_release_scales", "1.0,0.5,0.2,0.05,0.0"),
             npt_release_enabled=getattr(config, "npt_release_enabled", True),
             protein_npt_release_scales_csv=getattr(config, "protein_npt_release_scales", "1.0,0.5,0.1,0.01,0.0"),
@@ -775,13 +912,44 @@ class MDOptimizationService:
             resume_system_xml_path=getattr(config, "resume_system_xml_path", None),
             resume_integrator_xml_path=getattr(config, "resume_integrator_xml_path", None),
             production_only_from_prepared=bool(getattr(config, "production_only_from_prepared", False)),
+            strict_checkpoint_resume=bool(getattr(config, "strict_checkpoint_resume", False)),
+            append_production_outputs=bool(
+                getattr(config, "append_production_outputs", False)
+            ),
+            production_prior_steps=int(
+                getattr(config, "production_prior_steps", 0)
+            ),
+            coordinate_restart_policy=str(
+                getattr(config, "coordinate_restart_policy", "legacy_minimize_rethermalize")
+            ),
+            replica_equilibration_steps=int(getattr(config, "replica_equilibration_steps", 0)),
+            replica_density_revalidation=bool(
+                getattr(config, "replica_density_revalidation", False)
+            ),
+            replica_revalidation_max_steps=int(
+                getattr(config, "replica_revalidation_max_steps", 0)
+            ),
+            replica_revalidation_increment_steps=int(
+                getattr(config, "replica_revalidation_increment_steps", 0)
+            ),
+            replica_density_sample_interval_steps=int(
+                getattr(config, "replica_density_sample_interval_steps", 0)
+            ),
+            replica_density_plateau_required=bool(
+                getattr(config, "replica_density_plateau_required", True)
+            ),
+            production_timestep_fs=float(
+                getattr(config, "production_timestep_fs", 4.0)
+            ),
+            replica_seed=getattr(config, "replica_seed", None),
             temperature=config.temperature,
             pressure=config.pressure
         )
         
         valid, error = validate_equilibration_result(equilibration_result)
         if not valid:
-            raise RuntimeError(error)
+            logger.error(error)
+            return equilibration_result
         
         return equilibration_result
     
@@ -821,6 +989,9 @@ class MDOptimizationService:
         # Merge equilibration output files
         if "output_files" in equilibration_result:
             result["output_files"].update(equilibration_result["output_files"])
+        for key in ("restart_resume", "restraint_protocol"):
+            if key in equilibration_result:
+                result[key] = equilibration_result[key]
 
         # Post-hoc analytics: parse log + compute RMSD from all trajectory phases.
         # Wrapped in try/except so a completed simulation result is never lost
@@ -850,6 +1021,15 @@ class MDOptimizationService:
                 npt_report_interval=1000,
                 production_report_interval=config.production_report_interval,
                 dt_ps=0.004,
+                residue_mapping=config.residue_mapping,
+                ligand_formal_charges=ligand_formal_charges_from_sdf_data(
+                    config.ligand_refined_sdf_data
+                    or (
+                        config.ligand_structure_data
+                        if config.ligand_data_format.lower() == "sdf"
+                        else None
+                    )
+                ),
             )
             result["analytics"] = analytics
         except Exception as exc:

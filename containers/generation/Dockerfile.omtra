@@ -1,0 +1,65 @@
+FROM mnprot-biohub-esm-cu128:latest AS dgl_runtime
+
+ENV CUDA_HOME="/usr/local/cuda" \
+    TORCH_CUDA_ARCH_LIST="8.9;12.0+PTX" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+# OMTRA depends on CUDA DGL. Build DGL against the already-installed
+# CUDA 12.8/PyTorch 2.7 stack instead of installing its historical cu121 pins.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+         git libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 --branch v2.4.0 --recursive \
+         https://github.com/dmlc/dgl.git /tmp/dgl \
+    && cmake -S /tmp/dgl -B /tmp/dgl/build \
+         -DBUILD_TYPE=release -DUSE_CUDA=ON -DUSE_OPENMP=ON \
+         -DBUILD_TORCH=ON -DBUILD_GRAPHBOLT=OFF -DBUILD_SPARSE=OFF \
+         -DBUILD_CPP_TEST=OFF -DUSE_LIBXSMM=OFF \
+         -DCUDA_ARCH_NAME=Manual -DCUDA_ARCH_BIN="89;120" \
+         -DCUDA_ARCH_PTX=120 \
+    && cmake --build /tmp/dgl/build --parallel 16 \
+    && cd /tmp/dgl/python \
+    && DGL_LIBRARY_PATH=/tmp/dgl/build python setup.py install \
+    && DGL_PKG_DIR="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"] + "/dgl")')" \
+    && install -m 0755 /tmp/dgl/build/libdgl.so "${DGL_PKG_DIR}/libdgl.so" \
+    && install -d "${DGL_PKG_DIR}/tensoradapter/pytorch" \
+    && install -m 0755 /tmp/dgl/build/tensoradapter/pytorch/libtensoradapter_pytorch_*.so \
+         "${DGL_PKG_DIR}/tensoradapter/pytorch/" \
+    && rm -rf /tmp/dgl
+
+FROM dgl_runtime
+
+ARG SOURCE_COMMIT
+
+LABEL org.opencontainers.image.title="mn-ligand OMTRA" \
+      org.opencontainers.image.description="OMTRA inference on CUDA 12.8 / NVIDIA Blackwell" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="mn-ligand local pinned source checkout"
+
+ENV ENGINE="omtra" \
+    PYTHONPATH="/opt/engine"
+
+WORKDIR /opt/engine
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+         libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tools_to_implement/OMTRA/ /opt/engine/
+
+RUN python -m pip install --no-cache-dir \
+      hydra-core pytorch-lightning torchmetrics pystow einops zarr rich \
+      matplotlib pyarrow wandb useful-rdkit-utils py3Dmol tqdm peppr scipy \
+      pandas joblib scikit-learn seaborn umap-learn pynndescent duckdb \
+      mols2grid posebusters \
+    && python -m pip install --no-cache-dir \
+      torch_scatter torch_cluster \
+      -f https://data.pyg.org/whl/torch-2.7.0+cu128.html \
+    && python -m pip install --no-cache-dir --no-deps .
+
+COPY containers/generation/runner.py /opt/mn-ligand/generation_runner.py
+
+ENTRYPOINT ["python", "/opt/mn-ligand/generation_runner.py"]
+CMD ["--help"]

@@ -5,11 +5,13 @@ dependencies:
   - python=3.11
   - matplotlib
   - mdtraj
+  - meeko=0.6.1
   - numpy
   - pandas
   - pillow
   - py3dmol
   - rdkit
+  - seaborn
   - streamlit
   - typer
   - pip

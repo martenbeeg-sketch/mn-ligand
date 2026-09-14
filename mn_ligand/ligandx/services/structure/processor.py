@@ -337,8 +337,16 @@ class StructureProcessor:
         
         return processed_data
     
-    def process_structure_with_ligands(self, structure_data, clean_protein=True, include_2d_images=True, 
-                                       target_pdb_id=None, target_structure_id=None):
+    def process_structure_with_ligands(
+        self,
+        structure_data,
+        clean_protein=True,
+        include_2d_images=True,
+        target_pdb_id=None,
+        target_structure_id=None,
+        repair_options=None,
+        preserve_nonwater_heterogens=False,
+    ):
         """
         Process a protein structure with ligand extraction, protein cleaning, and ligand reinsertion.
         Supports both PDB and mmCIF formats (auto-detected).
@@ -363,42 +371,91 @@ class StructureProcessor:
         ligands = self.extract_ligands(structure, components["ligands"], 
                                      target_pdb_id=target_pdb_id, 
                                      target_structure_id=target_structure_id)
+        retained_heterogens = {}
+        if preserve_nonwater_heterogens:
+            for residue in [*components["ions"], *components["other"]]:
+                residue_id = residue.get_id()
+                if not str(residue_id[0]).startswith("H_"):
+                    continue
+                chain_id = str(residue.get_parent().get_id())
+                resname = str(residue.get_resname()).strip()
+                resseq = int(residue_id[1])
+                key = f"retained_{resname}_{chain_id}_{resseq}"
+                retained_heterogens[key] = {
+                    "pdb_data": self.pdb_parser.extract_residues_as_string(
+                        structure, [residue]
+                    ),
+                    "binding_site_info": {
+                        "chain_id": chain_id,
+                        "residue_number": resseq,
+                    },
+                }
         
         # Clean the protein if requested
         cleaned_protein_data = None
+        cleaning_succeeded = not clean_protein
+        cleaning_error = ""
+        repair_report = {}
         if clean_protein and components["protein"]:
             try:
-                # Extract protein component only for cleaning
-                protein_pdb = self.pdb_parser.extract_residues_as_string(structure, components["protein"])
-                
-                # Clean protein structure without removing heterogens (since we extracted protein only)
-                # We don't need to remove heterogens because we already extracted only protein residues
-                # Use staged cleaning and get the final result
-                cleaning_result = self.protein_preparer.clean_structure_staged(
-                    protein_pdb,
-                    remove_heterogens=False,  # Don't remove heterogens since we only have protein
-                    remove_water=True,        # Remove any water that might be in protein selection
-                    add_missing_residues=True,
-                    add_missing_atoms=True,
-                    add_missing_hydrogens=True,
-                    ph=7.4,
-                    add_solvation=False,
-                    keep_ligands=False
+                # PDB inputs retain SEQRES/REMARK information until PDBFixer has
+                # detected unresolved residues. mmCIF currently falls back to
+                # the extracted protein PDB because this adapter accepts a PDB
+                # stream; the report records that limitation.
+                structure_format = self.detect_format(structure_data)
+                repair_input = (
+                    structure_data
+                    if structure_format == "pdb"
+                    else self.pdb_parser.extract_residues_as_string(
+                        structure, components["protein"]
+                    )
                 )
-                # Get the final cleaned stage (highest step number)
-                stages = cleaning_result['stages']
-                stage_info = cleaning_result['stage_info']
-                # Find the stage with the highest step number
-                final_stage = max(stage_info.items(), key=lambda x: x[1].get('step', 0))
-                cleaned_protein_data = stages[final_stage[0]]
+                options = dict(repair_options or {})
+                primary_ligand_sdf = next(
+                    (
+                        str(item.get("sdf_data"))
+                        for item in ligands.values()
+                        if item.get("sdf_data")
+                    ),
+                    None,
+                )
+                cleaning_result = self.protein_preparer.repair_imported_structure(
+                    repair_input,
+                    ph=float(options.get("ph", 7.4)),
+                    add_missing_residues=bool(options.get("add_missing_residues", True)),
+                    skip_terminal_missing_residues=bool(
+                        options.get("skip_terminal_missing_residues", True)
+                    ),
+                    max_internal_gap=options.get("max_internal_gap", 15),
+                    refine_rebuilt_positions=bool(
+                        options.get("refine_rebuilt_positions", True)
+                    ),
+                    ligand_sdf_data=primary_ligand_sdf,
+                )
+                cleaned_protein_data = cleaning_result["pdb_data"]
+                repair_report = {
+                    **cleaning_result["report"],
+                    "input_format": structure_format,
+                    "sequence_records_available": (
+                        structure_format == "pdb"
+                        and any(
+                            line.startswith("SEQRES")
+                            for line in structure_data.splitlines()
+                        )
+                    ),
+                }
                 
                 # Reinsert ligands into cleaned protein
-                if ligands:
-                    cleaned_protein_data = self.reinsert_ligands(cleaned_protein_data, ligands)
+                if ligands or retained_heterogens:
+                    cleaned_protein_data = self.reinsert_ligands(
+                        cleaned_protein_data,
+                        {**ligands, **retained_heterogens},
+                    )
+                cleaning_succeeded = True
                     
             except Exception as e:
-                print(f"Warning: Protein cleaning failed: {e}")
-                # Fall back to original structure
+                cleaning_error = str(e)
+                print(f"Warning: Protein cleaning failed: {cleaning_error}")
                 cleaned_protein_data = structure_data
         else:
             cleaned_protein_data = structure_data
@@ -418,7 +475,11 @@ class StructureProcessor:
                 for component_type, residues in components.items()
             },
             "ligands": ligands,
-            "protein_cleaned": clean_protein and cleaned_protein_data != structure_data
+            "protein_cleaned": clean_protein and cleaning_succeeded,
+            "cleaning_succeeded": cleaning_succeeded,
+            "cleaning_error": cleaning_error,
+            "repair_report": repair_report,
+            "retained_heterogens": sorted(retained_heterogens),
         }
     
     

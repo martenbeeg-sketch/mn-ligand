@@ -15,6 +15,28 @@ services:
       dockerfile: Dockerfile
       platforms: ["linux/x86_64"]
 
+  fpocket:
+    image: ovolig-fpocket:latest
+    build:
+      context: ./containers/fpocket
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  p2rank:
+    image: ovolig-p2rank:latest
+    build:
+      context: ./tools_to_implement/p2rank
+      dockerfile: ../../containers/p2rank/Dockerfile
+      platforms: ["linux/x86_64"]
+
+  pesto:
+    image: mnprot-pesto-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/pesto/Dockerfile
+      platforms: ["linux/x86_64"]
+    gpus: all
+
   md:
     image: ovolig-md-cu128:latest
     build:
@@ -33,6 +55,107 @@ services:
     # Existing Blackwell/CUDA 12.8 image. This service intentionally has no
     # build block so `docker compose build` does not replace your local image.
     image: ovoex-boltz2:latest
+
+  nesso:
+    image: ovolig-nesso-cu128:latest
+    build:
+      context: ./tools_to_implement/nesso
+      dockerfile: ../../containers/nesso/Dockerfile
+      platforms: ["linux/x86_64"]
+    gpus: all
+
+  omtra:
+    image: ovolig-omtra-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.omtra
+      args: {SOURCE_COMMIT: 745127dabfa1}
+    gpus: all
+
+  pocketxmol:
+    image: ovolig-pocketxmol-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.pocketxmol
+      args: {SOURCE_COMMIT: 65488cf635c8}
+    gpus: all
+
+  flowr-root:
+    image: ovolig-flowr-root-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.flowr_root
+      args: {SOURCE_COMMIT: b2263e2516ad}
+    gpus: all
+
+  conditar:
+    image: ovolig-conditar-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.conditar
+      args: {SOURCE_COMMIT: 4294d2863751}
+    gpus: all
+
+  paopt:
+    image: ovolig-paopt-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.paopt
+      args: {SOURCE_COMMIT: 4294d2863751}
+    gpus: all
+
+  drugrpg:
+    image: ovolig-drugrpg-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.drugrpg
+      args: {SOURCE_COMMIT: 6fa0e417a523}
+    gpus: all
+
+  pfm:
+    image: ovolig-pfm-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.pfm
+      args: {SOURCE_COMMIT: 33be6c1f3dc9}
+    gpus: all
+
+  pocketflow:
+    image: ovolig-pocketflow-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.pocketflow
+      args: {SOURCE_COMMIT: a31a5a03f7d1}
+    gpus: all
+
+  pgmg:
+    image: ovolig-pgmg-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/generation/Dockerfile.pgmg
+      args: {SOURCE_COMMIT: 85fb7120022d}
+    gpus: all
+
+  posebusters:
+    image: ovolig-posebusters:latest
+    build:
+      context: ./tools_to_implement/posebusters
+      dockerfile: ../../containers/posebusters/Dockerfile
+      platforms: ["linux/x86_64"]
+
+  plip:
+    image: ovolig-plip:latest
+    build:
+      context: ./tools_to_implement/plip
+      dockerfile: ../../containers/plip/Dockerfile
+      platforms: ["linux/x86_64"]
+
+  pandamap:
+    image: ovolig-pandamap:latest
+    build:
+      context: ./tools_to_implement/PandaMap
+      dockerfile: ../../containers/pandamap/Dockerfile
+      platforms: ["linux/x86_64"]
 
   qc:
     image: ovolig-qc:latest

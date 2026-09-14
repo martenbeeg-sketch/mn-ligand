@@ -1,0 +1,24 @@
+FROM ovolig-conditar-cu128:latest
+
+ARG SOURCE_COMMIT
+
+LABEL org.opencontainers.image.title="mn-ligand paOPT property-steered generation engine" \
+      org.opencontainers.image.description="Locally permissioned paOPT CUDA 12.8 runtime for Ada and Blackwell GPUs" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Drug-Bioinformatics-Lab/conDitar-dev"
+
+ENV ENGINE="paopt" \
+    TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1"
+
+RUN python -m pip install --no-cache-dir \
+      numpy==1.26.4 pandas==2.1.4 \
+      cvxpy==1.6.7 \
+      chemprop==1.6.1 chemfunc==1.0.12 \
+      seaborn typed-argument-parser \
+    && python -m pip install --no-cache-dir admet-ai==1.4.0 --no-deps
+
+COPY tools_to_implement/conDitar-dev/ /opt/engine/
+COPY containers/generation/runner.py /opt/mn-ligand/generation_runner.py
+
+ENTRYPOINT ["python", "/opt/mn-ligand/generation_runner.py"]
+CMD ["--help"]

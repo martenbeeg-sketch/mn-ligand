@@ -6,6 +6,14 @@ from typing import Any
 
 import streamlit as st
 
+from mn_ligand.app.pages.run_resources import render_run_resources
+from mn_ligand.app.pages.discover_inputs import (
+    bound_ligand_box,
+    render_target_viewer,
+    select_target_artifact,
+    select_target_artifacts,
+    target_viewer_path,
+)
 from mn_ligand.app.pages.bound_ligand_md import _render_structure_view, _run_root
 from mn_ligand.app.pages.common import _run_docker_workflow, WORKFLOWS, try_dispatch_next_queued_gpu_job
 from mn_ligand.workflows.bound_ligand_md import parse_bound_ligands
@@ -322,13 +330,26 @@ def render() -> None:
     )
 
     if mode == "ABFE":
-        options = {row["label"]: row for row in jobs}
-        selected_label = st.selectbox("Structure preparation job", list(options.keys()), key="openfe_abfe_job")
-        selected = options[selected_label]
+        choice = select_target_artifact(
+            "Prepared complex",
+            ("prepared_complex",),
+            key="openfe_abfe_complex",
+            show_viewer=False,
+            allowed_run_ids={row["run_id"] for row in jobs},
+        )
+        if choice is None:
+            return
+        selected = next(row for row in jobs if row["run_id"] == choice.job.run_id)
         st.caption(
             f"Using: `{Path(selected['protein_refined']).name}` + `{Path(selected['ligand_refined_sdf']).name}`"
         )
-        _render_selected_structure_preview("abfe", selected)
+        render_target_viewer(
+            choice,
+            viewer_path=target_viewer_path(choice),
+            box=bound_ligand_box(choice, selected["ligand_key"]),
+            selected_ligand_key=selected["ligand_key"],
+            key="openfe_abfe_complex_viewer",
+        )
         st.markdown("#### ABFE settings")
         if "openfe_abfe_preset" not in st.session_state:
             st.session_state["openfe_abfe_preset"] = "fast"
@@ -489,22 +510,40 @@ def render() -> None:
             "timestep_fs": float(timestep_fs),
             "hydrogen_mass": 3.0 if bool(use_hmr) else 1.0,
         }
-        if st.button("Run OpenFE ABFE", type="primary"):
-            _run_abfe(selected)
+        run_tab, results_tab = st.tabs(["Run", "Results"])
+        with run_tab:
+            render_run_resources(
+                requires_gpu=True,
+                selected_gpu="Automatic",
+                key="openfe_abfe",
+            )
+            if st.button("Run OpenFE ABFE", type="primary"):
+                _run_abfe(selected)
+        with results_tab:
+            st.info("Completed OpenFE calculations are available in Jobs and Results.")
         return
 
-    selected_labels = st.multiselect(
-        "Structure preparation jobs (ligand series)",
-        [row["label"] for row in jobs],
-        default=[jobs[0]["label"], jobs[1]["label"]] if len(jobs) > 1 else [],
-        key="openfe_rbfe_jobs",
+    choices = select_target_artifacts(
+        "Prepared complexes",
+        ("prepared_complex",),
+        key="openfe_rbfe_complexes",
+        minimum=2,
+        allowed_run_ids={row["run_id"] for row in jobs},
     )
-    if not selected_labels:
+    if len(choices) < 2:
         st.info("Select at least two structure jobs for RBFE.")
         return
-    selected_jobs = [row for row in jobs if row["label"] in set(selected_labels)]
+    selected_run_ids = {choice.job.run_id for choice in choices}
+    selected_jobs = [row for row in jobs if row["run_id"] in selected_run_ids]
     st.caption(f"{len(selected_jobs)} selected ligands will be combined into one RBFE ligand set.")
-    _render_selected_structure_preview("rbfe", selected_jobs[0])
+    preview_choice = next(choice for choice in choices if choice.job.run_id == selected_jobs[0]["run_id"])
+    render_target_viewer(
+        preview_choice,
+        viewer_path=target_viewer_path(preview_choice),
+        box=bound_ligand_box(preview_choice, selected_jobs[0]["ligand_key"]),
+        selected_ligand_key=selected_jobs[0]["ligand_key"],
+        key="openfe_rbfe_complex_viewer",
+    )
     st.markdown("#### RBFE settings")
     if "openfe_rbfe_preset" not in st.session_state:
         st.session_state["openfe_rbfe_preset"] = "fast"
@@ -701,8 +740,17 @@ def render() -> None:
         "network_topology": str(network_topology),
         "central_ligand": str(central_ligand).strip(),
     }
-    if st.button("Run OpenFE RBFE", type="primary"):
-        _run_rbfe(selected_jobs)
+    run_tab, results_tab = st.tabs(["Run", "Results"])
+    with run_tab:
+        render_run_resources(
+            requires_gpu=True,
+            selected_gpu="Automatic",
+            key="openfe_rbfe",
+        )
+        if st.button("Run OpenFE RBFE", type="primary"):
+            _run_rbfe(selected_jobs)
+    with results_tab:
+        st.info("Completed OpenFE calculations are available in Jobs and Results.")
 
 
 render()

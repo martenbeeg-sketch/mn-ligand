@@ -7,7 +7,7 @@ __pycache__/
 .mplconfig/
 data/
 .nextflow*
-mn-ligand-workdir/
+/mn-ligand-workdir
 .tmp/
 work/
 output/
@@ -17,3 +17,14 @@ dist/
 build/
 !mn_ligand/app/components/molstar_viewer/frontend/build/
 !mn_ligand/app/components/molstar_viewer/frontend/build/**
+
+# Local research outputs and third-party source checkouts are not app source.
+/MD_*.csv
+/MD_*.md
+/MD_*.xlsx
+/COMPUTATIONAL_PROTEIN_BINDER_DESIGN_METHODS.md
+/DOCKING_COFOLDING_METHODS_*.md
+/RETROSPECTIVE_REASSESSMENT_METHODS_*.md
+/reports/
+/tools_to_implement/
+.~lock.*

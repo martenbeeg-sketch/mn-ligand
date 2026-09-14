@@ -1,0 +1,77 @@
+FROM mnprot-biohub-esm-cu128:latest AS dgl_runtime
+
+ENV CUDA_HOME="/usr/local/cuda" \
+    TORCH_CUDA_ARCH_LIST="8.9;12.0+PTX" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+# DGL 2.4 is the newest upstream release and must be compiled against the
+# installed PyTorch/CUDA ABI; published legacy wheels do not support Blackwell.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+         git libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 --branch v2.4.0 --recursive \
+         https://github.com/dmlc/dgl.git /tmp/dgl \
+    && cmake -S /tmp/dgl -B /tmp/dgl/build \
+         -DBUILD_TYPE=release -DUSE_CUDA=ON -DUSE_OPENMP=ON \
+         -DBUILD_TORCH=ON -DBUILD_GRAPHBOLT=OFF -DBUILD_SPARSE=OFF \
+         -DBUILD_CPP_TEST=OFF -DUSE_LIBXSMM=OFF \
+         -DCUDA_ARCH_NAME=Manual -DCUDA_ARCH_BIN="89;120" \
+         -DCUDA_ARCH_PTX=120 \
+    && cmake --build /tmp/dgl/build --parallel 16 \
+    && cd /tmp/dgl/python \
+    && DGL_LIBRARY_PATH=/tmp/dgl/build python setup.py install \
+    && DGL_PKG_DIR="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"] + "/dgl")')" \
+    && install -m 0755 /tmp/dgl/build/libdgl.so "${DGL_PKG_DIR}/libdgl.so" \
+    && install -d "${DGL_PKG_DIR}/tensoradapter/pytorch" \
+    && install -m 0755 /tmp/dgl/build/tensoradapter/pytorch/libtensoradapter_pytorch_*.so \
+         "${DGL_PKG_DIR}/tensoradapter/pytorch/" \
+    && rm -rf /tmp/dgl
+
+FROM dgl_runtime
+
+ARG SOURCE_COMMIT
+
+LABEL org.opencontainers.image.title="mn-ligand PGMG" \
+      org.opencontainers.image.description="PGMG inference on CUDA 12.8 / NVIDIA Blackwell" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="mn-ligand local pinned source checkout"
+
+ENV ENGINE="pgmg" \
+    PYTHONPATH="/opt/engine"
+
+WORKDIR /opt/engine
+COPY tools_to_implement/PGMG/ /opt/engine/
+
+# PGMG uses a small subset of fairseq 0.10.2. The no-build-isolation install
+# avoids its obsolete dependency resolver replacing the Blackwell torch stack.
+RUN python -m pip install --no-cache-dir Cython==0.29.37 einops hydra-core omegaconf \
+    && git clone --depth 1 --branch v0.10.2 \
+         https://github.com/facebookresearch/fairseq.git /tmp/fairseq \
+    && sed -i 's/np\.float/float/g' \
+         /tmp/fairseq/fairseq/data/indexed_dataset.py \
+         /tmp/fairseq/fairseq/modules/dynamic_crf_layer.py \
+    && sed -i 's/np\.long/int/g' \
+         /tmp/fairseq/fairseq/data/language_pair_dataset.py \
+         /tmp/fairseq/fairseq/data/token_block_dataset.py \
+    && sed -i 's/np\.int/int/g' \
+         /tmp/fairseq/fairseq/data/data_utils.py \
+    && sed -i '/^import fairseq\.criterions/,$d' \
+         /tmp/fairseq/fairseq/__init__.py \
+    && sed -i '/^# automatically import any Python files/,$d' \
+         /tmp/fairseq/fairseq/models/__init__.py \
+    && env -u CUDA_HOME python -m pip install \
+         --no-cache-dir --no-build-isolation --no-deps \
+         /tmp/fairseq \
+    && rm -rf /tmp/fairseq \
+    && python -m pip install --no-cache-dir bitarray cffi regex sacrebleu tqdm
+
+COPY containers/generation/fairseq_init.py \
+     /opt/venv/lib/python3.12/site-packages/fairseq/__init__.py
+COPY containers/generation/fairseq_modules_init.py \
+     /opt/venv/lib/python3.12/site-packages/fairseq/modules/__init__.py
+COPY containers/generation/runner.py /opt/mn-ligand/generation_runner.py
+
+ENTRYPOINT ["python", "/opt/mn-ligand/generation_runner.py"]
+CMD ["--help"]

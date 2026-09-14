@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from mn_ligand.app.pages.bound_ligand_md import _run_root
+from mn_ligand.app.viewers import render_persistent_3dmol
 
 try:
     import py3Dmol  # type: ignore
@@ -44,7 +44,11 @@ def _render_py3dmol_molecule(path: Path) -> None:
         viewer.setStyle({"stick": {"radius": 0.2}})
         viewer.setBackgroundColor("white")
         viewer.zoomTo()
-        components.html(viewer._make_html(), height=470)
+        render_persistent_3dmol(
+            viewer,
+            key=f"qc-molecule:{path.resolve()}",
+            height=470,
+        )
     except Exception as exc:
         st.warning(f"Could not render molecule preview: {exc}")
 

@@ -15,6 +15,38 @@ logger = logging.getLogger(__name__)
 class SolvatedSystemBuilder:
     """Builds solvated protein-ligand systems for MD simulation."""
 
+    PROTEIN_FORCEFIELD_FILES = {
+        "amber14-all": "amber14-all.xml",
+        "amber99sbildn": "amber99sbildn.xml",
+        "amberfb15": "amberfb15.xml",
+        "amber15ipq": "amber14/protein.ff15ipq.xml",
+    }
+    WATER_FORCEFIELD_FILES = {
+        "tip3p": "amber14/tip3p.xml",
+        "tip3pfb": "amber14/tip3pfb.xml",
+        "spce": "amber14/spce.xml",
+        "tip4pew": "amber14/tip4pew.xml",
+    }
+    SOLVENT_BOX_MODELS = {
+        "tip3p": "tip3p",
+        "tip3pfb": "tip3p",
+        "spce": "spce",
+        "tip4pew": "tip4pew",
+    }
+    OPENMM_BOX_SHAPES = {
+        "cube": "cube",
+        "cubic": "cube",
+        "box": "cube",
+        "dodecahedron": "dodecahedron",
+        "octahedron": "octahedron",
+    }
+    PROTEIN_RESIDUES = {
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY",
+        "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER",
+        "THR", "TRP", "TYR", "VAL", "MSE", "HYP", "PCA", "SEP",
+        "TPO", "CSO", "PTR", "KCX", "HIE", "HID", "HIP", "CYX",
+        "ACE", "NME",
+    }
     WATER_RESIDUES = {'HOH', 'WAT', 'H2O', 'TIP', 'TIP3', 'TIP4'}
     ION_RESIDUES = {'NA', 'CL', 'MG', 'K', 'CA', 'ZN', 'FE', 'MN'}
     LIGAND_RMSD_WARN_A = float(os.getenv("MN_LIGAND_ASSEMBLY_RMSD_WARN_A", "0.05"))
@@ -44,11 +76,54 @@ class SolvatedSystemBuilder:
         self.protein_restraint_k = float(
             os.getenv("MN_LIGAND_PROTEIN_RESTRAINT_K_KJMOL_NM2", "1000.0")
         )
+        self.ligand_lock_k = float(
+            os.getenv(
+                "MN_LIGAND_LOCK_K_KJMOL_NM2",
+                str(self.LIGAND_LOCK_K_KJMOL_NM2),
+            )
+        )
+        self.ligand_planarity_k = float(
+            os.getenv(
+                "MN_LIGAND_PLANARITY_K_KJMOL_NM2",
+                str(self.LIGAND_PLANARITY_K_KJMOL_NM2),
+            )
+        )
         self.enable_planarity_restraints = str(
             os.getenv("MN_LIGAND_ENABLE_PLANARITY_RESTRAINTS", "0")
         ).strip().lower() not in {"0", "false", "no", "off"}
 
-    def create_forcefield_with_ligand(self, prepared_ligand, forcefield_method: str = "openff-2.2.0") -> Any:
+    @staticmethod
+    def _assert_ligand_absent_from_protein_component(
+        protein_pdb_data: str,
+        ligand_resname: str,
+    ) -> None:
+        """Reject only a ligand that remains in the protein component.
+
+        The public MD input is normally a complete protein-ligand complex.  The
+        protein-preparation stage extracts its protein component before the
+        refined ligand is added back with OpenFF parameters, so validating the
+        original complex here would always be a false positive.
+        """
+        expected = str(ligand_resname or "LIG").strip().upper()
+        for line in protein_pdb_data.splitlines():
+            if (
+                line.startswith(("ATOM  ", "HETATM"))
+                and len(line) >= 20
+                and line[17:20].strip().upper() == expected
+            ):
+                raise ValueError(
+                    "ligand added twice error: selected ligand residue "
+                    f"'{expected}' is still present in the prepared protein "
+                    "component while refined ligand input is also being added"
+                )
+
+    def create_forcefield_with_ligand(
+        self,
+        prepared_ligand,
+        forcefield_method: str = "openff-2.2.0",
+        protein_forcefield_method: str = "amber14-all",
+        water_model: str = "tip3p",
+    ) -> Any:
         """
         Create OpenMM ForceField with ligand template generator.
 
@@ -72,8 +147,20 @@ class SolvatedSystemBuilder:
             else:
                 raise ValueError(f"Unknown force field method: {forcefield_method}")
 
-            # Create force field with template generator
-            forcefield = OpenMMForceField('amber14-all.xml', 'amber14/tip3p.xml')
+            protein_file = self.PROTEIN_FORCEFIELD_FILES.get(
+                protein_forcefield_method
+            )
+            water_file = self.WATER_FORCEFIELD_FILES.get(water_model)
+            if protein_file is None:
+                raise ValueError(
+                    "Unsupported OpenMM protein force field: "
+                    f"{protein_forcefield_method}"
+                )
+            if water_file is None:
+                raise ValueError(
+                    f"Unsupported OpenMM water model: {water_model}"
+                )
+            forcefield = OpenMMForceField(protein_file, water_file)
             forcefield.registerTemplateGenerator(template_generator)
             logger.info("[COMPLETE] Registered template generator with OpenMM force field")
             return forcefield
@@ -559,6 +646,7 @@ class SolvatedSystemBuilder:
         ligand_set = set(ligand_atom_indices)
         selection = (selection or "backbone").lower()
         target_atoms = []
+        sidechain_atoms = []
         backbone = {"N", "CA", "C", "O"}
         for atom in topology.atoms():
             if atom.index in ligand_set:
@@ -567,9 +655,15 @@ class SolvatedSystemBuilder:
                 continue
             if atom.element is None:
                 continue
-            if selection == "heavy":
+            if selection in {"heavy", "roe_brooks"}:
                 if atom.element.symbol != "H":
-                    target_atoms.append(atom.index)
+                    if selection == "roe_brooks" and (
+                        atom.residue.name not in self.PROTEIN_RESIDUES
+                        or atom.name not in backbone
+                    ):
+                        sidechain_atoms.append(atom.index)
+                    else:
+                        target_atoms.append(atom.index)
             else:  # backbone default
                 if atom.name in backbone:
                     target_atoms.append(atom.index)
@@ -586,12 +680,32 @@ class SolvatedSystemBuilder:
             force.addParticle(int(idx), [float(p.x), float(p.y), float(p.z)])
 
         openmm_system.addForce(force)
+        if selection == "roe_brooks":
+            sidechain_force = CustomExternalForce(
+                "k_prot_side*periodicdistance(x,y,z,x0,y0,z0)^2"
+            )
+            sidechain_force.addGlobalParameter(
+                "k_prot_side", float(k_kjmol_nm2)
+            )
+            sidechain_force.addPerParticleParameter("x0")
+            sidechain_force.addPerParticleParameter("y0")
+            sidechain_force.addPerParticleParameter("z0")
+            for idx in sidechain_atoms:
+                p = pos_nm[idx]
+                sidechain_force.addParticle(
+                    int(idx), [float(p.x), float(p.y), float(p.z)]
+                )
+            openmm_system.addForce(sidechain_force)
         return {
             "status": "applied",
             "selection": selection,
             "parameter_name": "k_prot",
             "k_kjmol_nm2": float(k_kjmol_nm2),
             "restrained_atoms": len(target_atoms),
+            "sidechain_parameter_name": (
+                "k_prot_side" if selection == "roe_brooks" else None
+            ),
+            "restrained_sidechain_or_nonprotein_atoms": len(sidechain_atoms),
         }
 
     def _add_ligand_planarity_restraints(
@@ -740,9 +854,13 @@ class SolvatedSystemBuilder:
         ionic_strength_m: float = 0.15,
         padding_nm: float = 1.0,
         forcefield_method: str = "openff-2.2.0",
+        protein_forcefield_method: str = "amber14-all",
+        water_model: str = "tip3p",
         box_shape: str = "dodecahedron",
         temperature: float = 300.0,
-        pressure: float = 1.0
+        pressure: float = 1.0,
+        production_timestep_fs: float = 4.0,
+        hydrogen_mass_amu: float | None = 4.0,
     ) -> Dict[str, Any]:
         """
         Create a complete solvated protein-ligand system.
@@ -773,13 +891,7 @@ class SolvatedSystemBuilder:
         logger.info("Creating protein-ligand complex using hybrid OpenFF/OpenMM approach...")
         
         try:
-            # Safety: if ligand is provided from refined chemistry input, protein input must not already contain it.
             ligand_resname = (ligand_id[:3] if ligand_id else "LIG").upper()
-            for ln in protein_pdb_data.splitlines():
-                if ln.startswith("HETATM") and len(ln) >= 20 and ln[17:20].strip().upper() == ligand_resname:
-                    raise ValueError(
-                        f"ligand added twice error: selected ligand residue '{ligand_resname}' is still present in protein input PDB while refined ligand input is also being added"
-                    )
 
             # Step 1: Prepare ligand PDB
             logger.info("Step 1: Converting OpenFF ligand to PDB format...")
@@ -791,9 +903,19 @@ class SolvatedSystemBuilder:
             
             if os.path.exists(prepared_protein_path):
                 logger.info(f"Using prepared protein structure: {prepared_protein_path}")
+                with open(prepared_protein_path) as handle:
+                    protein_component_data = handle.read()
+                self._assert_ligand_absent_from_protein_component(
+                    protein_component_data,
+                    ligand_resname,
+                )
                 protein_pdb = PDBFile(prepared_protein_path)
             else:
                 logger.warning("Prepared protein structure not found, using raw protein data")
+                self._assert_ligand_absent_from_protein_component(
+                    protein_pdb_data,
+                    ligand_resname,
+                )
                 protein_pdb_file = StringIO(protein_pdb_data)
                 protein_pdb = PDBFile(protein_pdb_file)
             
@@ -806,7 +928,12 @@ class SolvatedSystemBuilder:
             
             # Step 4: Create force field with ligand template
             logger.info(f"Step 4: Creating force field with ligand template using {forcefield_method}...")
-            forcefield = self.create_forcefield_with_ligand(prepared_ligand, forcefield_method)
+            forcefield = self.create_forcefield_with_ligand(
+                prepared_ligand,
+                forcefield_method,
+                protein_forcefield_method,
+                water_model,
+            )
             
             # Step 5: Combine protein and ligand
             logger.info("Step 5: Combining protein and ligand...")
@@ -836,11 +963,15 @@ class SolvatedSystemBuilder:
             logger.info(f"[COMPLETE] Combined system: {modeller.topology.getNumAtoms()} atoms")
             
             # Step 6: Solvate and ionize
-            omm_box_shape = 'dodecahedron' if box_shape == 'dodecahedron' else 'cube'
+            omm_box_shape = self.OPENMM_BOX_SHAPES.get(
+                str(box_shape).strip().lower()
+            )
+            if omm_box_shape is None:
+                raise ValueError(f"Unsupported OpenMM box shape: {box_shape}")
             logger.info(f"Step 6: Solvating and ionizing system (box_shape={omm_box_shape})...")
             modeller.addSolvent(
                 forcefield,
-                model='tip3p',
+                model=self.SOLVENT_BOX_MODELS[water_model],
                 padding=padding_nm * unit.nanometer,
                 ionicStrength=ionic_strength_m * unit.molar,
                 boxShape=omm_box_shape
@@ -878,7 +1009,7 @@ class SolvatedSystemBuilder:
                         modeller.topology,
                         modeller.positions,
                         added_ligand_atom_indices,
-                        self.LIGAND_LOCK_K_KJMOL_NM2,
+                        self.ligand_lock_k,
                     )
                     if self.enable_planarity_restraints:
                         pre_planarity_restraint = self._add_ligand_planarity_restraints(
@@ -886,7 +1017,7 @@ class SolvatedSystemBuilder:
                             modeller.topology,
                             ligand_pdb_path,
                             added_ligand_atom_indices,
-                            self.LIGAND_PLANARITY_K_KJMOL_NM2,
+                            self.ligand_planarity_k,
                         )
                     else:
                         pre_planarity_restraint = {"status": "disabled", "reason": "planarity restraints disabled by config"}
@@ -923,7 +1054,11 @@ class SolvatedSystemBuilder:
                 switchDistance=0.8 * unit.nanometer,
                 constraints=openmm.app.HBonds,
                 rigidWater=True,
-                hydrogenMass=4.0 * unit.amu,
+                hydrogenMass=(
+                    float(hydrogen_mass_amu) * unit.amu
+                    if hydrogen_mass_amu is not None
+                    else None
+                ),
             )
             if self.enable_ligand_restraints:
                 setup_lock_restraint = self._add_ligand_positional_restraints(
@@ -931,7 +1066,7 @@ class SolvatedSystemBuilder:
                     modeller.topology,
                     modeller.positions,
                     added_ligand_atom_indices,
-                    self.LIGAND_LOCK_K_KJMOL_NM2,
+                    self.ligand_lock_k,
                 )
                 if self.enable_planarity_restraints:
                     setup_planarity_restraint = self._add_ligand_planarity_restraints(
@@ -939,7 +1074,7 @@ class SolvatedSystemBuilder:
                         modeller.topology,
                         ligand_pdb_path,
                         added_ligand_atom_indices,
-                        self.LIGAND_PLANARITY_K_KJMOL_NM2,
+                        self.ligand_planarity_k,
                     )
                 else:
                     setup_planarity_restraint = {"status": "disabled", "reason": "planarity restraints disabled by config"}
@@ -982,7 +1117,7 @@ class SolvatedSystemBuilder:
             integrator = LangevinMiddleIntegrator(
                 temperature * unit.kelvin,
                 1.0 / unit.picosecond,
-                0.004 * unit.picoseconds
+                float(production_timestep_fs) * unit.femtoseconds,
             )
 
             # Step 10: Create simulation
@@ -1104,8 +1239,12 @@ class SolvatedSystemBuilder:
         prepared_ligand,
         system_id: str = "system",
         forcefield_method: str = "openff-2.2.0",
+        protein_forcefield_method: str = "amber14-all",
+        water_model: str = "tip3p",
         temperature: float = 300.0,
-        pressure: float = 1.0
+        pressure: float = 1.0,
+        production_timestep_fs: float = 4.0,
+        hydrogen_mass_amu: float | None = 4.0,
     ) -> Dict[str, Any]:
         """
         Recreate OpenMM system from an existing solvated PDB.
@@ -1131,7 +1270,12 @@ class SolvatedSystemBuilder:
         
         try:
             # Create force field with ligand template
-            forcefield = self.create_forcefield_with_ligand(prepared_ligand, forcefield_method)
+            forcefield = self.create_forcefield_with_ligand(
+                prepared_ligand,
+                forcefield_method,
+                protein_forcefield_method,
+                water_model,
+            )
             
             # Load PDB using OpenMM PDBFile (supports Hybrid-36)
             pdb_file = io.StringIO(system_pdb_data)
@@ -1147,7 +1291,11 @@ class SolvatedSystemBuilder:
                 switchDistance=0.8 * unit.nanometer,
                 constraints=openmm.app.HBonds,
                 rigidWater=True,
-                hydrogenMass=4.0 * unit.amu
+                hydrogenMass=(
+                    float(hydrogen_mass_amu) * unit.amu
+                    if hydrogen_mass_amu is not None
+                    else None
+                ),
             )
 
             # Enable long-range dispersion correction
@@ -1162,7 +1310,7 @@ class SolvatedSystemBuilder:
             # Configure integrator and barostat
             temp_unit = temperature * unit.kelvin
             friction = 1.0 / unit.picosecond
-            step_size = 4.0 * unit.femtoseconds
+            step_size = float(production_timestep_fs) * unit.femtoseconds
             integrator = LangevinMiddleIntegrator(temp_unit, friction, step_size)
 
             press_unit = pressure * unit.bar
@@ -1211,7 +1359,9 @@ class SolvatedSystemBuilder:
         padding_nm: float = 1.0,
         box_shape: str = "dodecahedron",
         temperature: float = 300.0,
-        pressure: float = 1.0
+        pressure: float = 1.0,
+        production_timestep_fs: float = 4.0,
+        hydrogen_mass_amu: float | None = 4.0,
     ) -> Dict[str, Any]:
         """
         Create a complete solvated protein-only system using AMBER14 force fields.
@@ -1250,7 +1400,11 @@ class SolvatedSystemBuilder:
             forcefield = OpenMMForceField('amber14-all.xml', 'amber14/tip3p.xml')
 
             # Step 3: Solvate and ionize
-            omm_box_shape = 'dodecahedron' if box_shape == 'dodecahedron' else 'cube'
+            omm_box_shape = self.OPENMM_BOX_SHAPES.get(
+                str(box_shape).strip().lower()
+            )
+            if omm_box_shape is None:
+                raise ValueError(f"Unsupported OpenMM box shape: {box_shape}")
             logger.info(f"Step 3: Solvating and ionizing system (box_shape={omm_box_shape})...")
             modeller = Modeller(protein_pdb.topology, protein_pdb.positions)
             modeller.addSolvent(
@@ -1312,7 +1466,11 @@ class SolvatedSystemBuilder:
                 switchDistance=0.8 * unit.nanometer,
                 constraints=openmm.app.HBonds,
                 rigidWater=True,
-                hydrogenMass=4.0 * unit.amu,
+                hydrogenMass=(
+                    float(hydrogen_mass_amu) * unit.amu
+                    if hydrogen_mass_amu is not None
+                    else None
+                ),
             )
 
             # Enable long-range dispersion correction
@@ -1338,7 +1496,7 @@ class SolvatedSystemBuilder:
             integrator = LangevinMiddleIntegrator(
                 temperature * unit.kelvin,
                 1.0 / unit.picosecond,
-                0.004 * unit.picoseconds
+                float(production_timestep_fs) * unit.femtoseconds,
             )
 
             # Step 7: Create simulation
@@ -1408,7 +1566,9 @@ class SolvatedSystemBuilder:
         system_pdb_data: str,
         system_id: str = "system",
         temperature: float = 300.0,
-        pressure: float = 1.0
+        pressure: float = 1.0,
+        production_timestep_fs: float = 4.0,
+        hydrogen_mass_amu: float | None = 4.0,
     ) -> Dict[str, Any]:
         """
         Recreate protein-only OpenMM system from an existing solvated PDB.
@@ -1444,7 +1604,11 @@ class SolvatedSystemBuilder:
                 switchDistance=0.8 * unit.nanometer,
                 constraints=openmm.app.HBonds,
                 rigidWater=True,
-                hydrogenMass=4.0 * unit.amu
+                hydrogenMass=(
+                    float(hydrogen_mass_amu) * unit.amu
+                    if hydrogen_mass_amu is not None
+                    else None
+                ),
             )
 
             # Enable long-range dispersion correction
@@ -1459,7 +1623,7 @@ class SolvatedSystemBuilder:
             # Configure integrator and barostat
             temp_unit = temperature * unit.kelvin
             friction = 1.0 / unit.picosecond
-            step_size = 4.0 * unit.femtoseconds
+            step_size = float(production_timestep_fs) * unit.femtoseconds
             integrator = LangevinMiddleIntegrator(temp_unit, friction, step_size)
 
             press_unit = pressure * unit.bar

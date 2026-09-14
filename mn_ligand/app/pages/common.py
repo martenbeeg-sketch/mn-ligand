@@ -11,6 +11,17 @@ from uuid import uuid4
 
 import streamlit as st
 
+from mn_ligand.app.pages.run_resources import render_run_resources
+from mn_ligand.core.docker_runner import (
+    DockerMount,
+    DockerRunSpec,
+    build_docker_command,
+    registered_tool,
+    write_registered_command_record,
+)
+from mn_ligand.core.jobs import display_job_code, iter_job_records, short_job_code
+from mn_ligand.runtime import input_root, runs_root
+
 
 WORKFLOWS: dict[str, dict[str, Any]] = {
     "structure-preparation": {
@@ -160,20 +171,25 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
     },
 }
 
+WORKFLOW_TOOL_IDS = {
+    "structure-preparation": "protein_cleaning",
+    "docking": "legacy_docking",
+    "batch-docking": "legacy_docking",
+    "md": "openmm_md",
+    "admet": "admet_ai",
+    "boltz2": "boltz2",
+    "qc": "quantum_chemistry",
+    "abfe": "openfe_abfe",
+    "rbfe": "openfe_rbfe",
+}
+
 
 def _input_root() -> Path:
-    root = Path(os.getenv("MN_LIGAND_INPUT_DIR", "/tmp/mn-ligand-inputs"))
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return input_root()
 
 
 def _run_root() -> Path:
-    # Keep run storage consistent with MD pages/jobs:
-    # default to project-local mn-ligand-workdir/workdir/runs.
-    default_root = Path(__file__).resolve().parents[3] / "mn-ligand-workdir" / "workdir" / "runs"
-    root = Path(os.getenv("MN_LIGAND_RUN_DIR", str(default_root)))
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return runs_root()
 
 
 def resolve_run_artifact_path(path_value: str | Path | None, *, must_exist: bool = False) -> Path | None:
@@ -246,6 +262,8 @@ def release_gpu_job_lock(run_id: str) -> None:
 
 
 def queue_gpu_job(run_dir: Path, workflow: str, run_id: str, command: list[str]) -> None:
+    from mn_ligand.core.resources import gpu_ids_from_command
+
     run_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = run_dir / "metadata.json"
     current = {}
@@ -254,6 +272,8 @@ def queue_gpu_job(run_dir: Path, workflow: str, run_id: str, command: list[str])
             current = json.loads(metadata_path.read_text())
         except Exception:
             current = {}
+    requested_gpu_ids = gpu_ids_from_command(command)
+    now_iso = datetime.now(timezone.utc).isoformat()
     current.update(
         {
             "run_id": run_id,
@@ -261,70 +281,32 @@ def queue_gpu_job(run_dir: Path, workflow: str, run_id: str, command: list[str])
             "status": "queued",
             "gpu_queued": True,
             "queued_command": command,
-            "updated_at": current.get("updated_at") or "",
+            "queued_at": current.get("queued_at") or now_iso,
+            "updated_at": now_iso,
+            "resources": {
+                **(current.get("resources") if isinstance(current.get("resources"), dict) else {}),
+                "gpu": True,
+                **({"gpu_ids": list(requested_gpu_ids)} if requested_gpu_ids is not None else {}),
+            },
         }
     )
     metadata_path.write_text(json.dumps(current, indent=2))
 
 
 def try_dispatch_next_queued_gpu_job() -> dict[str, Any] | None:
-    """Dispatch queued GPU jobs sequentially while lock is free.
+    """Compatibility dispatcher backed by the durable worker implementation.
 
-    Returns a summary dict when at least one queued job was run, otherwise None.
+    New installations should run ``mn-ligand worker`` independently so page
+    refreshes do not own job lifetimes. This synchronous wrapper preserves the
+    established behavior while pages migrate.
     """
-    if _gpu_lock_path().exists():
+    from mn_ligand.core.worker import WorkerConfig, iter_queued_jobs, run_worker_until_idle
+
+    run_root = _run_root()
+    if _gpu_lock_path().exists() or not iter_queued_jobs(run_root):
         return None
-
-    dispatched: list[dict[str, Any]] = []
-    while True:
-        candidates: list[tuple[float, Path, dict[str, Any]]] = []
-        for meta in _run_root().glob("**/metadata.json"):
-            try:
-                payload = json.loads(meta.read_text())
-            except Exception:
-                continue
-            if str(payload.get("status")) != "queued":
-                continue
-            cmd = payload.get("queued_command")
-            if not isinstance(cmd, list) or not cmd:
-                continue
-            run_dir = meta.parent
-            try:
-                t = run_dir.stat().st_mtime
-            except Exception:
-                t = 0.0
-            candidates.append((t, run_dir, payload))
-
-        if not candidates:
-            break
-        candidates.sort(key=lambda x: x[0])
-        _, run_dir, payload = candidates[0]
-        run_id = str(payload.get("run_id") or run_dir.name)
-        workflow = str(payload.get("workflow") or "unknown")
-        cmd = payload.get("queued_command")
-        lock_ok, _ = acquire_gpu_job_lock(workflow, run_id)
-        if not lock_ok:
-            break
-
-        metadata_path = run_dir / "metadata.json"
-        payload["status"] = "running"
-        metadata_path.write_text(json.dumps(payload, indent=2))
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            payload["status"] = "completed" if result.returncode == 0 else "failed"
-            payload["returncode"] = int(result.returncode)
-            payload["stdout_tail"] = (result.stdout or "")[-8000:]
-            payload["stderr_tail"] = (result.stderr or "")[-8000:]
-            metadata_path.write_text(json.dumps(payload, indent=2))
-            dispatched.append(
-                {"run_id": run_id, "workflow": workflow, "returncode": int(result.returncode)}
-            )
-        finally:
-            release_gpu_job_lock(run_id)
-
-    if not dispatched:
-        return None
-    return {"count": len(dispatched), "last": dispatched[-1], "runs": dispatched}
+    config = WorkerConfig.create(runs_dir=run_root)
+    return run_worker_until_idle(config)
 
 
 def reconcile_run_metadata_status(run_dir: Path) -> bool:
@@ -601,13 +583,9 @@ def _build_docker_command(
     output_dir: Path,
 ) -> list[str]:
     image = params[workflow["container_param"]]
-    command = ["docker", "run", "--rm", "-v", f"{output_dir}:/output"]
-    # Keep output file ownership on the host user for local app-managed runs.
-    if workflow_key in {"admet", "qc"}:
-        command += ["--user", f"{os.getuid()}:{os.getgid()}"]
-
-    if workflow.get("gpu"):
-        command += ["--gpus", "all"]
+    tool_id = WORKFLOW_TOOL_IDS[workflow_key]
+    mounts = [DockerMount(output_dir, "/output")]
+    environment: dict[str, str] = {}
 
     container_inputs: dict[str, str] = {}
     for param_name in workflow["files"]:
@@ -616,9 +594,11 @@ def _build_docker_command(
             continue
         suffix = Path(host_path).suffix
         container_path = f"/input/{param_name}{suffix}"
-        command += ["-v", f"{host_path}:{container_path}:ro"]
+        mounts.append(DockerMount(Path(host_path), container_path, read_only=True))
         container_inputs[param_name] = container_path
 
+    native_command: tuple[str, ...]
+    workdir = ""
     if workflow_key == "boltz2":
         input_yaml = container_inputs.get("input_yaml")
         if not input_yaml:
@@ -627,13 +607,12 @@ def _build_docker_command(
         cache_dir = str(params.get("boltz_cache_dir") or "").strip()
         msa_repo_dir = str(params.get("boltz_msa_repository_dir") or "").strip()
         if cache_dir:
-            command += ["-v", f"{cache_dir}:/cache"]
-            command += ["-e", "BOLTZ_CACHE=/cache"]
+            mounts.append(DockerMount(Path(cache_dir), "/cache"))
+            environment["BOLTZ_CACHE"] = "/cache"
         if msa_repo_dir:
-            command += ["-v", f"{msa_repo_dir}:/msa_repository"]
+            mounts.append(DockerMount(Path(msa_repo_dir), "/msa_repository"))
 
-        boltz_cmd = [
-            image,
+        boltz_cmd = (
             "predict",
             input_yaml,
             "--out_dir",
@@ -651,16 +630,16 @@ def _build_docker_command(
             "--accelerator",
             str(params.get("accelerator", "gpu")),
             "--override",
-        ]
+        )
+        extra: list[str] = []
         if bool(params.get("use_msa_server", True)):
-            boltz_cmd.append("--use_msa_server")
+            extra.append("--use_msa_server")
         if bool(params.get("use_potentials", True)):
-            boltz_cmd.append("--use_potentials")
+            extra.append("--use_potentials")
         if bool(params.get("affinity_mw_correction", False)):
-            boltz_cmd.append("--affinity_mw_correction")
-        return command + boltz_cmd
-
-    if workflow_key in {"abfe", "rbfe"}:
+            extra.append("--affinity_mw_correction")
+        native_command = (*boltz_cmd, *extra)
+    elif workflow_key in {"abfe", "rbfe"}:
         payload = _build_openfe_payload(workflow_key, params, output_dir.name)
         (output_dir / "openfe_input.json").write_text(json.dumps(payload, indent=2))
         entry = (
@@ -670,22 +649,15 @@ def _build_docker_command(
             else "ABFE_OUTPUT_DIR=/output RBFE_OUTPUT_DIR=/output "
             "python -m mn_ligand.ligandx.services.rbfe.run_rbfe_job --input /output/openfe_input.json --output /output/result.json"
         )
-        return command + [
-            "-v",
-            f"{Path(__file__).resolve().parents[3]}:/work:ro",
-            "-w",
-            "/work",
-            image,
-            "/bin/bash",
-            "-lc",
-            entry,
-        ]
-
-    if workflow_key == "admet":
+        mounts.append(DockerMount(Path(__file__).resolve().parents[3], "/work", read_only=True))
+        workdir = "/work"
+        native_command = ("/bin/bash", "-lc", entry)
+    elif workflow_key == "admet":
         smiles_file = container_inputs.get("smiles_file")
         if not smiles_file:
             raise ValueError("ADMET requires smiles_file input")
         script = _build_admet_script(smiles_file)
+        native_command = ("/bin/sh", "-lc", script)
     elif workflow_key == "qc":
         molecule_file = container_inputs.get("molecule_file")
         if not molecule_file:
@@ -695,14 +667,26 @@ def _build_docker_command(
             str(params.get("method") or "B3LYP"),
             str(params.get("basis") or "def2-SVP"),
         )
+        native_command = ("/bin/sh", "-lc", script)
     else:
         script = _build_smoke_script(workflow_key, params, container_inputs)
-    return command + [image, "/bin/sh", "-lc", script]
+        native_command = ("/bin/sh", "-lc", script)
+    return build_docker_command(
+        DockerRunSpec(
+            tool=registered_tool(tool_id, image=image),
+            command=native_command,
+            mounts=tuple(mounts),
+            environment=environment,
+            gpu_enabled=bool(workflow.get("gpu")),
+            workdir=workdir,
+            use_host_user=workflow_key in {"admet", "qc"},
+        )
+    )
 
 
 def _run_docker_workflow(workflow_key: str, workflow: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     run_id = str(uuid4())
-    generated_job_code = run_id.replace("-", "")[:3].upper()
+    generated_job_code = short_job_code(run_id)
     output_dir = _run_root() / workflow_key / run_id
     if workflow_key == "boltz2":
         extra_meta = params.get("metadata")
@@ -746,6 +730,12 @@ def _run_docker_workflow(workflow_key: str, workflow: dict[str, Any], params: di
         pass
 
     command = _build_docker_command(workflow_key, workflow, params, output_dir)
+    write_registered_command_record(
+        output_dir,
+        tool_id=WORKFLOW_TOOL_IDS[workflow_key],
+        commands=(command,),
+        image=str(params[workflow["container_param"]]),
+    )
     lock_acquired = False
     if workflow.get("gpu"):
         lock_acquired, lock_info = acquire_gpu_job_lock(workflow_key, run_id)
@@ -815,12 +805,13 @@ def render_workflow_page(
     workflow_key: str,
     *,
     show_title: bool = True,
-    show_container_input: bool = True,
+    show_container_input: bool = False,
     show_command_preview: bool = True,
     show_command_in_result: bool = True,
     title_override: str | None = None,
     intro_text: str | None = None,
     run_button_label: str = "Run Docker workflow",
+    input_artifact_types: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
     workflow = WORKFLOWS[workflow_key]
     if show_title:
@@ -834,52 +825,107 @@ def render_workflow_page(
     elif intro_text:
         st.write(intro_text)
 
+    input_tab, tool_tab, run_tab, results_tab = st.tabs(
+        ["Target / Input", "Tool / Engine", "Run", "Results"]
+    )
     params: dict[str, Any] = {}
 
     container_param = workflow["container_param"]
-    if show_container_input:
-        st.subheader("Container")
-        params[container_param] = st.text_input(
-            "Docker image",
-            value=workflow["defaults"][container_param],
-            help="Docker image tag used by docker run.",
-        )
-    else:
+    with tool_tab:
         params[container_param] = workflow["defaults"][container_param]
+        if workflow["params"]:
+            st.subheader("Parameters")
+            for param_name, default in workflow["params"].items():
+                params[param_name] = _render_scalar_input(param_name, default)
 
-    st.subheader("Inputs")
-    for param_name, extensions in workflow["files"].items():
-        uploaded_file = st.file_uploader(
-            param_name.replace("_", " ").title(),
-            type=extensions,
-            key=f"{workflow_key}_{param_name}",
-        )
-        saved_path = _save_upload(workflow_key, param_name, uploaded_file)
-        if saved_path:
-            params[param_name] = saved_path
-            st.code(saved_path)
-
-    if workflow["params"]:
-        st.subheader("Parameters")
-        for param_name, default in workflow["params"].items():
-            params[param_name] = _render_scalar_input(param_name, default)
-
-    if show_command_preview:
-        with st.expander("Docker command preview", expanded=True):
-            try:
-                preview_dir = _run_root() / workflow_key / "preview"
-                preview_command = _build_docker_command(workflow_key, workflow, params, preview_dir)
-                st.code(shlex.join(preview_command))
-            except Exception as exc:
-                st.info(str(exc))
-
-    if st.button(run_button_label, type="primary"):
-        try:
-            run = _run_docker_workflow(workflow_key, workflow, params)
-            if run["returncode"] == 0:
-                st.success(f"Docker run completed: {run['run_id']}")
+    inputs_ready = True
+    missing_prepared_input = False
+    with input_tab:
+        st.subheader("Inputs")
+        for param_name, extensions in workflow["files"].items():
+            artifact_types = (input_artifact_types or {}).get(param_name)
+            if artifact_types:
+                options: dict[str, str] = {}
+                allowed_suffixes = {
+                    f".{extension.lower().lstrip('.')}" for extension in extensions
+                }
+                for job in iter_job_records(_run_root()):
+                    if job.status != "completed" or job.artifact_manifest is None:
+                        continue
+                    for artifact in job.artifact_manifest.artifacts:
+                        if artifact.artifact_type not in artifact_types:
+                            continue
+                        path = artifact.resolve(job.run_dir, must_exist=True)
+                        if path is None or path.suffix.lower() not in allowed_suffixes:
+                            continue
+                        code = display_job_code(job.metadata.get("job_code"), job.run_id)
+                        options[f"{code} | {artifact.label or path.name}"] = str(path)
+                if options:
+                    selected_label = st.selectbox(
+                        param_name.replace("_", " ").title(),
+                        list(options),
+                        key=f"{workflow_key}_{param_name}_artifact",
+                    )
+                    params[param_name] = options[selected_label]
+                else:
+                    st.selectbox(
+                        param_name.replace("_", " ").title(),
+                        ["No compatible prepared artifact"],
+                        disabled=True,
+                        key=f"{workflow_key}_{param_name}_missing",
+                    )
+                    inputs_ready = False
+                    missing_prepared_input = True
             else:
-                st.error(f"Docker run failed with exit code {run['returncode']}")
+                uploaded_file = st.file_uploader(
+                    param_name.replace("_", " ").title(),
+                    type=extensions,
+                    key=f"{workflow_key}_{param_name}",
+                )
+                saved_path = _save_upload(workflow_key, param_name, uploaded_file)
+                if saved_path:
+                    params[param_name] = saved_path
+                else:
+                    inputs_ready = False
+
+    with run_tab:
+        render_run_resources(
+            requires_gpu=bool(workflow.get("gpu")),
+            selected_gpu="Automatic",
+            key=workflow_key,
+        )
+        if missing_prepared_input:
+            st.info("Prepare a compatible typed input before running this workflow.")
+            st.link_button(
+                "Open Structure Import", "./workspace-structure-preparation"
+            )
+        if show_command_preview:
+            with st.expander("Docker command preview", expanded=True):
+                try:
+                    preview_dir = _run_root() / workflow_key / "preview"
+                    preview_command = _build_docker_command(
+                        workflow_key, workflow, params, preview_dir
+                    )
+                    st.code(shlex.join(preview_command))
+                except Exception as exc:
+                    st.info(str(exc))
+
+        if st.button(run_button_label, type="primary", disabled=not inputs_ready):
+            try:
+                run = _run_docker_workflow(workflow_key, workflow, params)
+                st.session_state[f"{workflow_key}_last_run"] = run
+                if run["returncode"] == 0:
+                    st.success(f"Docker run completed: {run['run_id']}")
+                else:
+                    st.error(f"Docker run failed with exit code {run['returncode']}")
+            except Exception as exc:
+                st.error(f"Docker run failed: {exc}")
+
+    with results_tab:
+        run = st.session_state.get(f"{workflow_key}_last_run")
+        if not isinstance(run, dict):
+            st.info("No run has been launched from this page in the current session.")
+        else:
             st.write("Output directory")
             st.code(run["output_dir"])
             if show_command_in_result:
@@ -891,5 +937,3 @@ def render_workflow_page(
             if run["stderr"]:
                 with st.expander("stderr"):
                     st.code(run["stderr"])
-        except Exception as exc:
-            st.error(f"Docker run failed: {exc}")

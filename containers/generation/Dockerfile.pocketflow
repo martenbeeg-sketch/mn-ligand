@@ -1,0 +1,31 @@
+FROM mnprot-biohub-esm-cu128:latest
+
+ARG SOURCE_COMMIT
+
+LABEL org.opencontainers.image.title="mn-ligand PocketFlow" \
+      org.opencontainers.image.description="PocketFlow inference on CUDA 12.8 / NVIDIA Blackwell" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="mn-ligand local pinned source checkout"
+
+ENV ENGINE="pocketflow" \
+    CUDA_HOME="/usr/local/cuda" \
+    TORCH_CUDA_ARCH_LIST="12.0+PTX" \
+    PYTHONPATH="/opt/engine" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+WORKDIR /opt/engine
+
+# PyG publishes extensions compiled for the CUDA 12.8 PyTorch 2.7 ABI used by
+# the local Blackwell base. Pin the wheel index so pip cannot replace torch.
+RUN python -m pip install --no-cache-dir \
+      pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+      -f https://data.pyg.org/whl/torch-2.7.0+cu128.html \
+    && python -m pip install --no-cache-dir "torch-geometric==2.6.1" \
+    && python -m pip install --no-cache-dir easydict lmdb scipy tensorboard tqdm
+
+COPY tools_to_implement/PocketFlow/ /opt/engine/
+COPY containers/generation/runner.py /opt/mn-ligand/generation_runner.py
+
+ENTRYPOINT ["python", "/opt/mn-ligand/generation_runner.py"]
+CMD ["--help"]

@@ -2,19 +2,29 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import subprocess
 from pathlib import Path
 from statistics import mean, stdev
+from urllib.parse import urlencode
 
+import pandas as pd
 import streamlit as st
 
 from mn_ligand.app.pages.bound_ligand_md import (
-    DEFAULT_MD_IMAGE,
     _render_md_results,
+    _render_static_line_plot,
     _rewrite_output_paths,
     _run_root,
-    _repo_root,
+)
+from mn_ligand.core.jobs import display_job_code
+from mn_ligand.workflows.md_simulation import (
+    create_mmgbsa_analysis_job,
+    list_mmgbsa_analysis_jobs,
+)
+from mn_ligand.workflows.md_engines import (
+    GROMACS_ENGINE,
+    OPENMM_ENGINE,
+    md_engine_spec,
+    normalize_md_engine,
 )
 
 
@@ -23,51 +33,6 @@ def _read_json(path: Path) -> dict:
         return json.loads(path.read_text())
     except Exception:
         return {}
-
-
-def _build_mmgbsa_recompute_command(
-    image: str,
-    run_dir: Path,
-    use_gpu: bool,
-    start_pct: float,
-    end_pct: float,
-    stride: int,
-    backend: str,
-) -> list[str]:
-    command = ["docker", "run", "--rm"]
-    shm_size = os.getenv("MN_MD_DOCKER_SHM_SIZE", "64g").strip()
-    if shm_size:
-        command += ["--shm-size", shm_size]
-    if use_gpu:
-        command += ["--gpus", "all"]
-    command += [
-        "-v",
-        f"{_repo_root()}:/mn-ligand:ro",
-        "-v",
-        f"{run_dir}:/output",
-        "-e",
-        "PYTHONPATH=/mn-ligand",
-        image,
-        "python",
-        "-m",
-        "mn_ligand.workflows.bound_ligand_md",
-        "mmgbsa",
-        "--input",
-        "/output/input.json",
-        "--result",
-        "/output/result.json",
-        "--output",
-        "/output/result.json",
-        "--start-pct",
-        str(start_pct),
-        "--end-pct",
-        str(end_pct),
-        "--stride",
-        str(stride),
-        "--backend",
-        str(backend),
-    ]
-    return command
 
 
 def _read_total_frames_from_dcd(path: Path) -> int | None:
@@ -94,18 +59,225 @@ def _collect_repeat_group_runs(run_dir: Path, metadata: dict) -> list[tuple[Path
     return grouped or [(run_dir, metadata, _read_json(run_dir / "result.json"))]
 
 
+def _render_workflow_replica_files(
+    result_payload: dict,
+    metadata: dict,
+) -> None:
+    """Keep production replicas as lightweight file handoffs.
+
+    Stability, interaction, and endpoint-energy calculations belong to the
+    workflow's immutable ``md-analysis`` child.  Repeating them here made a
+    replica route slow and presented a second, potentially confusing analysis
+    surface.
+    """
+    md_result = result_payload.get("md_result") or {}
+    output_files = md_result.get("output_files") or {}
+    status = str(md_result.get("status") or metadata.get("status") or "unknown")
+    st.subheader("Production replica files")
+    if result_payload.get("success"):
+        st.success(f"Production replica status: {status}")
+    else:
+        st.warning(f"Production replica status: {status}")
+    if output_files:
+        rows = []
+        for name, path in output_files.items():
+            rows.append(
+                {
+                    "file": name,
+                    "path": str(path),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.info("This replica did not declare output files.")
+
+
+def _render_mmgbsa_convergence(mmgbsa: dict, analysis_dir: Path) -> None:
+    artifacts = (
+        mmgbsa.get("artifacts")
+        if isinstance(mmgbsa.get("artifacts"), dict)
+        else {}
+    )
+    raw_path = str(artifacts.get("per_frame_csv") or "").strip()
+    if not raw_path:
+        return
+    candidates = [Path(raw_path), analysis_dir / raw_path]
+    per_frame_path = next(
+        (candidate for candidate in candidates if candidate.is_file()),
+        None,
+    )
+    if per_frame_path is None:
+        return
+    try:
+        frame = pd.read_csv(per_frame_path)
+    except Exception as exc:
+        st.caption(f"Per-frame endpoint energies could not be read: {exc}")
+        return
+    total_column = next(
+        (
+            column
+            for column in (
+                "delta_G_mmgbsa_kcalmol",
+                "DELTA_TOTAL",
+                "delta_g_bind_total_kcal_mol",
+            )
+            if column in frame.columns
+        ),
+        None,
+    )
+    if total_column is None or frame.empty:
+        return
+    values = pd.to_numeric(frame[total_column], errors="coerce")
+    valid = values.notna()
+    if not valid.any():
+        return
+    frame = frame.loc[valid].copy()
+    values = values.loc[valid].astype(float)
+    if "time_ps" in frame.columns:
+        x_values = (
+            pd.to_numeric(frame["time_ps"], errors="coerce")
+            .ffill()
+            .fillna(0.0)
+            / 1000.0
+        )
+        x_label = "Analyzed trajectory time (ns)"
+    else:
+        x_values = pd.Series(range(1, len(frame) + 1), index=frame.index)
+        x_label = "Analyzed frame"
+    convergence = pd.DataFrame(
+        {
+            "x": x_values.to_numpy(),
+            "per_frame_delta_g_kcal_mol": values.to_numpy(),
+            "cumulative_mean_delta_g_kcal_mol": values.expanding().mean().to_numpy(),
+        }
+    ).set_index("x")
+    st.markdown("##### Endpoint-energy convergence")
+    _render_static_line_plot(
+        convergence,
+        [
+            "per_frame_delta_g_kcal_mol",
+            "cumulative_mean_delta_g_kcal_mol",
+        ],
+        "MM/GBSA estimate and cumulative mean",
+        "ΔG estimate (kcal/mol)",
+        x_label=x_label,
+    )
+
+    block_count = min(10, max(1, len(values) // 5))
+    if block_count >= 2:
+        block_ids = pd.cut(
+            range(len(values)),
+            bins=block_count,
+            labels=False,
+            include_lowest=True,
+        )
+        block_table = (
+            pd.DataFrame(
+                {
+                    "block": block_ids,
+                    "delta_g_kcal_mol": values.to_numpy(),
+                }
+            )
+            .groupby("block", as_index=False)
+            .agg(
+                mean_delta_g_kcal_mol=("delta_g_kcal_mol", "mean"),
+                sample_sd_kcal_mol=("delta_g_kcal_mol", "std"),
+                frames=("delta_g_kcal_mol", "size"),
+            )
+        )
+        block_plot = block_table.set_index("block")[
+            ["mean_delta_g_kcal_mol"]
+        ]
+        _render_static_line_plot(
+            block_plot,
+            ["mean_delta_g_kcal_mol"],
+            "Contiguous block means",
+            "Mean ΔG estimate (kcal/mol)",
+            x_label="Trajectory block",
+        )
+        with st.expander("MM/GBSA convergence table"):
+            st.dataframe(block_table, hide_index=True, width="stretch")
+    st.caption(
+        "A stable cumulative mean and mutually consistent late block means "
+        "support numerical stability of the endpoint estimate; they do not "
+        "establish rigorous free-energy convergence."
+    )
+
+
 def _render_repeat_mmgbsa_aggregate(grouped_runs: list[tuple[Path, dict, dict]]) -> None:
-    successful = []
-    for _, _, result_payload in grouped_runs:
-        mm = (result_payload.get("mmgbsa") or {})
+    successful: list[dict] = []
+    replicate_rows: list[dict] = []
+    convergence_jobs = []
+    for run_dir, metadata, result_payload in grouped_runs:
+        endpoint_jobs = list_mmgbsa_analysis_jobs(run_dir.name)
+        latest_completed = next(
+            (
+                job
+                for job in endpoint_jobs
+                if job.status == "completed"
+                and str((job.result.get("mmgbsa") or {}).get("status") or "")
+                == "success"
+            ),
+            None,
+        )
+        mm = (
+            latest_completed.result.get("mmgbsa") or {}
+            if latest_completed is not None
+            else result_payload.get("mmgbsa") or {}
+        )
+        delta = mm.get("delta") or {}
         if str(mm.get("status")) == "success":
-            successful.append(mm.get("delta") or {})
+            successful.append(delta)
+            if latest_completed is not None:
+                convergence_jobs.append((metadata, latest_completed, mm))
+        replicate_rows.append(
+            {
+                "replica": metadata.get("repeat_index") or "-",
+                "production_results": "./md-results?"
+                + urlencode(
+                    {
+                        "run_type": "bound-ligand-md",
+                        "run_id": run_dir.name,
+                    }
+                ),
+                "production_job": display_job_code(
+                    metadata.get("job_code"), run_dir.name
+                ),
+                "endpoint_job": (
+                    latest_completed.run_id if latest_completed is not None else ""
+                ),
+                "status": str(mm.get("status") or "not computed"),
+                "frames": (
+                    (mm.get("metadata") or {}).get("n_frames_analyzed")
+                    if isinstance(mm.get("metadata"), dict)
+                    else ""
+                ),
+                "delta_g_bind_kcal_mol": delta.get(
+                    "delta_g_bind_total_kcal_mol"
+                ),
+            }
+        )
     total = len(grouped_runs)
     ok = len(successful)
-    st.subheader("MM/GBSA Repeat Aggregate")
-    st.caption(f"Successful repeats: {ok}/{total}")
+    st.subheader("Replicated endpoint-energy estimate")
+    st.caption(
+        f"Successful independent replicas: {ok}/{total}. These MM/GBSA-style "
+        "endpoint estimates are trajectory summaries, not rigorous absolute "
+        "binding free energies."
+    )
+    st.dataframe(
+        replicate_rows,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "production_results": st.column_config.LinkColumn(
+                "Replica files", display_text="Open files"
+            ),
+            "production_job": st.column_config.TextColumn("Production job"),
+        },
+    )
     if ok == 0:
-        st.info("No successful MM/GBSA repeat results available for aggregation yet.")
+        st.info("No successful endpoint-energy results are available yet.")
         return
 
     def _stats(values: list[float]) -> tuple[float, float]:
@@ -142,10 +314,54 @@ def _render_repeat_mmgbsa_aggregate(grouped_runs: list[tuple[Path, dict, dict]])
         st.table(rows)
     if ok < 2:
         st.caption("SD is not available with fewer than 2 successful repeats.")
+    if convergence_jobs:
+        with st.expander("Per-replica MM/GBSA convergence"):
+            for metadata, endpoint_job, mmgbsa in convergence_jobs:
+                st.markdown(
+                    f"**Replica {metadata.get('repeat_index') or '-'} · "
+                    f"{display_job_code(endpoint_job.metadata.get('job_code'), endpoint_job.run_id)}**"
+                )
+                _render_mmgbsa_convergence(
+                    mmgbsa, endpoint_job.run_dir
+                )
 
 
 def _render_mmgbsa_summary_at_end(result_payload: dict, run_dir: Path, metadata: dict, input_payload: dict) -> dict:
     st.subheader("MM/GBSA Analysis (End Summary)")
+    analysis_jobs = list_mmgbsa_analysis_jobs(run_dir.name)
+    latest_success_job = None
+    if analysis_jobs:
+        st.markdown("**Post-run evaluations**")
+        st.table(
+            [
+                {
+                    "job": display_job_code(job.metadata.get("job_code"), job.run_id),
+                    "status": job.status,
+                    "engine": ((job.result.get("mmgbsa") or {}).get("method") or
+                               ((job.result.get("mmgbsa") or {}).get("backend")) or
+                               ((job.metadata.get("resources") or {}).get("tool_id")) or "openmm_md"),
+                    "window": (
+                        f"{((job.result.get('mmgbsa') or {}).get('start_pct') or (job.metadata.get('parameters') or {}).get('start_pct') or '-')}-"
+                        f"{((job.result.get('mmgbsa') or {}).get('end_pct') or (job.metadata.get('parameters') or {}).get('end_pct') or '-')}%"
+                    ),
+                }
+                for job in analysis_jobs
+            ]
+        )
+        latest_success = next(
+            (
+                job
+                for job in analysis_jobs
+                if job.status == "completed"
+                and str((job.result.get("mmgbsa") or {}).get("status") or "") == "success"
+            ),
+            None,
+        )
+        if latest_success is not None:
+            latest_success_job = latest_success
+            result_payload = dict(result_payload)
+            result_payload["mmgbsa"] = latest_success.result.get("mmgbsa") or {}
+
     default_start_pct = int(input_payload.get("mmgbsa_start_pct", 20))
     default_end_pct = int(input_payload.get("mmgbsa_end_pct", 100))
     default_stride = int(input_payload.get("mmgbsa_stride", 1))
@@ -185,35 +401,68 @@ def _render_mmgbsa_summary_at_end(result_payload: dict, run_dir: Path, metadata:
         else:
             st.caption(f"Auto-suggested stride for ~600 analyzed frames: {suggested_stride} (window ~{analyzed_frames} frames)")
 
-    input_json = run_dir / "input.json"
-    result_json = run_dir / "result.json"
-    if st.button("Recompute MM/GBSA", type="primary", key=f"recompute_mmgbsa_end_{run_dir.name}"):
-        if not input_json.exists() or not result_json.exists():
-            st.error("This run is missing input.json or result.json; cannot recompute MM/GBSA.")
-        else:
-            image = str(metadata.get("docker_image") or DEFAULT_MD_IMAGE)
-            use_gpu = bool(metadata.get("use_gpu", True))
-            cmd = _build_mmgbsa_recompute_command(
-                image=image,
-                run_dir=run_dir,
-                use_gpu=use_gpu,
+    st.markdown("**Tool / Engine**")
+    engine_columns = st.columns(3)
+    source_engine = normalize_md_engine(
+        metadata.get("md_engine")
+        or result_payload.get("engine")
+        or (result_payload.get("md_result") or {}).get("engine")
+        or input_payload.get("md_engine")
+        or OPENMM_ENGINE
+    )
+    default_backend = str(
+        input_payload.get("mmgbsa_backend")
+        or (
+            "g_mmpbsa"
+            if source_engine == GROMACS_ENGINE
+            else "openmm_gbsa"
+        )
+    )
+    backend_options = list(md_engine_spec(source_engine).endpoint_backends)
+    if source_engine == GROMACS_ENGINE:
+        backend_options = ["g_mmpbsa"]
+    with engine_columns[0]:
+        backend = st.selectbox(
+            "Endpoint energy engine",
+            backend_options,
+            index=backend_options.index(default_backend) if default_backend in backend_options else 0,
+            key=f"mmgbsa_backend_{run_dir.name}",
+        )
+    with engine_columns[1]:
+        use_gpu = st.checkbox(
+            "Use GPU",
+            value=bool(metadata.get("use_gpu", True)),
+            key=f"mmgbsa_gpu_{run_dir.name}",
+        )
+    with engine_columns[2]:
+        gpu_device = st.selectbox(
+            "GPU device",
+            ["0", "1", "all"],
+            index=0,
+            disabled=not use_gpu,
+            key=f"mmgbsa_gpu_device_{run_dir.name}",
+        )
+    st.caption(
+        f"Engine: {md_engine_spec(source_engine).label} · Container: "
+        f"{metadata.get('docker_image') or md_engine_spec(source_engine).default_image}"
+    )
+    if st.button("Queue MM/GBSA analysis", type="primary", key=f"queue_mmgbsa_end_{run_dir.name}"):
+        try:
+            queued = create_mmgbsa_analysis_job(
+                run_dir.name,
                 start_pct=start_pct,
                 end_pct=end_pct,
                 stride=stride,
-                backend=str(input_payload.get("mmgbsa_backend", "openmm_gbsa")),
+                backend=backend,
+                image=str(metadata.get("docker_image") or ""),
+                use_gpu=use_gpu,
+                gpu_device=gpu_device if use_gpu else "all",
             )
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode == 0:
-                st.success("MM/GBSA recompute finished.")
-                result_payload = _read_json(result_json)
-            else:
-                st.error(f"MM/GBSA recompute failed with exit code {proc.returncode}")
-            if proc.stdout:
-                with st.expander("stdout"):
-                    st.code(proc.stdout)
-            if proc.stderr:
-                with st.expander("stderr"):
-                    st.code(proc.stderr)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            st.error(f"Could not queue MM/GBSA analysis: {exc}")
+        else:
+            code = display_job_code(queued.metadata.get("job_code"), queued.run_id)
+            st.success(f"Queued MM/GBSA job {code}. The source MD run is unchanged.")
 
     def _render_delta_metrics(delta_payload: dict, title: str) -> None:
         st.markdown(f"**{title}**")
@@ -246,6 +495,12 @@ def _render_mmgbsa_summary_at_end(result_payload: dict, run_dir: Path, metadata:
         if artifacts:
             st.markdown("**Generated Amber files**")
             st.table([{"name": k, "path": v} for k, v in artifacts.items()])
+        _render_mmgbsa_convergence(
+            mmgbsa,
+            latest_success_job.run_dir
+            if latest_success_job is not None
+            else run_dir,
+        )
     elif status == "failed":
         st.error(f"MM/GBSA failed: {mmgbsa.get('error', 'Unknown error')}")
     elif status == "skipped":
@@ -295,7 +550,12 @@ def render() -> None:
         return
 
     rewritten = _rewrite_output_paths(result, run_dir)
-    if run_subdir == "bound-ligand-md":
+    is_workflow_replica = bool(
+        metadata.get("workflow_id") or metadata.get("workflow_parent_run_id")
+    )
+    if run_subdir == "bound-ligand-md" and is_workflow_replica:
+        _render_workflow_replica_files(rewritten, metadata)
+    elif run_subdir == "bound-ligand-md":
         grouped_runs = _collect_repeat_group_runs(run_dir, metadata)
         if len(grouped_runs) > 1:
             st.caption(f"Repeat group: {metadata.get('repeat_group_id')} ({len(grouped_runs)} runs)")

@@ -1,0 +1,25 @@
+name: ovolig-gromacs
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ambertools
+  - parmed
+  - rdkit
+  - mdtraj
+  - mdanalysis
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - networkx
+  - scikit-learn
+  - biopython
+  - pyyaml
+  - openmpi
+  - mpi4py
+  - pip
+  - pip:
+      - g-mmpbsa==3.0.13
+      - ruptures>=1.1.9

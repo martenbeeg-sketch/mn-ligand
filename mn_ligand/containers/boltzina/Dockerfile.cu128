@@ -1,0 +1,20 @@
+FROM ovoex-boltz2:latest AS canonical_boltz2
+
+FROM boltzina:latest
+
+LABEL org.opencontainers.image.title="mn-ligand Boltzina pose rescoring"
+LABEL org.opencontainers.image.description="Boltzina with the canonical CUDA 12.8 Boltz-2 runtime for RTX 5090"
+LABEL org.opencontainers.image.source="mn-ligand"
+
+# Keep Boltzina's structure-preparation utilities and bundled CCD, but replace
+# its older Python/CUDA runtime with the same canonical Boltz-2 environment
+# used by mn-ligand. No model weights are stored in this image.
+COPY --from=canonical_boltz2 /opt/conda/envs/boltz2 /opt/conda/envs/boltz2
+COPY run_pose_rescoring.py /opt/mn-ligand/run_pose_rescoring.py
+
+ENV PATH="/opt/conda/envs/boltz2/bin:${PATH}" \
+    CUDA_HOME="/usr/local/cuda" \
+    PYTHONUNBUFFERED="1" \
+    PYTHONDONTWRITEBYTECODE="1"
+
+ENTRYPOINT ["/opt/conda/envs/boltz2/bin/python", "/opt/mn-ligand/run_pose_rescoring.py"]

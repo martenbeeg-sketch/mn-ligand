@@ -610,7 +610,7 @@ def render_structure_jobs() -> None:
     st.title("Jobs – Structure")
     rows = _collect_structure_jobs()
     if not rows:
-        st.info("No structure preparation jobs found yet.")
+        st.info("No structure import jobs found yet.")
         return
     df = pd.DataFrame(rows)
     statuses = sorted([s for s in df["status"].dropna().unique().tolist() if s])

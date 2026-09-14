@@ -10,14 +10,16 @@ import streamlit as st
 from mn_ligand.app.pages.bound_ligand_md import _short_job_code, _run_root
 from mn_ligand.app.pages.common import WORKFLOWS, _input_root, _run_docker_workflow, try_dispatch_next_queued_gpu_job
 from mn_ligand.workflows.bound_ligand_md import parse_bound_ligands, extract_ligand_pdb, _build_ligand_sdf_artifacts
+from mn_ligand.workflows.refolding import configured_alphafold3_reference_paths
 
 EXAMPLE_PROTEIN = """>THRbeta_human
 HKPEPTDEEWELIKTVTEAHVATNAQGSHWKQKRKFLPEDIGQAPIVNAPEGGKVDLEAFSHFTKIITPAITRVVDFAKKLPMFCELPCEDQIILLKGCCMEIMSLRAAVRYDPESETLTLNGEMAVTRGQLKNGGLGVVSDAIFDLGMSLSSFNLDDTEVALLQAVLLMSSDRPGLACVERIEKYQDSFLLAFEHYINYRKHHVTHFWPKLLMKVTDLRMIGACHASRFLHMKVECPTELFPPLFLEVFED"""
 EXAMPLE_LIGAND = "T3,OC1=C(I)C=C(OC2=C(I)C=C(C[C@H](N)C(O)=O)C=C2I)C=C1"
 VALID_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
 BOLTZ2_UI_SCHEMA_VERSION = "2026-05-12-v2"
-DEFAULT_BOLTZ_CACHE_DIR = "/mnt/db/reference_files/boltz_models"
-DEFAULT_MSA_REPOSITORY_DIR = DEFAULT_BOLTZ_CACHE_DIR + "/msa_repository"
+_DEFAULT_DB_DIR, _DEFAULT_WEIGHTS_DIR, _DEFAULT_MSA_DIR = configured_alphafold3_reference_paths()
+DEFAULT_MSA_REPOSITORY_DIR = str(_DEFAULT_MSA_DIR)
+DEFAULT_BOLTZ_CACHE_DIR = str(_DEFAULT_MSA_DIR.parent)
 POLYMER_RESN = {"ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL","A","C","G","U","T","DA","DC","DG","DT","DU"}
 
 
@@ -63,11 +65,6 @@ def _default_state() -> None:
         st.session_state["boltz2_diffusion_samples_affinity"] = 5
     if "boltz2_affinity_mw_correction" not in st.session_state:
         st.session_state["boltz2_affinity_mw_correction"] = False
-    if "boltz2_cache_dir" not in st.session_state:
-        st.session_state["boltz2_cache_dir"] = DEFAULT_BOLTZ_CACHE_DIR
-    if "boltz2_msa_repository_dir" not in st.session_state:
-        st.session_state["boltz2_msa_repository_dir"] = DEFAULT_MSA_REPOSITORY_DIR
-
     # Backward compatibility: convert legacy "LIG <smiles>" to comma style.
     raw_lig = str(st.session_state.get("boltz2_ligand", "") or "").strip()
     if raw_lig and "," not in raw_lig and " " in raw_lig:
@@ -499,16 +496,7 @@ def render_boltz2_ui(*, show_page_title: bool = True) -> None:
 
     st.markdown("#### Boltz Settings")
     with st.expander("Settings", expanded=False):
-        st.text_input(
-            "Cache directory",
-            key="boltz2_cache_dir",
-            help="Host path with Boltz reference/model cache. Mounted to /cache.",
-        )
-        st.text_input(
-            "MSA repository directory",
-            key="boltz2_msa_repository_dir",
-            help="Host path for MSA repository. Mounted to /msa_repository.",
-        )
+        st.caption("Uses `boltz_models/` and its shared `msa_repository/` from the configured reference root.")
         s1, s2, s3 = st.columns(3)
         with s1:
             st.checkbox("Use MSA server", key="boltz2_use_msa_server")
@@ -579,8 +567,8 @@ def render_boltz2_ui(*, show_page_title: bool = True) -> None:
         try:
             meta_path = structure_dir / "metadata.json"
             meta = _read_json(meta_path)
-            meta["input_yaml_path"] = str(yaml_path)
-            meta["boltz_output_dir"] = str(boltz_dir)
+            meta["input_yaml_path"] = yaml_path.relative_to(structure_dir).as_posix()
+            meta["boltz_output_dir"] = boltz_dir.relative_to(structure_dir).as_posix()
             _write_json(meta_path, meta)
         except Exception:
             pass
@@ -589,8 +577,8 @@ def render_boltz2_ui(*, show_page_title: bool = True) -> None:
             "boltz2_container": WORKFLOWS["boltz2"]["defaults"]["boltz2_container"],
             "input_yaml": str(yaml_path),
             "accelerator": "gpu",
-            "boltz_cache_dir": str(st.session_state.get("boltz2_cache_dir", DEFAULT_BOLTZ_CACHE_DIR)),
-            "boltz_msa_repository_dir": str(st.session_state.get("boltz2_msa_repository_dir", DEFAULT_MSA_REPOSITORY_DIR)),
+            "boltz_cache_dir": str(configured_alphafold3_reference_paths()[2].parent),
+            "boltz_msa_repository_dir": str(configured_alphafold3_reference_paths()[2]),
             "use_msa_server": bool(st.session_state.get("boltz2_use_msa_server", True)),
             "use_potentials": bool(st.session_state.get("boltz2_use_potentials", True)),
             "sampling_steps": int(st.session_state.get("boltz2_sampling_steps", 200)),
@@ -664,23 +652,11 @@ def render_boltz2_ui(*, show_page_title: bool = True) -> None:
                 message=f"Registration failed: {error_message}",
             )
             st.error(f"Boltz2 finished, but structure registration failed: {error_message}")
-            st.code(f"Boltz run directory:\
-{run.get('output_dir', '')}")
             return
 
         structure_dir = registered_dir
         structure_meta = json.loads((structure_dir / "metadata.json").read_text())
         st.success(f"Boltz2 completed and structure job registered: {structure_meta.get('job_code', '')}")
-        st.code(
-            "\n".join(
-                [
-                    f"Boltz run: {run.get('output_dir', '')}",
-                    f"Structure job: {structure_dir}",
-                    f"Complex PDB: {next(iter(sorted(structure_dir.glob('*_complex_refined.pdb'))), '')}",
-                    f"Ligand SDF: {next(iter(sorted(structure_dir.glob('*_ligand_refined.sdf'))), '')}",
-                ]
-            )
-        )
         if st.button("Open Structure Jobs"):
             _switch_to("app/pages/jobs_structure.py")
 

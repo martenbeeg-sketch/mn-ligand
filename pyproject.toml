@@ -9,16 +9,29 @@ description = "Standalone Streamlit app for Docker-backed ligand modelling workf
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "gemmi>=0.7,<0.8",
   "matplotlib",
   "mdtraj",
+  "meeko>=0.6.1,<0.7",
   "numpy",
+  "openpyxl>=3.1,<4",
   "pandas",
   "pillow",
   "py3Dmol",
+  "pyyaml>=6,<7",
   "rdkit",
+  "seaborn",
   "streamlit",
   "typer",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 mn-ligand = "mn_ligand.cli:main"

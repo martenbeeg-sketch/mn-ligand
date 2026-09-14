@@ -9,7 +9,7 @@
 - Active task pages for ADMET/QC/OpenFE and docking engines (UDP/Vina/Gnina) in the structure workflow
 
 The app is implemented as a Python package with CLI entrypoint `mn-ligand`, and an app runtime rooted at:
-- `/home/user/programs/git-projects/mn-ligand/mn-ligand-workdir`
+- `/mnt/data/RESULTS/mn-ligand-workdir`
 
 ## 2) Current goal
 Stabilize and complete the modular workflow split with consistent artifact handoff:
@@ -44,6 +44,10 @@ Inspiration/reference folders used during implementation:
 - Job tables are in place across major tasks with links on job codes and auto-refresh behavior.
 - Structure results include docking metadata and ligand overlay/RMSD-oriented views.
 - Production restart handling and run provenance were hardened (input/result/metadata consistency).
+- Durable CPU and per-GPU workers use atomic run claims. All jobs share a
+  systemwide CPU-slot pool capped by `cpu_process_limit` (16 by default), while
+  GPU jobs additionally acquire an exclusive per-device lease. Temporary CPU
+  pressure queues work instead of oversubscribing the host.
 
 Status caveats:
 - **Boltz2 prediction route in structure preparation is not completed** (`To be confirmed`).
@@ -69,7 +73,7 @@ Status caveats:
   - `/home/user/programs/git-projects/mn-ligand/mn_ligand/ligandx/services/md/workflow/equilibration_runner.py`
   - `/home/user/programs/git-projects/mn-ligand/mn_ligand/ligandx/services/md/workflow/system_builder.py`
 - Runtime outputs:
-  - `/home/user/programs/git-projects/mn-ligand/mn-ligand-workdir/workdir/runs/`
+  - `/mnt/data/RESULTS/mn-ligand-workdir/workdir/runs/`
 
 ## 6) Core features
 - PDB download/inspection and bound ligand selection flow (legacy and modularized variants)
@@ -80,6 +84,8 @@ Status caveats:
 - MD production launch and results rendering
 - Job tables for multiple run classes (structure, MD system prep, MD production, OpenFE, ADMET, QC)
 - 3D visualization (Mol* and py3Dmol-based views in different contexts)
+- Read-only worker health with CPU slots leased/capacity, queue depth, worker
+  heartbeats, and per-GPU lease state
 
 ## 7) Known bugs or fragile areas
 - Legacy/new page routing can still surface unexpected fallback pages in some paths.
@@ -112,7 +118,7 @@ Status caveats:
 - Keep `mn-ligand` self-contained; do not modify external platform installs unless explicitly requested.
 - Preserve run provenance in `input.json`, `result.json`, and `metadata.json`.
 - When changing restart logic, inspect a real failed run folder under:
-  - `/home/user/programs/git-projects/mn-ligand/mn-ligand-workdir/workdir/runs/`
+  - `/mnt/data/RESULTS/mn-ligand-workdir/workdir/runs/`
 - Keep container path visibility in mind (`/mn-ligand` and `/output` mounts).
 - Avoid broad refactors during bug-fix passes; make scoped, traceable changes.
 
@@ -126,4 +132,4 @@ Status caveats:
 - Build images:
   - `docker compose build`
 
-Last Updated: 2026-05-12
+Last Updated: 2026-08-04

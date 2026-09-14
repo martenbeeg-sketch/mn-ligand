@@ -1,0 +1,35 @@
+FROM mnprot-biohub-esm-cu128:latest
+
+ARG SOURCE_COMMIT
+
+LABEL org.opencontainers.image.title="mn-ligand conDitar generation engine" \
+      org.opencontainers.image.description="Locally permissioned conDitar CUDA 12.8 runtime for Ada and Blackwell GPUs" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Drug-Bioinformatics-Lab/conDitar-dev"
+
+ENV ENGINE="conditar" \
+    CUDA_HOME="/usr/local/cuda" \
+    TORCH_CUDA_ARCH_LIST="8.9;12.0+PTX" \
+    PYTHONPATH="/opt/engine" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+WORKDIR /opt/engine
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir \
+      pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+      -f https://data.pyg.org/whl/torch-2.7.0+cu128.html \
+    && python -m pip install --no-cache-dir \
+      easydict lmdb openbabel-wheel pandas pyyaml scikit-learn scipy \
+      tensorboard torch-geometric==2.7.0 tqdm
+
+COPY tools_to_implement/conDitar-dev/ /opt/engine/
+COPY containers/generation/runner.py /opt/mn-ligand/generation_runner.py
+
+ENTRYPOINT ["python", "/opt/mn-ligand/generation_runner.py"]
+CMD ["--help"]

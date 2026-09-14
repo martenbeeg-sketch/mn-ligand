@@ -8,10 +8,24 @@ NVT, NPT equilibration, and optional production MD.
 import os
 import sys
 import json
+import csv
 import logging
+import math
 from typing import Dict, Any, Optional, List, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _restart_platform_properties(simulation: Any) -> Dict[str, str]:
+    """Preserve precision when rebuilding a context for checkpoint loading."""
+    platform = simulation.context.getPlatform()
+    if platform.getName() not in {"CUDA", "OpenCL"}:
+        return {}
+    try:
+        precision = platform.getPropertyValue(simulation.context, "Precision")
+    except Exception:
+        precision = "mixed"
+    return {"Precision": precision}
 
 
 def emit_progress(progress: int, status: str, completed_stages: List[str]) -> None:
@@ -29,6 +43,88 @@ def emit_progress(progress: int, status: str, completed_stages: List[str]) -> No
     # Write to stderr with a special prefix so the router can identify it
     sys.stderr.write(f"MD_PROGRESS:{json.dumps(progress_data)}\n")
     sys.stderr.flush()
+
+
+def fit_density_plateau(
+    times_ps: List[float],
+    densities_g_ml: List[float],
+) -> Dict[str, Any]:
+    """Fit the Roe–Brooks density relaxation model and apply its three gates."""
+    import numpy as np
+    from scipy.optimize import curve_fit
+
+    times = np.asarray(times_ps, dtype=float)
+    densities = np.asarray(densities_g_ml, dtype=float)
+    finite = np.isfinite(times) & np.isfinite(densities)
+    times = times[finite]
+    densities = densities[finite]
+    if len(times) < 10:
+        return {
+            "plateau": False,
+            "reason": "At least 10 finite density samples are required",
+            "sample_count": int(len(times)),
+        }
+    shifted = times - times[0]
+
+    def model(time, density_initial, density_final, rate):
+        return density_initial + (
+            (density_final - density_initial) * (1.0 - np.exp(-rate * time))
+        )
+
+    first_count = max(1, int(math.ceil(len(densities) * 0.01)))
+    density_initial_guess = float(np.mean(densities[:first_count]))
+    density_final_guess = float(np.mean(densities[len(densities) // 2:]))
+    try:
+        parameters, _ = curve_fit(
+            model,
+            shifted,
+            densities,
+            p0=(density_initial_guess, density_final_guess, 0.1),
+            bounds=(
+                (0.0, 0.0, 0.0),
+                (np.inf, np.inf, np.inf),
+            ),
+            maxfev=20000,
+        )
+    except Exception as exc:
+        return {
+            "plateau": False,
+            "reason": f"Density exponential fit failed: {exc}",
+            "sample_count": int(len(times)),
+        }
+    density_initial, density_final, rate = (
+        float(value) for value in parameters
+    )
+    fitted = model(shifted, *parameters)
+    residuals = densities - fitted
+    chi_squared = float(np.sum(residuals * residuals))
+    final_time = float(shifted[-1])
+    final_slope = abs(
+        (density_final - density_initial)
+        * rate
+        * math.exp(-rate * final_time)
+    )
+    second_half_mean = float(np.mean(densities[len(densities) // 2:]))
+    final_difference = abs(density_final - second_half_mean)
+    slope_ok = final_slope < 1.0e-6
+    difference_ok = final_difference < 0.02
+    chi_squared_ok = chi_squared < 0.5
+    return {
+        "plateau": bool(slope_ok and difference_ok and chi_squared_ok),
+        "sample_count": int(len(times)),
+        "density_initial_g_ml": density_initial,
+        "density_final_g_ml": density_final,
+        "rate_per_ps": rate,
+        "final_slope_g_ml_per_ps": final_slope,
+        "second_half_mean_g_ml": second_half_mean,
+        "final_density_difference_g_ml": final_difference,
+        "chi_squared": chi_squared,
+        "criteria": {
+            "slope_below_1e-6": bool(slope_ok),
+            "final_difference_below_0_02": bool(difference_ok),
+            "chi_squared_below_0_5": bool(chi_squared_ok),
+        },
+    }
 
 
 class EquilibrationRunner:
@@ -72,7 +168,14 @@ class EquilibrationRunner:
 
     @staticmethod
     def _list_active_restraint_params(context) -> Dict[str, Optional[float]]:
-        out = {"k_prot": None, "k_lig": None, "k_plan": None, "k": None, "kp": None}
+        out = {
+            "k_prot": None,
+            "k_prot_side": None,
+            "k_lig": None,
+            "k_plan": None,
+            "k": None,
+            "kp": None,
+        }
         try:
             params = set(context.getParameters().keys())
             for key in list(out.keys()):
@@ -81,6 +184,374 @@ class EquilibrationRunner:
         except Exception:
             pass
         return out
+
+    def _set_roe_brooks_restraints(
+        self,
+        context,
+        *,
+        backbone_k: float,
+        sidechain_k: float,
+        ligand_k: float,
+    ) -> Dict[str, Optional[float]]:
+        requested = {
+            "k_prot": float(backbone_k),
+            "k_prot_side": float(sidechain_k),
+            "k_lig": float(ligand_k),
+            "k": float(ligand_k),
+            "k_plan": 0.0,
+            "kp": 0.0,
+        }
+        for name, value in requested.items():
+            self._set_context_param_if_present(context, name, value)
+        return self._list_active_restraint_params(context)
+
+    @staticmethod
+    def _set_barostat_frequency(simulation, frequency: int) -> None:
+        import openmm
+
+        changed = False
+        state = simulation.context.getState(
+            getPositions=True,
+            getVelocities=True,
+            getParameters=True,
+        )
+        for force in simulation.system.getForces():
+            if isinstance(force, openmm.MonteCarloBarostat):
+                force.setFrequency(int(frequency))
+                changed = True
+        if changed:
+            simulation.context.reinitialize(preserveState=True)
+            simulation.context.setState(state)
+
+    @staticmethod
+    def _system_density_g_ml(simulation, unit) -> float:
+        state = simulation.context.getState(getEnergy=False)
+        volume_nm3 = state.getPeriodicBoxVolume().value_in_unit(
+            unit.nanometer**3
+        )
+        mass_dalton = sum(
+            simulation.system.getParticleMass(index).value_in_unit(unit.dalton)
+            for index in range(simulation.system.getNumParticles())
+        )
+        return float(mass_dalton / volume_nm3 * 0.00166053906660)
+
+    def _run_roe_brooks_preparation(
+        self,
+        simulation,
+        *,
+        unit,
+        temperature: float,
+        nvt_traj_path: str,
+        nvt_pdb_path: str,
+        npt_traj_path: str,
+        npt_pdb_path: str,
+        minimized_pdb_path: str,
+        density_csv_path: str,
+        density_json_path: str,
+        density_min_ns: float,
+        density_max_ns: float,
+        density_increment_ns: float,
+        density_sample_interval_ps: float,
+        density_plateau_required: bool,
+        production_timestep_fs: float,
+    ) -> Dict[str, Any]:
+        """Run the engine-portable Roe–Brooks preparation sequence in OpenMM."""
+        from openmm.app import DCDReporter
+        from ..utils.pdb_utils import write_pdb_file
+
+        kcal_a2_to_kj_nm2 = 418.4
+        restraint_schedule = {
+            "step_1": 5.0 * kcal_a2_to_kj_nm2,
+            "step_3": 2.0 * kcal_a2_to_kj_nm2,
+            "step_4": 0.1 * kcal_a2_to_kj_nm2,
+            "step_6": 1.0 * kcal_a2_to_kj_nm2,
+            "step_7_8": 0.5 * kcal_a2_to_kj_nm2,
+        }
+        stage_rows: List[Dict[str, Any]] = []
+
+        def set_step_size(fs: float) -> None:
+            if hasattr(simulation.integrator, "setStepSize"):
+                simulation.integrator.setStepSize(
+                    float(fs) * unit.femtoseconds
+                )
+            if hasattr(simulation.integrator, "setTemperature"):
+                simulation.integrator.setTemperature(
+                    float(temperature) * unit.kelvin
+                )
+
+        def dynamics(
+            name: str,
+            steps: int,
+            timestep_fs: float,
+            *,
+            npt: bool,
+            reset_velocities: bool = False,
+        ) -> None:
+            set_step_size(timestep_fs)
+            self._set_barostat_frequency(simulation, 100 if npt else 0)
+            if reset_velocities:
+                simulation.context.setVelocitiesToTemperature(
+                    float(temperature) * unit.kelvin
+                )
+            simulation.step(int(steps))
+            stage_rows.append(
+                {
+                    "stage": name,
+                    "kind": "NPT" if npt else "NVT",
+                    "steps": int(steps),
+                    "timestep_fs": float(timestep_fs),
+                    "duration_ps": float(steps) * float(timestep_fs) / 1000.0,
+                    "restraints": self._list_active_restraint_params(
+                        simulation.context
+                    ),
+                }
+            )
+
+        # Steps 1–5: solvent relaxation followed by progressive solute release.
+        strong = restraint_schedule["step_1"]
+        self._set_roe_brooks_restraints(
+            simulation.context,
+            backbone_k=strong,
+            sidechain_k=strong,
+            ligand_k=strong,
+        )
+        step1 = self._run_minimization(
+            simulation,
+            minimized_pdb_path,
+            unit,
+            temperature,
+            max_iterations=1000,
+            tolerance_kjmol_nm=10.0,
+            progress_start=5,
+            progress_end=6,
+        )
+        stage_rows.append({"stage": "1", "kind": "minimization", **step1})
+
+        simulation.reporters.clear()
+        simulation.reporters.append(DCDReporter(nvt_traj_path, 1000))
+        dynamics("2", 15000, 1.0, npt=False, reset_velocities=True)
+        write_pdb_file(
+            simulation.topology,
+            simulation.context.getState(
+                getPositions=True, enforcePeriodicBox=True
+            ).getPositions(),
+            nvt_pdb_path,
+            keep_ids=True,
+        )
+        simulation.reporters.clear()
+
+        for name, force_constant in (
+            ("3", restraint_schedule["step_3"]),
+            ("4", restraint_schedule["step_4"]),
+            ("5", 0.0),
+        ):
+            self._set_roe_brooks_restraints(
+                simulation.context,
+                backbone_k=force_constant,
+                sidechain_k=force_constant,
+                ligand_k=force_constant,
+            )
+            result = self._run_minimization(
+                simulation,
+                minimized_pdb_path,
+                unit,
+                temperature,
+                max_iterations=1000,
+                tolerance_kjmol_nm=10.0,
+                progress_start=6,
+                progress_end=9,
+            )
+            stage_rows.append(
+                {"stage": name, "kind": "minimization", **result}
+            )
+
+        # Steps 6–9: restrained then unrestrained NPT relaxation.
+        one_k = restraint_schedule["step_6"]
+        self._set_roe_brooks_restraints(
+            simulation.context,
+            backbone_k=one_k,
+            sidechain_k=one_k,
+            ligand_k=one_k,
+        )
+        dynamics("6", 5000, 1.0, npt=True, reset_velocities=True)
+
+        half_k = restraint_schedule["step_7_8"]
+        self._set_roe_brooks_restraints(
+            simulation.context,
+            backbone_k=half_k,
+            sidechain_k=half_k,
+            ligand_k=half_k,
+        )
+        dynamics("7", 5000, 1.0, npt=True)
+        self._set_roe_brooks_restraints(
+            simulation.context,
+            backbone_k=half_k,
+            sidechain_k=0.0,
+            ligand_k=half_k,
+        )
+        dynamics("8", 10000, 1.0, npt=True)
+        self._set_roe_brooks_restraints(
+            simulation.context,
+            backbone_k=0.0,
+            sidechain_k=0.0,
+            ligand_k=0.0,
+        )
+        dynamics("9", 5000, 2.0, npt=True)
+
+        # Step 10: production-like unrestrained NPT until density plateaus.
+        production_dt_fs = float(production_timestep_fs)
+        set_step_size(production_dt_fs)
+        self._set_barostat_frequency(simulation, 100)
+        simulation.reporters.clear()
+        sample_steps = max(
+            1,
+            int(
+                round(
+                    float(density_sample_interval_ps)
+                    * 1000.0
+                    / production_dt_fs
+                )
+            ),
+        )
+        simulation.reporters.append(DCDReporter(npt_traj_path, sample_steps))
+        increment_steps = max(
+            1,
+            int(
+                round(
+                    float(density_increment_ns)
+                    * 1_000_000.0
+                    / production_dt_fs
+                )
+            ),
+        )
+        min_steps = max(
+            1,
+            int(
+                round(
+                    float(density_min_ns)
+                    * 1_000_000.0
+                    / production_dt_fs
+                )
+            ),
+        )
+        max_steps = max(
+            min_steps,
+            int(
+                round(
+                    float(density_max_ns)
+                    * 1_000_000.0
+                    / production_dt_fs
+                )
+            ),
+        )
+        times_ps: List[float] = []
+        densities: List[float] = []
+        completed_steps = 0
+        density_fit: Dict[str, Any] = {
+            "plateau": False,
+            "reason": "Density stabilization has not been evaluated",
+        }
+        while completed_steps < max_steps:
+            target = min(max_steps, completed_steps + increment_steps)
+            while completed_steps < target:
+                to_run = min(sample_steps, target - completed_steps)
+                simulation.step(to_run)
+                completed_steps += to_run
+                times_ps.append(
+                    completed_steps * production_dt_fs / 1000.0
+                )
+                densities.append(
+                    self._system_density_g_ml(simulation, unit)
+                )
+            if completed_steps >= min_steps:
+                density_fit = fit_density_plateau(times_ps, densities)
+                emit_progress(
+                    min(
+                        95,
+                        15 + int(80 * completed_steps / max_steps),
+                    ),
+                    (
+                        "Density plateau satisfied"
+                        if density_fit.get("plateau") is True
+                        else "Density stabilization continues"
+                    ),
+                    [
+                        "preparation",
+                        "minimization",
+                        "roe_brooks_steps_1_9",
+                    ],
+                )
+                if density_fit.get("plateau") is True:
+                    break
+
+        with open(density_csv_path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("time_ps", "density_g_ml"))
+            writer.writerows(zip(times_ps, densities))
+        density_report = {
+            "protocol": "Roe–Brooks 2020 inspired OpenMM",
+            "plateau_required": bool(density_plateau_required),
+            "stabilization_ns": (
+                completed_steps * production_dt_fs / 1_000_000.0
+            ),
+            "minimum_ns": float(density_min_ns),
+            "maximum_ns": float(density_max_ns),
+            "increment_ns": float(density_increment_ns),
+            "sample_interval_ps": float(density_sample_interval_ps),
+            "fit": density_fit,
+        }
+        with open(density_json_path, "w") as handle:
+            json.dump(density_report, handle, indent=2)
+        stage_rows.append(
+            {
+                "stage": "10",
+                "kind": "density stabilization NPT",
+                "steps": int(completed_steps),
+                "timestep_fs": production_dt_fs,
+                "duration_ps": completed_steps * production_dt_fs / 1000.0,
+                "restraints": self._list_active_restraint_params(
+                    simulation.context
+                ),
+                "density_plateau": density_fit.get("plateau") is True,
+            }
+        )
+        write_pdb_file(
+            simulation.topology,
+            simulation.context.getState(
+                getPositions=True, enforcePeriodicBox=True
+            ).getPositions(),
+            npt_pdb_path,
+            keep_ids=True,
+        )
+        if density_plateau_required and density_fit.get("plateau") is not True:
+            raise RuntimeError(
+                "Roe–Brooks density plateau criteria were not satisfied "
+                f"within {float(density_max_ns):.3f} ns"
+            )
+        return {
+            "protocol": "roe_brooks_2020",
+            "paper": "Roe and Brooks, J. Chem. Phys. 153, 054123 (2020)",
+            "stages": stage_rows,
+            "density_stabilization": density_report,
+            "energy_minimization": {
+                "initial_energy": step1.get("initial_energy"),
+                "final_energy": stage_rows[4].get("final_energy"),
+            },
+            "nvt_equilibration": {
+                "steps": 15000,
+                "duration_ps": 15.0,
+            },
+            "npt_equilibration": {
+                "steps": int(25000 + completed_steps),
+                "duration_ps": 30.0 + completed_steps * 0.004,
+                "release_stage_details": stage_rows[5:9],
+                "final_scales": {
+                    "protein": 0.0,
+                    "ligand": 0.0,
+                    "planarity": 0.0,
+                },
+            },
+        }
 
     @staticmethod
     def _compute_stage_ranges(nvt_steps: int, npt_steps: int, production_steps: int) -> Dict[str, Tuple[int, int]]:
@@ -147,6 +618,147 @@ class EquilibrationRunner:
                 root_logger.removeHandler(file_handler)
             except Exception as e:
                 logger.warning(f"Error cleaning up file handler: {e}")
+
+    def _initialize_independent_replica(
+        self,
+        simulation,
+        unit,
+        *,
+        temperature: float,
+        burn_in_steps: int,
+        seed: int,
+        density_revalidation: bool = False,
+        revalidation_max_steps: int = 0,
+        revalidation_increment_steps: int = 0,
+        density_sample_interval_steps: int = 0,
+        density_plateau_required: bool = True,
+        timestep_fs: float = 4.0,
+    ) -> Dict[str, Any]:
+        if burn_in_steps < 0:
+            raise RuntimeError("Independent replica burn-in cannot be negative")
+        if density_revalidation:
+            if revalidation_max_steps < burn_in_steps:
+                raise RuntimeError(
+                    "Replica density revalidation maximum must be at least its minimum"
+                )
+            if revalidation_increment_steps <= 0:
+                raise RuntimeError(
+                    "Replica density revalidation increment must be positive"
+                )
+            if density_sample_interval_steps <= 0:
+                raise RuntimeError(
+                    "Replica density sample interval must be positive"
+                )
+        context = simulation.context
+        for parameter in (
+            "k_prot",
+            "k_prot_side",
+            "k_lig",
+            "k_plan",
+            "k",
+            "kp",
+        ):
+            self._set_context_param_if_present(context, parameter, 0.0)
+        initial_state = context.getState(getEnergy=True)
+        initial_energy = initial_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        initial_volume = initial_state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
+        context.setVelocitiesToTemperature(float(temperature) * unit.kelvin, int(seed))
+        logger.info(
+            "Starting independent replica seed=%d with %d minimum unrestrained NPT steps",
+            seed,
+            burn_in_steps,
+        )
+        completed_steps = 0
+        density_times_ps: List[float] = []
+        densities_g_ml: List[float] = []
+        density_fit: Dict[str, Any] = {
+            "plateau": False,
+            "reason": "Replica density revalidation was not requested",
+        }
+        density_revalidation_failed = False
+        if density_revalidation:
+            while completed_steps < revalidation_max_steps:
+                target_steps = min(
+                    revalidation_max_steps,
+                    completed_steps + revalidation_increment_steps,
+                )
+                while completed_steps < target_steps:
+                    steps = min(
+                        density_sample_interval_steps,
+                        target_steps - completed_steps,
+                    )
+                    simulation.step(steps)
+                    completed_steps += steps
+                    density_times_ps.append(
+                        completed_steps * float(timestep_fs) / 1000.0
+                    )
+                    densities_g_ml.append(
+                        self._system_density_g_ml(simulation, unit)
+                    )
+                if completed_steps >= burn_in_steps:
+                    density_fit = fit_density_plateau(
+                        density_times_ps,
+                        densities_g_ml,
+                    )
+                    if density_fit.get("plateau") is True:
+                        break
+            density_revalidation_failed = bool(
+                density_plateau_required
+                and density_fit.get("plateau") is not True
+            )
+        elif burn_in_steps > 0:
+            simulation.step(burn_in_steps)
+            completed_steps = burn_in_steps
+        final_state = context.getState(getEnergy=True)
+        final_energy = final_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        final_volume = final_state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
+        report = {
+            "policy": (
+                "roe_density_revalidated_replica"
+                if density_revalidation
+                else "independent_replica"
+            ),
+            "seed": int(seed),
+            "burn_in_steps": int(completed_steps),
+            "burn_in_duration_ps": (
+                completed_steps * float(timestep_fs) / 1000.0
+            ),
+            "minimum_revalidation_steps": int(burn_in_steps),
+            "maximum_revalidation_steps": int(revalidation_max_steps),
+            "density_revalidation": bool(density_revalidation),
+            "density_plateau_required": bool(density_plateau_required),
+            "density_fit": density_fit,
+            "initial_potential_energy_kj_mol": initial_energy,
+            "final_potential_energy_kj_mol": final_energy,
+            "initial_volume_nm3": initial_volume,
+            "final_volume_nm3": final_volume,
+            "restraints_disabled": True,
+            "burn_in_included_in_production": False,
+        }
+        if density_revalidation:
+            density_csv_path = os.path.join(
+                self.output_dir,
+                "replica_density_revalidation.csv",
+            )
+            density_json_path = os.path.join(
+                self.output_dir,
+                "replica_density_revalidation.json",
+            )
+            with open(density_csv_path, "w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(("time_ps", "density_g_ml"))
+                writer.writerows(zip(density_times_ps, densities_g_ml))
+            with open(density_json_path, "w") as handle:
+                json.dump(report, handle, indent=2)
+            report["density_csv"] = density_csv_path
+            report["density_report"] = density_json_path
+        if density_revalidation_failed:
+            raise RuntimeError(
+                "Replica Roe–Brooks density plateau criteria were not "
+                f"satisfied within "
+                f"{completed_steps * float(timestep_fs) / 1_000_000.0:.3f} ns"
+            )
+        return report
 
     def _minimize_on_cpu(self, simulation, unit, maxIterations: int = 5000) -> None:
         """
@@ -470,6 +1082,12 @@ class EquilibrationRunner:
         production_report_interval: int = 2500,
         minimization_max_iterations: int = 5000,
         minimization_tolerance_kjmol_nm: float = 10.0,
+        preparation_protocol: str = "current_staged",
+        density_stabilization_min_ns: float = 1.0,
+        density_stabilization_max_ns: float = 5.0,
+        density_stabilization_increment_ns: float = 1.0,
+        density_sample_interval_ps: float = 4.0,
+        density_plateau_required: bool = True,
         npt_restraint_release_scales_csv: str = "1.0,0.5,0.2,0.05,0.0",
         npt_release_enabled: bool = True,
         protein_npt_release_scales_csv: str = "1.0,0.5,0.1,0.01,0.0",
@@ -481,6 +1099,18 @@ class EquilibrationRunner:
         resume_system_xml_path: str | None = None,
         resume_integrator_xml_path: str | None = None,
         production_only_from_prepared: bool = False,
+        strict_checkpoint_resume: bool = False,
+        append_production_outputs: bool = False,
+        production_prior_steps: int = 0,
+        coordinate_restart_policy: str = "legacy_minimize_rethermalize",
+        replica_equilibration_steps: int = 0,
+        replica_density_revalidation: bool = False,
+        replica_revalidation_max_steps: int = 0,
+        replica_revalidation_increment_steps: int = 0,
+        replica_density_sample_interval_steps: int = 0,
+        replica_density_plateau_required: bool = True,
+        production_timestep_fs: float = 4.0,
+        replica_seed: int | None = None,
         temperature: float = 300.0,
         pressure: float = 1.0
     ) -> Dict[str, Any]:
@@ -550,6 +1180,12 @@ class EquilibrationRunner:
             production_traj_path = os.path.join(self.output_dir, f"{system_id}_production.dcd")
             production_pdb_path = os.path.join(self.output_dir, f"{system_id}_production_final.pdb")
             production_log_path = os.path.join(self.output_dir, f"{system_id}_production.log")
+            density_csv_path = os.path.join(
+                self.output_dir, f"{system_id}_density_stabilization.csv"
+            )
+            density_json_path = os.path.join(
+                self.output_dir, f"{system_id}_density_stabilization.json"
+            )
 
             # Clear any existing reporters
             simulation.reporters.clear()
@@ -579,6 +1215,10 @@ class EquilibrationRunner:
                 bundle_system_xml = str(resume_system_xml_path or "").strip()
                 bundle_integrator_xml = str(resume_integrator_xml_path or "").strip()
                 bundle_used = False
+                if strict_checkpoint_resume and not (bundle_system_xml and bundle_integrator_xml):
+                    raise RuntimeError(
+                        "Strict checkpoint continuation requires serialized System and Integrator files"
+                    )
                 if bundle_system_xml and bundle_integrator_xml and os.path.exists(bundle_system_xml) and os.path.exists(bundle_integrator_xml):
                     try:
                         from openmm import XmlSerializer
@@ -588,10 +1228,24 @@ class EquilibrationRunner:
                         with open(bundle_integrator_xml, "r") as inf:
                             restored_integrator = XmlSerializer.deserialize(inf.read())
                         platform = simulation.context.getPlatform()
-                        simulation = Simulation(simulation.topology, restored_system, restored_integrator, platform)
+                        platform_properties = _restart_platform_properties(simulation)
+                        simulation = Simulation(
+                            simulation.topology,
+                            restored_system,
+                            restored_integrator,
+                            platform,
+                            platform_properties,
+                        )
                         bundle_used = True
-                        logger.info("Rebuilt simulation context from serialized OpenMM bundle.")
+                        logger.info(
+                            "Rebuilt simulation context from serialized OpenMM bundle with platform properties %s.",
+                            platform_properties,
+                        )
                     except Exception as bundle_exc:
+                        if strict_checkpoint_resume:
+                            raise RuntimeError(
+                                f"Strict continuation could not restore the serialized OpenMM bundle: {bundle_exc}"
+                            ) from bundle_exc
                         logger.warning("OpenMM bundle restore failed; using current simulation object. reason=%s", bundle_exc)
 
                 checkpoint_path = str(resume_from_checkpoint_path).strip()
@@ -604,6 +1258,10 @@ class EquilibrationRunner:
                     logger.info("Checkpoint loaded successfully.")
                 except Exception as exc:
                     logger.warning("Checkpoint load failed: %s", exc)
+                    if strict_checkpoint_resume:
+                        raise RuntimeError(
+                            f"Strict checkpoint continuation failed; coordinate fallback is disabled: {exc}"
+                        ) from exc
                     state_xml_path = str(resume_state_xml_path or "").strip()
                     if state_xml_path and os.path.exists(state_xml_path):
                         logger.info("Falling back to state XML resume: %s", state_xml_path)
@@ -666,11 +1324,17 @@ class EquilibrationRunner:
                             completed_stages,
                             allow_restrained_production=allow_restrained_production,
                             force_unrestrained_production=force_unrestrained_production,
+                            append_outputs=append_production_outputs,
+                            prior_steps=production_prior_steps,
+                            timestep_fs=production_timestep_fs,
                         )
                         equilibration_stats["production"] = prod_result
                         output_files["production_trajectory"] = production_traj_path
                         output_files["production_pdb"] = production_pdb_path
                         output_files["production_log"] = production_log_path
+                        output_files["production_checkpoint"] = prod_result.get(
+                            "checkpoint_path"
+                        )
                         completed_stages.append("production")
                         emit_progress(100, "MD production completed successfully", completed_stages)
 
@@ -706,14 +1370,46 @@ class EquilibrationRunner:
 
             if bool(production_only_from_prepared):
                 logger.info("Production-only mode enabled: skipping minimization/heating/NVT/NPT.")
-                try:
-                    simulation.minimizeEnergy(maxIterations=500)
-                except Exception as exc:
-                    logger.warning("Production-only pre-stabilization minimization failed: %s", exc)
-                try:
-                    simulation.context.setVelocitiesToTemperature(float(temperature) * unit.kelvin)
-                except Exception:
-                    logger.warning("Could not initialize velocities to target temperature before production-only run.")
+                restart_policy = str(coordinate_restart_policy or "legacy_minimize_rethermalize")
+                replica_initialization: Dict[str, Any] = {"policy": restart_policy}
+                if restart_policy == "independent_replica":
+                    burn_in_steps = int(replica_equilibration_steps)
+                    seed = int(replica_seed) if replica_seed is not None else 0
+                    replica_initialization = self._initialize_independent_replica(
+                        simulation,
+                        unit,
+                        temperature=float(temperature),
+                        burn_in_steps=burn_in_steps,
+                        seed=seed,
+                        density_revalidation=bool(
+                            replica_density_revalidation
+                        ),
+                        revalidation_max_steps=int(
+                            replica_revalidation_max_steps
+                        ),
+                        revalidation_increment_steps=int(
+                            replica_revalidation_increment_steps
+                        ),
+                        density_sample_interval_steps=int(
+                            replica_density_sample_interval_steps
+                        ),
+                        density_plateau_required=bool(
+                            replica_density_plateau_required
+                        ),
+                        timestep_fs=float(production_timestep_fs),
+                    )
+                else:
+                    try:
+                        simulation.minimizeEnergy(maxIterations=500)
+                    except Exception as exc:
+                        logger.warning("Production-only pre-stabilization minimization failed: %s", exc)
+                    try:
+                        simulation.context.setVelocitiesToTemperature(float(temperature) * unit.kelvin)
+                    except Exception:
+                        logger.warning("Could not initialize velocities to target temperature before production-only run.")
+                    replica_initialization.update(
+                        {"minimization_iterations": 500, "velocities_reinitialized": True}
+                    )
 
                 completed_stages = ["preparation", "npt"]
                 equilibration_stats = {
@@ -730,6 +1426,14 @@ class EquilibrationRunner:
                     "equilibration_log": log_path,
                     "console_log": console_log_path,
                 }
+                if replica_initialization.get("density_csv"):
+                    output_files["replica_density_series"] = (
+                        replica_initialization["density_csv"]
+                    )
+                if replica_initialization.get("density_report"):
+                    output_files["replica_density_report"] = (
+                        replica_initialization["density_report"]
+                    )
 
                 if production_steps > 0:
                     prod_progress_start = ranges['production'][0]
@@ -743,11 +1447,17 @@ class EquilibrationRunner:
                         completed_stages,
                         allow_restrained_production=allow_restrained_production,
                         force_unrestrained_production=force_unrestrained_production,
+                        append_outputs=append_production_outputs,
+                        prior_steps=production_prior_steps,
+                        timestep_fs=production_timestep_fs,
                     )
                     equilibration_stats["production"] = prod_result
                     output_files["production_trajectory"] = production_traj_path
                     output_files["production_pdb"] = production_pdb_path
                     output_files["production_log"] = production_log_path
+                    output_files["production_checkpoint"] = prod_result.get(
+                        "checkpoint_path"
+                    )
                     completed_stages.append("production")
                     emit_progress(100, "Production-only MD completed successfully", completed_stages)
 
@@ -762,6 +1472,7 @@ class EquilibrationRunner:
                         "requested_integrator_xml_path": (str(resume_integrator_xml_path).strip() if resume_integrator_xml_path else None),
                         "bundle_context_rebuild_used": False,
                         "resume_mode": "coordinate_continuation",
+                        "replica_initialization": replica_initialization,
                     },
                     "restraint_protocol": {
                         "production_unrestrained": bool(equilibration_stats.get("production", {}).get("production_unrestrained", True)),
@@ -775,83 +1486,125 @@ class EquilibrationRunner:
                 self._cleanup_file_handler(file_handler)
                 return results
 
-            # Stage 1: Energy Minimization
-            if not skip_minimization:
-                min_result = self._run_minimization(
-                    simulation, minimized_pdb_path, unit, temperature,
-                    max_iterations=minimization_max_iterations,
-                    tolerance_kjmol_nm=minimization_tolerance_kjmol_nm,
-                    progress_start=ranges['minimization'][0],
-                    progress_end=ranges['minimization'][1],
+            selected_preparation_protocol = str(
+                preparation_protocol or "current_staged"
+            ).strip().lower()
+            roe_brooks_result = None
+            if (
+                selected_preparation_protocol == "roe_brooks_2020"
+                and not skip_minimization
+                and not minimization_only
+                and not pause_at_minimized
+            ):
+                roe_brooks_result = self._run_roe_brooks_preparation(
+                    simulation,
+                    unit=unit,
+                    temperature=float(temperature),
+                    nvt_traj_path=nvt_traj_path,
+                    nvt_pdb_path=nvt_pdb_path,
+                    npt_traj_path=npt_traj_path,
+                    npt_pdb_path=npt_pdb_path,
+                    minimized_pdb_path=minimized_pdb_path,
+                    density_csv_path=density_csv_path,
+                    density_json_path=density_json_path,
+                    density_min_ns=float(density_stabilization_min_ns),
+                    density_max_ns=float(density_stabilization_max_ns),
+                    density_increment_ns=float(
+                        density_stabilization_increment_ns
+                    ),
+                    density_sample_interval_ps=float(
+                        density_sample_interval_ps
+                    ),
+                    density_plateau_required=bool(
+                        density_plateau_required
+                    ),
+                    production_timestep_fs=float(
+                        production_timestep_fs
+                    ),
                 )
-                initial_energy_val = min_result.get('initial_energy')
-                final_energy_val = min_result.get('final_energy')
-
-                if minimization_only:
-                    logger.info("Minimization only requested - stopping workflow.")
-                    self._cleanup_file_handler(file_handler)
-                    return {
-                        "status": "success",
-                        "message": "Minimization completed successfully",
-                        "minimization_only": True,
-                        "final_energy": final_energy_val,
-                        "equilibration_stats": {
-                            "minimized_energy": final_energy_val
-                        },
-                        "output_files": {
-                            "minimized_pdb": minimized_pdb_path,
-                            "equilibration_log": log_path,
-                            "console_log": console_log_path
-                        }
-                    }
-
-                if pause_at_minimized:
-                    logger.info("Pause at minimized structure requested.")
-                    self._cleanup_file_handler(file_handler)
-                    return {
-                        "status": "minimized_ready",
-                        "message": "Minimization completed. Paused for inspection.",
-                        "final_energy": final_energy_val,
-                        "output_files": {
-                            "minimized_pdb": minimized_pdb_path,
-                            "equilibration_log": log_path,
-                            "console_log": console_log_path
-                        }
-                    }
+                energy_summary = roe_brooks_result["energy_minimization"]
+                initial_energy_val = energy_summary.get("initial_energy")
+                final_energy_val = energy_summary.get("final_energy")
+                heating_result = {
+                    "status": (
+                        "replaced_by_roe_brooks_target_temperature_nvt"
+                    )
+                }
+                nvt_result = roe_brooks_result["nvt_equilibration"]
+                npt_result = roe_brooks_result["npt_equilibration"]
             else:
-                logger.info("Skipping minimization (resuming from minimized state)")
+                # Existing staged preparation remains unchanged.
+                if not skip_minimization:
+                    min_result = self._run_minimization(
+                        simulation, minimized_pdb_path, unit, temperature,
+                        max_iterations=minimization_max_iterations,
+                        tolerance_kjmol_nm=minimization_tolerance_kjmol_nm,
+                        progress_start=ranges['minimization'][0],
+                        progress_end=ranges['minimization'][1],
+                    )
+                    initial_energy_val = min_result.get('initial_energy')
+                    final_energy_val = min_result.get('final_energy')
 
-            # Stage 2: Thermal Heating (gradual temperature ramping)
-            heating_result = self._run_thermal_heating(
-                simulation, unit,
-                target_temperature=temperature,
-                start_temperature=heating_start_temperature,
-                n_stages=heating_stages,
-                steps_per_stage=heating_steps_per_stage,
-                progress_start=ranges['heating'][0],
-                progress_end=ranges['heating'][1],
-            )
+                    if minimization_only:
+                        logger.info("Minimization only requested - stopping workflow.")
+                        self._cleanup_file_handler(file_handler)
+                        return {
+                            "status": "success",
+                            "message": "Minimization completed successfully",
+                            "minimization_only": True,
+                            "final_energy": final_energy_val,
+                            "equilibration_stats": {
+                                "minimized_energy": final_energy_val
+                            },
+                            "output_files": {
+                                "minimized_pdb": minimized_pdb_path,
+                                "equilibration_log": log_path,
+                                "console_log": console_log_path
+                            }
+                        }
 
-            # Stage 3: NVT Equilibration
-            nvt_result = self._run_nvt(
-                simulation, nvt_steps, report_interval,
-                nvt_traj_path, log_path, nvt_pdb_path, unit,
-                temperature,
-                progress_start=ranges['nvt'][0],
-                progress_end=ranges['nvt'][1],
-            )
+                    if pause_at_minimized:
+                        logger.info("Pause at minimized structure requested.")
+                        self._cleanup_file_handler(file_handler)
+                        return {
+                            "status": "minimized_ready",
+                            "message": "Minimization completed. Paused for inspection.",
+                            "final_energy": final_energy_val,
+                            "output_files": {
+                                "minimized_pdb": minimized_pdb_path,
+                                "equilibration_log": log_path,
+                                "console_log": console_log_path
+                            }
+                        }
+                else:
+                    logger.info("Skipping minimization (resuming from minimized state)")
 
-            # Stage 4: NPT Equilibration
-            npt_result = self._run_npt(
-                simulation, npt_steps, report_interval,
-                npt_traj_path, log_path, npt_pdb_path, unit,
-                release_scales_csv=npt_restraint_release_scales_csv,
-                release_enabled=bool(npt_release_enabled),
-                protein_release_scales_csv=protein_npt_release_scales_csv,
-                planarity_release_scales_csv=planarity_npt_release_scales_csv,
-                progress_start=ranges['npt'][0],
-                progress_end=ranges['npt'][1],
-            )
+                heating_result = self._run_thermal_heating(
+                    simulation, unit,
+                    target_temperature=temperature,
+                    start_temperature=heating_start_temperature,
+                    n_stages=heating_stages,
+                    steps_per_stage=heating_steps_per_stage,
+                    progress_start=ranges['heating'][0],
+                    progress_end=ranges['heating'][1],
+                )
+                nvt_result = self._run_nvt(
+                    simulation, nvt_steps, report_interval,
+                    nvt_traj_path, log_path, nvt_pdb_path, unit,
+                    temperature,
+                    progress_start=ranges['nvt'][0],
+                    progress_end=ranges['nvt'][1],
+                )
+                npt_result = self._run_npt(
+                    simulation, npt_steps, report_interval,
+                    npt_traj_path, log_path, npt_pdb_path, unit,
+                    release_scales_csv=npt_restraint_release_scales_csv,
+                    release_enabled=bool(npt_release_enabled),
+                    protein_release_scales_csv=protein_npt_release_scales_csv,
+                    planarity_release_scales_csv=planarity_npt_release_scales_csv,
+                    progress_start=ranges['npt'][0],
+                    progress_end=ranges['npt'][1],
+                )
 
             # Build completed stages list
             completed_stages = ["preparation", "minimization", "thermal_heating", "nvt", "npt"]
@@ -878,6 +1631,10 @@ class EquilibrationRunner:
                 "nvt_pdb": nvt_pdb_path,
                 "npt_pdb": npt_pdb_path
             }
+            if roe_brooks_result is not None:
+                equilibration_stats["preparation_protocol"] = roe_brooks_result
+                output_files["density_report"] = density_json_path
+                output_files["density_series"] = density_csv_path
 
             # Persist exact post-NPT restart artifacts for downstream production runs.
             simulation.saveCheckpoint(npt_checkpoint_path)
@@ -909,12 +1666,16 @@ class EquilibrationRunner:
                     completed_stages,
                     allow_restrained_production=allow_restrained_production,
                     force_unrestrained_production=force_unrestrained_production,
+                    timestep_fs=production_timestep_fs,
                 )
 
                 equilibration_stats["production"] = prod_result
                 output_files["production_trajectory"] = production_traj_path
                 output_files["production_pdb"] = production_pdb_path
                 output_files["production_log"] = production_log_path
+                output_files["production_checkpoint"] = prod_result.get(
+                    "checkpoint_path"
+                )
                 completed_stages.append("production")
 
             logger.info("[COMPLETE] Complete equilibration protocol finished successfully")
@@ -949,13 +1710,26 @@ class EquilibrationRunner:
             logger.error(f"Equilibration protocol failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             self._cleanup_file_handler(file_handler)
+            retained_outputs = {
+                "console_log": console_log_path,
+            }
+            for key, path in (
+                ("equilibration_log", locals().get("log_path")),
+                ("minimized_pdb", locals().get("minimized_pdb_path")),
+                ("nvt_trajectory", locals().get("nvt_traj_path")),
+                ("nvt_pdb", locals().get("nvt_pdb_path")),
+                ("npt_trajectory", locals().get("npt_traj_path")),
+                ("npt_pdb", locals().get("npt_pdb_path")),
+                ("density_report", locals().get("density_json_path")),
+                ("density_series", locals().get("density_csv_path")),
+            ):
+                if path and os.path.exists(path):
+                    retained_outputs[key] = path
             return {
                 "status": "error",
                 "error": str(e),
                 "traceback": traceback.format_exc(),
-                "output_files": {
-                    "console_log": console_log_path
-                }
+                "output_files": retained_outputs,
             }
 
     def _run_minimization(
@@ -1543,6 +2317,9 @@ class EquilibrationRunner:
         checkpoint_interval: int = 25000,
         allow_restrained_production: bool = False,
         force_unrestrained_production: bool = True,
+        append_outputs: bool = False,
+        prior_steps: int = 0,
+        timestep_fs: float = 4.0,
     ) -> Dict[str, Any]:
         """
         Run unrestrained production MD.
@@ -1569,7 +2346,7 @@ class EquilibrationRunner:
         if completed_stages is None:
             completed_stages = ["preparation", "minimization", "thermal_heating", "nvt", "npt"]
 
-        duration_ns = steps * 0.004 / 1000  # 4 fs timestep
+        duration_ns = steps * float(timestep_fs) / 1_000_000.0
         logger.info(f"=== STAGE 5: PRODUCTION MD ({duration_ns:.1f} ns, {steps} steps) ===")
         warnings: List[str] = []
         active_before = self._list_active_restraint_params(simulation.context)
@@ -1586,13 +2363,19 @@ class EquilibrationRunner:
 
         # Clear reporters and add production reporters
         simulation.reporters.clear()
-        simulation.reporters.append(DCDReporter(traj_path, report_interval))
+        if append_outputs and not os.path.isfile(traj_path):
+            raise RuntimeError(
+                "Strict trajectory continuation requested append mode, but the prior DCD is missing"
+            )
+        simulation.reporters.append(
+            DCDReporter(traj_path, report_interval, append=bool(append_outputs))
+        )
         simulation.reporters.append(
             StateDataReporter(
                 log_path, 1000,
                 step=True, potentialEnergy=True, kineticEnergy=True,
                 totalEnergy=True, temperature=True, volume=True,
-                density=True, speed=True, separator='\t'
+                density=True, speed=True, separator='\t', append=bool(append_outputs)
             )
         )
 
@@ -1613,7 +2396,7 @@ class EquilibrationRunner:
 
             frac = completed_steps / steps
             prod_progress = progress_start + int(frac * (progress_end - progress_start))
-            elapsed_ns = completed_steps * 0.004 / 1000
+            elapsed_ns = completed_steps * float(timestep_fs) / 1_000_000.0
             emit_progress(
                 prod_progress,
                 f"Production MD: {elapsed_ns:.1f}/{duration_ns:.1f} ns",
@@ -1632,8 +2415,14 @@ class EquilibrationRunner:
         )
         final_temp_val = final_state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         final_volume = final_state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
+        # CheckpointReporter may have last fired before the final integration
+        # step. Always overwrite it here so an extension starts at the exact
+        # trajectory endpoint, including velocities, box, time, RNG and
+        # barostat state.
+        simulation.saveCheckpoint(checkpoint_path)
 
         # Save final structure
+        simulation.topology.setPeriodicBoxVectors(final_state.getPeriodicBoxVectors())
         write_pdb_file(
             simulation.topology,
             final_state.getPositions(),
@@ -1650,10 +2439,19 @@ class EquilibrationRunner:
         )
 
         return {
-            "steps": steps,
-            "duration_ns": duration_ns,
-            "duration_ps": steps * 0.004,
-            "trajectory_frames": n_frames,
+            "steps": int(prior_steps) + steps,
+            "duration_ns": (
+                (int(prior_steps) + steps) * float(timestep_fs) / 1_000_000.0
+            ),
+            "duration_ps": (
+                (int(prior_steps) + steps) * float(timestep_fs) / 1000.0
+            ),
+            "trajectory_frames": (int(prior_steps) + steps) // report_interval,
+            "extension_steps": steps,
+            "extension_duration_ns": duration_ns,
+            "prior_steps": int(prior_steps),
+            "trajectory_appended": bool(append_outputs),
+            "checkpoint_path": checkpoint_path,
             "final_volume_nm3": final_volume,
             "production_unrestrained": not any_active_after,
             "active_restraints_in_production": active_after,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from mn_ligand.app.pages.common import (
     try_dispatch_next_queued_gpu_job,
 )
 from mn_ligand.app.pages.md import _collect_md_system_prep_jobs
+from mn_ligand.runtime import cpu_process_limit
 
 
 def _steps_to_ns(steps: int | float) -> float:
@@ -158,14 +160,14 @@ def render() -> None:
     npt_integrator_xml_path = resolve_run_artifact_path(npt_integrator_xml_str, must_exist=True) if npt_integrator_xml_str else None
     restart_mode = st.selectbox(
         "Restart mode",
-        options=["Checkpoint (exact continuation)", "NPT-final PDB (coordinate restart)"],
+        options=["Continue exact NPT checkpoint", "Start independent replicas"],
         index=0,
         help=(
-            "Checkpoint is exact continuation and recommended. "
-            "NPT-final PDB rebuilds the system and reinitializes state."
+            "Exact continuation preserves the NPT state. Independent replicas use new seeded velocities "
+            "and an unrestrained NPT burn-in."
         ),
     )
-    use_checkpoint_restart = restart_mode.startswith("Checkpoint")
+    use_checkpoint_restart = restart_mode.startswith("Continue")
 
     if npt_final_path is None:
         st.error(
@@ -182,7 +184,7 @@ def render() -> None:
         st.error(
             "Checkpoint restart selected, but no valid `md_result.output_files.npt_checkpoint` artifact was found."
         )
-        st.info("Switch restart mode to `NPT-final PDB (coordinate restart)` or regenerate MD system prep.")
+        st.info("Start independent replicas from NPT coordinates or regenerate MD system preparation.")
         st.code(f"Prep result file: {prep_result_json}")
         return
     if use_checkpoint_restart and prep_system_pdb_path is None:
@@ -191,6 +193,13 @@ def render() -> None:
         )
         st.info("Regenerate MD system prep so production can rebuild the exact checkpoint-compatible system.")
         st.code(f"Prep result file: {prep_result_json}")
+        return
+    if npt_system_xml_path is None or npt_integrator_xml_path is None:
+        st.error(
+            "This restart mode requires serialized `npt_system_xml` and `npt_integrator_xml` artifacts "
+            "from MD system preparation."
+        )
+        st.info("Regenerate MD system preparation before starting production.")
         return
     production_start_path = npt_final_path
     try:
@@ -239,8 +248,8 @@ def render() -> None:
     )
     if not use_checkpoint_restart:
         st.warning(
-            "Coordinate restart mode selected: production will rebuild from NPT-final PDB. "
-            "This is less exact than checkpoint continuation."
+            "Independent-replica mode selected: each run receives new seeded velocities and an "
+            "unrestrained NPT burn-in before recorded production."
         )
 
     st.subheader("2. Prepared system summary")
@@ -321,7 +330,6 @@ def render() -> None:
         production_steps = st.number_input(
             "Production steps",
             min_value=0,
-            value=default_steps,
             step=1000,
             key=steps_state_key,
         )
@@ -335,12 +343,28 @@ def render() -> None:
         production_report_interval = st.number_input(
             "Production report interval",
             min_value=100,
-            value=default_report,
             step=100,
             key=report_state_key,
         )
         allow_restrained_production = st.checkbox("Allow restrained production", value=False)
         repeat_count = int(st.number_input("Repetitions", min_value=1, value=1, step=1, key="md_prod_repeat_count"))
+        replica_equilibration_steps = int(
+            st.number_input(
+                "Replica NPT burn-in steps",
+                min_value=1000,
+                value=250000,
+                step=10000,
+                disabled=use_checkpoint_restart,
+            )
+        )
+    if use_checkpoint_restart:
+        repeat_count = 1
+        st.info("Exact continuation creates one trajectory and does not minimize or replace velocities.")
+    else:
+        st.caption(
+            f"Independent-replica burn-in: {replica_equilibration_steps * 0.004 / 1000:.3f} ns; "
+            "burn-in frames are excluded from production."
+        )
     st.caption(
         f"Temperature and pressure are inherited from system preparation: "
         f"{prep_input.get('temperature_k', 300.0)} K, {prep_input.get('pressure', 1.0)} bar."
@@ -364,14 +388,14 @@ def render() -> None:
     if stride_key not in st.session_state:
         st.session_state[stride_key] = suggested_stride
     with mmc3:
-        mmgbsa_stride = int(st.number_input("Sampling stride", min_value=1, value=int(st.session_state[stride_key]), step=1, key=stride_key))
+        mmgbsa_stride = int(st.number_input("Sampling stride", min_value=1, step=1, key=stride_key))
     if analyzed_frames <= 600:
         st.info(f"MM/GBSA analysis window has only ~{analyzed_frames} frame(s); using stride 1 is recommended.")
     else:
         st.caption(f"Auto-suggested stride for ~600 analyzed frames: {suggested_stride} (window ~{analyzed_frames} frames)")
 
-    with st.expander("Docker/runtime settings"):
-        image = st.text_input("MD Docker image", value=DEFAULT_MD_IMAGE)
+    image = DEFAULT_MD_IMAGE
+    with st.expander("Runtime settings"):
         use_gpu = st.checkbox("Use GPU", value=True)
 
     refined_sdf_data = ""
@@ -444,14 +468,29 @@ def render() -> None:
             # Keep all workflow outputs inside this run folder mounted at /output.
             input_payload["output_dir"] = "/output"
             input_payload["restart_mode"] = restart_mode
+            input_payload["continuation_mode"] = (
+                "exact_checkpoint" if use_checkpoint_restart else "independent_replica"
+            )
+            input_payload["production_only_from_prepared"] = True
+            input_payload["strict_checkpoint_resume"] = bool(use_checkpoint_restart)
+            input_payload["coordinate_restart_policy"] = (
+                "legacy_minimize_rethermalize" if use_checkpoint_restart else "independent_replica"
+            )
+            input_payload["replica_equilibration_steps"] = (
+                0 if use_checkpoint_restart else int(replica_equilibration_steps)
+            )
+            input_payload["replica_seed"] = (
+                int(hashlib.sha256(f"{repeat_group_id}:{repeat_idx + 1}".encode()).hexdigest()[:8], 16)
+                % 2147483646
+                + 1
+            )
             input_payload["mmgbsa_enabled"] = bool(mmgbsa_enabled)
             input_payload["mmgbsa_backend"] = str(mm_backend)
             input_payload["mmgbsa_start_pct"] = int(mmgbsa_start_pct)
             input_payload["mmgbsa_end_pct"] = int(mmgbsa_end_pct)
             input_payload["mmgbsa_stride"] = int(mmgbsa_stride)
             input_payload["mmpbsa_use_mpi"] = bool(mm_backend == "ambertools_mmpbsa")
-            cpu_default = max(1, min(32, int(os.cpu_count() or 8)))
-            input_payload["mmpbsa_mpi_cores"] = int(cpu_default)
+            input_payload["mmpbsa_mpi_cores"] = cpu_process_limit()
             input_payload["repeat_group_id"] = repeat_group_id
             input_payload["repeat_index"] = repeat_idx + 1
             input_payload["repeat_total"] = repeat_count
@@ -474,10 +513,10 @@ def render() -> None:
                     input_payload["resume_integrator_xml_path"] = _host_path_to_container_path(npt_integrator_xml_path)
             else:
                 input_payload.pop("resume_from_checkpoint_path", None)
-                input_payload.pop("resume_system_pdb_path", None)
-                input_payload.pop("resume_state_xml_path", None)
-                input_payload.pop("resume_system_xml_path", None)
-                input_payload.pop("resume_integrator_xml_path", None)
+                input_payload["resume_system_pdb_path"] = _host_path_to_container_path(npt_final_path)
+                input_payload["resume_state_xml_path"] = _host_path_to_container_path(npt_state_xml_path)
+                input_payload["resume_system_xml_path"] = _host_path_to_container_path(npt_system_xml_path)
+                input_payload["resume_integrator_xml_path"] = _host_path_to_container_path(npt_integrator_xml_path)
 
             if refined_sdf_data:
                 input_payload["ligand_refined_sdf_data"] = refined_sdf_data

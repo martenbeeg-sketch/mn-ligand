@@ -9,4 +9,7 @@ render_workflow_page(
     show_command_preview=False,
     show_command_in_result=False,
     run_button_label="Run QC",
+    input_artifact_types={
+        "molecule_file": ("prepared_ligand_set", "compound_set"),
+    },
 )

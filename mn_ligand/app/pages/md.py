@@ -162,9 +162,9 @@ def render() -> None:
         st.info(
             "No MD system preparation jobs found. Run MD System Preparation first."
             if is_production_mode
-            else "No prepared structure jobs found. Create one first in Structure Preparation."
+            else "No prepared structure jobs found. Create one first in Structure Import."
         )
-        if st.button("Go to MD System Preparation" if is_production_mode else "Go to Structure Preparation"):
+        if st.button("Go to MD System Preparation" if is_production_mode else "Go to Structure Import"):
             st.switch_page("app/pages/md_system_preparation.py" if is_production_mode else "app/pages/structure_preparation.py")
         return
 
@@ -400,8 +400,7 @@ def render() -> None:
     image = DEFAULT_MD_IMAGE
     use_gpu = True
     if is_production_mode:
-        with st.expander("Docker/runtime settings"):
-            image = st.text_input("MD Docker image", value=DEFAULT_MD_IMAGE)
+        with st.expander("Runtime settings"):
             use_gpu = st.checkbox("Use GPU", value=True)
 
     refined_sdf_path = next(iter(sorted(structure_job_dir.glob("*_ligand_refined.sdf"))), None)

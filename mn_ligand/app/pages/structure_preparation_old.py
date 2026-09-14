@@ -10,6 +10,13 @@ from uuid import uuid4
 import streamlit as st
 
 from mn_ligand.app.pages.common import _input_root
+from mn_ligand.core.docker_runner import (
+    DockerMount,
+    DockerRunSpec,
+    build_docker_command,
+    registered_tool,
+    write_registered_command_record,
+)
 from mn_ligand.app.pages.bound_ligand_md import (
     DEFAULT_MD_IMAGE,
     _parse_protein_chains,
@@ -326,19 +333,14 @@ def _run_udp_redocking_from_prepared_structure(
         "--dir results "
         "--search_mode balance"
     )
-    command = [
-        "docker",
-        "run",
-        "--rm",
-        "--gpus",
-        "all",
-        "-v",
-        f"{run_dir}:/workspace",
-        docker_image,
-        "bash",
-        "-lc",
-        shell_cmd,
-    ]
+    command = build_docker_command(
+        DockerRunSpec(
+            tool=registered_tool("unidock_pro", image=docker_image),
+            command=("bash", "-lc", shell_cmd),
+            mounts=(DockerMount(run_dir, "/workspace"),),
+            use_host_user=False,
+        )
+    )
     metadata = {
         "run_id": run_id,
         "job_code": _short_job_code(run_id),
@@ -358,6 +360,12 @@ def _run_udp_redocking_from_prepared_structure(
         "updated_at": _utc_now_iso(),
     }
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    write_registered_command_record(
+        run_dir,
+        tool_id="unidock_pro",
+        commands=(command,),
+        image=docker_image,
+    )
     proc = subprocess.run(command, capture_output=True, text=True, check=False)
     out_files = sorted(output_dir.rglob("*_out.pdbqt"))
     best_file = out_files[0] if out_files else None
@@ -381,7 +389,7 @@ def _run_udp_redocking_from_prepared_structure(
 
 
 def render() -> None:
-    st.title("Structure Preparation")
+    st.title("Structure Import")
     st.caption("Prepare protein-ligand systems that can be reused by MD, free energy, and property workflows.")
 
     tabs = st.tabs(
@@ -422,7 +430,7 @@ def render() -> None:
         ligands = st.session_state.get("prep_wizard_ligands", [])
         active_pdb_id = st.session_state.get("prep_wizard_pdb_id", pdb_id)
         if raw_pdb and ligands:
-            if st.button("Start new structure preparation task", key="prep_start_new_task"):
+            if st.button("Start new structure import task", key="prep_start_new_task"):
                 for key in [
                     "prep_wizard_pdb_id",
                     "prep_wizard_raw_pdb_data",

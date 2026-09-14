@@ -8,6 +8,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from mn_ligand.app.pages.bound_ligand_md import _render_ligand_summary, _render_structure_view, _run_root
+from mn_ligand.app.viewers import render_persistent_3dmol
+from mn_ligand.core.artifacts import load_artifact_manifest
 from mn_ligand.workflows.bound_ligand_md import parse_bound_ligands
 
 
@@ -393,6 +395,7 @@ def _render_py3dmol_refined_complex(
     input_overlay_opacity: float = 0.35,
     title: str = "Final refined selected complex",
     caption: str = "Prepared protein+ligand complex for downstream workflows.",
+    persist_key: str = "refined-complex",
 ) -> None:
     try:
         import py3Dmol
@@ -435,7 +438,11 @@ def _render_py3dmol_refined_complex(
             },
         )
     view.zoomTo()
-    components.html(view._make_html(), height=580, scrolling=False)
+    render_persistent_3dmol(
+        view,
+        key=persist_key,
+        height=580,
+    )
 
 
 def _load_structure_for_view(path: Path | None) -> tuple[str, str]:
@@ -862,27 +869,40 @@ def render() -> None:
     qp = st.query_params
     run_id = str(qp.get("run_id", "")).strip()
     if not run_id:
-        st.info("No structure run selected. Open this page from Jobs – Structure.")
-        if st.button("Back to Structure Jobs"):
-            st.switch_page("app/pages/jobs_structure.py")
+        st.info("No structure run selected. Open a run from Structure Import → Results.")
+        st.link_button("Back to Structure Import", "./workspace-structure-preparation")
         return
 
     run_dir = _run_root() / "structure-jobs" / run_id
     if not run_dir.exists():
         st.error(f"Structure run not found: {run_id}")
-        if st.button("Back to Structure Jobs"):
-            st.switch_page("app/pages/jobs_structure.py")
+        st.link_button("Back to Structure Import", "./workspace-structure-preparation")
         return
 
     metadata = _read_json(run_dir / "metadata.json")
+    manifest = load_artifact_manifest(run_dir, task_group="structure-jobs")
     pdb_id = str(metadata.get("pdb_id", "")).lower()
 
     protein_refined = next(iter(sorted(run_dir.glob(f"{pdb_id}*_protein_refined.pdb"))), None) if pdb_id else None
     if protein_refined is None:
         protein_refined = next(iter(sorted(run_dir.glob("*_protein_refined.pdb"))), None)
+    if protein_refined is None:
+        protein_refs = manifest.by_type("prepared_receptor")
+        protein_refined = (
+            protein_refs[0].resolve(run_dir, must_exist=True)
+            if protein_refs
+            else None
+        )
     complex_refined = next(iter(sorted(run_dir.glob(f"{pdb_id}*_complex_refined.pdb"))), None) if pdb_id else None
     if complex_refined is None:
         complex_refined = next(iter(sorted(run_dir.glob("*_complex_refined.pdb"))), None)
+    if complex_refined is None:
+        complex_refs = manifest.by_type("prepared_complex")
+        complex_refined = (
+            complex_refs[0].resolve(run_dir, must_exist=True)
+            if complex_refs
+            else None
+        )
 
     protein_pdb_data = _load_text(protein_refined) if protein_refined else ""
     complex_pdb_data = _load_text(complex_refined) if complex_refined else ""
@@ -896,8 +916,7 @@ def render() -> None:
         if metadata.get("job_code"):
             st.caption(f"Job code: {metadata.get('job_code')}")
     with top[1]:
-        if st.button("Back to Structure Jobs"):
-            st.switch_page("app/pages/jobs_structure.py")
+        st.link_button("Back to Structure Import", "./workspace-structure-preparation")
 
     boltz_art = _discover_boltz_artifacts(run_dir)
     if boltz_art["boltz_dir"].exists():
@@ -908,6 +927,13 @@ def render() -> None:
     def _render_refined_section() -> None:
         raw_sdf = next(iter(sorted(run_dir.glob("*_ligand_raw.sdf"))), None)
         refined_sdf = next(iter(sorted(run_dir.glob("*_ligand_refined.sdf"))), None)
+        if refined_sdf is None:
+            ligand_refs = manifest.by_type("prepared_ligand_set")
+            refined_sdf = (
+                ligand_refs[0].resolve(run_dir, must_exist=True)
+                if ligand_refs
+                else None
+            )
         refined_sdf_data = _load_text(refined_sdf) if refined_sdf else ""
         input_overlay_sdf = _resolve_input_ligand_sdf_for_overlay(run_dir, metadata)
         input_overlay_sdf_data = _load_text(input_overlay_sdf) if input_overlay_sdf else ""
@@ -937,6 +963,7 @@ def render() -> None:
                 input_overlay_opacity=float(input_overlay_opacity),
                 title="Final refined selected complex",
                 caption="Rendered from refined protein PDB + refined ligand SDF.",
+                persist_key=f"refined-complex:{run_id}",
             )
             if show_input_overlay:
                 if input_overlay_sdf and input_overlay_sdf_data.strip():
@@ -962,7 +989,7 @@ def render() -> None:
         st.markdown("#### Docking results (from this prepared structure)")
         docking_rows = _collect_docking_runs_for_structure(run_dir)
         if not docking_rows:
-            st.info("No docking runs yet for this structure. Use the `From docking` tab in Structure Preparation.")
+            st.info("No docking runs yet for this structure. Use the `From docking` tab in Structure Import.")
             return
         docking_rows = _attach_rmsd_to_docking_rows(docking_rows)
         df = pd.DataFrame(docking_rows)

@@ -6,22 +6,74 @@ import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 from uuid import uuid4
 import streamlit as st
-import streamlit.components.v1 as components
 
 from mn_ligand.app.pages.common import _input_root
 from mn_ligand.app.pages.bound_ligand_md import (
     DEFAULT_MD_IMAGE,
     _parse_protein_chains,
-    _prepare_structure_with_ligandx,
     _render_ligand_summary,
     _render_structure_view,
     _render_workflow_selection,
     _run_root,
     _short_job_code,
 )
-from mn_ligand.app.pages.boltz2_ui import render_boltz2_inline
+from mn_ligand.app.pages.discover_inputs import select_target_artifact
+from mn_ligand.app.pages.run_resources import render_run_resources
+from mn_ligand.app.viewers import render_persistent_3dmol
+from mn_ligand.core.artifacts import (
+    ArtifactRef,
+    load_artifact_manifest,
+    write_artifact_manifest,
+    write_structure_artifact_manifest,
+)
+from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, display_job_code, iter_job_records
+from mn_ligand.core.provenance import target_lineage_summary
+from mn_ligand.core.docker_runner import (
+    DockerMount,
+    DockerRunSpec,
+    build_docker_command,
+    registered_tool,
+    write_registered_command_record,
+)
+from mn_ligand.core.workflows import (
+    add_workflow_input,
+    attach_workflow_child,
+    create_workflow,
+    refresh_workflow,
+)
+from mn_ligand.workflows.protein_preparation import (
+    CANONICAL_AMINO_ACIDS,
+    coordinate_gap_candidates,
+    create_protein_import_job,
+    detect_noncanonical_residues,
+    detect_modeller_internal_gaps,
+    imported_target,
+    inline_structure_preview_data,
+    load_protein_import_job,
+    prepared_target,
+    resolve_present_protein_chains,
+    run_protein_cleaning_job,
+)
+from mn_ligand.workflows.predicted_complex_promotion import promote_predicted_complex
+from mn_ligand.workflows.complex_prediction_inputs import (
+    create_complex_prediction_inputs,
+    normalize_ligand,
+    normalize_sequence,
+)
+from mn_ligand.workflows.refolding import (
+    DEFAULT_ALPHAFOLD3_IMAGE,
+    DEFAULT_BOLTZ2_IMAGE,
+    alphafast_readiness,
+    boltz2_readiness,
+    configured_alphafold3_reference_paths,
+    configured_boltz2_cache_dir,
+    find_cached_msa,
+    queue_alphafold3_refolding_job,
+    queue_boltz2_refolding_job,
+)
 
 from mn_ligand.workflows.bound_ligand_md import (
     MODIFIED_RESIDUE_MAPPINGS,
@@ -59,16 +111,26 @@ def _write_structure_job(payload: dict) -> Path:
     job_dir = _run_root() / "structure-jobs" / run_id
     job_dir.mkdir(parents=True, exist_ok=False)
     metadata = {
+        **payload,
+        "schema_version": JOB_SCHEMA_VERSION,
         "run_id": run_id,
         "job_code": _short_job_code(run_id),
         "job_type": "structure",
-        "status": "completed",
+        "status": "preparing",
         "created_at": _utc_now_iso(),
         "updated_at": _utc_now_iso(),
-        **payload,
     }
     (job_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     return job_dir
+
+
+def _complete_structure_job(job_dir: Path) -> None:
+    metadata_path = job_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["status"] = "completed"
+    metadata["updated_at"] = _utc_now_iso()
+    metadata["completed_at"] = _utc_now_iso()
+    metadata_path.write_text(json.dumps(metadata, indent=2))
 
 
 def _atom_record_count(pdb_data: str) -> int:
@@ -136,6 +198,7 @@ def _render_py3dmol_complex_preview(
     ligand_sdf_path: str | None = None,
     center: tuple[float, float, float] | None = None,
     size: tuple[float, float, float] | None = None,
+    persist_key: str = "structure-preparation-complex",
 ) -> None:
     import py3Dmol
 
@@ -229,7 +292,11 @@ def _render_py3dmol_complex_preview(
             },
         )
     view.zoomTo()
-    components.html(view._make_html(), height=580, scrolling=False)
+    render_persistent_3dmol(
+        view,
+        key=persist_key,
+        height=580,
+    )
 
 
 def _sdf_quick_summary(sdf_path: str) -> dict:
@@ -254,7 +321,13 @@ def _extract_selected_complex_pdb(
     selected_protein_chains: list[str],
     selected_ligand_key: str,
 ) -> str:
-    selected_chain_set = set(selected_protein_chains)
+    selected_chain_set = resolve_present_protein_chains(
+        pdb_data,
+        selected_protein_chains,
+    )
+    # Some historical OpenMM outputs rewrote a single deposited chain (for
+    # example X) to A. Never publish a ligand-only "complex" merely because
+    # the stored selection uses the pre-cleaning chain ID.
     lines: list[str] = []
     for line in pdb_data.splitlines():
         if line.startswith("ATOM"):
@@ -287,6 +360,13 @@ def _read_text(path: Path) -> str:
         return path.read_text()
     except Exception:
         return ""
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 def _infer_center_from_sdf(sdf_path: Path) -> tuple[float, float, float] | None:
@@ -527,27 +607,782 @@ def _collect_refined_structure_jobs() -> list[dict]:
             metadata = json.loads((run_dir / "metadata.json").read_text())
         except Exception:
             metadata = {}
-        protein_candidates = sorted(run_dir.glob("*_protein_refined.pdb"))
-        ligand_candidates = sorted(run_dir.glob("*_ligand_refined.sdf"))
-        complex_candidates = sorted(run_dir.glob("*_complex_refined.pdb"))
-        smiles_candidates = sorted(run_dir.glob("*_ligand_ref.smi"))
-        if not protein_candidates or not ligand_candidates:
+        manifest = load_artifact_manifest(run_dir, task_group="structure-jobs")
+        protein_refs = manifest.by_type("prepared_receptor")
+        ligand_refs = manifest.by_type("prepared_ligand_set")
+        complex_refs = manifest.by_type("prepared_complex")
+        smiles_refs = tuple(item for item in manifest.by_type("compound_set") if item.role == "reference_smiles")
+        protein_path = protein_refs[0].resolve(run_dir, must_exist=True) if protein_refs else None
+        ligand_path = ligand_refs[0].resolve(run_dir, must_exist=True) if ligand_refs else None
+        complex_path = complex_refs[0].resolve(run_dir, must_exist=True) if complex_refs else None
+        smiles_path = smiles_refs[0].resolve(run_dir, must_exist=True) if smiles_refs else None
+        if protein_path is None or ligand_path is None:
             continue
+        repair_refs = manifest.by_type("repair_report")
+        repair_path = (
+            repair_refs[0].resolve(run_dir, must_exist=True) if repair_refs else None
+        )
+        provenance = _structure_result_provenance(metadata)
+        protein_data = protein_path.read_text(errors="replace")
+        if not provenance["chains"]:
+            provenance["chains"] = ", ".join(
+                sorted(
+                    {
+                        line[21].strip() or "_"
+                        for line in protein_data.splitlines()
+                        if line.startswith("ATOM  ") and len(line) > 21
+                    }
+                )
+            )
+        if not provenance["residues"]:
+            provenance["residues"] = _residue_count(protein_data)
+        if not provenance["formula"] or not provenance["molecular_weight"]:
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import Descriptors, rdMolDescriptors
+
+                supplier = Chem.SDMolSupplier(str(ligand_path), removeHs=False)
+                molecule = supplier[0] if supplier and len(supplier) else None
+                if molecule is not None:
+                    provenance["formula"] = (
+                        provenance["formula"]
+                        or rdMolDescriptors.CalcMolFormula(molecule)
+                    )
+                    provenance["molecular_weight"] = (
+                        provenance["molecular_weight"]
+                        or round(float(Descriptors.MolWt(molecule)), 3)
+                    )
+            except Exception:
+                pass
+        md_assessment = _structure_md_readiness(
+            protein_data,
+            _read_json(repair_path) if repair_path is not None else {},
+        )
         rows.append(
             {
                 "run_id": run_dir.name,
                 "job_code": metadata.get("job_code") or _short_job_code(run_dir.name),
-                "pdb_id": metadata.get("pdb_id") or "",
-                "ligand_key": metadata.get("ligand_key") or "",
-                "protein_pdb": str(protein_candidates[0]),
-                "ligand_sdf": str(ligand_candidates[0]),
-                "complex_pdb": str(complex_candidates[0]) if complex_candidates else "",
-                "ligand_ref_smi": str(smiles_candidates[0]) if smiles_candidates else "",
+                "status": metadata.get("status") or "",
+                "pdb_id": provenance["pdb_id"],
+                "ligand_key": provenance["ligand_key"],
+                "protein_pdb": str(protein_path),
+                "ligand_sdf": str(ligand_path),
+                "complex_pdb": str(complex_path) if complex_path is not None else "",
+                "ligand_ref_smi": str(smiles_path) if smiles_path is not None else "",
                 "source": metadata.get("source") or "",
+                "tool": metadata.get("tool") or metadata.get("engine") or metadata.get("source") or "",
+                "receptor_name": provenance["receptor_name"],
+                "organism": provenance["organism"],
+                "uniprot": provenance["uniprot"],
+                "chains": provenance["chains"],
+                "residues": provenance["residues"],
+                "compound": provenance["compound"],
+                "formula": provenance["formula"],
+                "molecular_weight": provenance["molecular_weight"],
+                "preparation": provenance["preparation"],
+                "md_readiness": md_assessment["label"],
+                "md_assessment": md_assessment,
                 "created_at": metadata.get("created_at") or "",
             }
         )
     return rows
+
+
+def _structure_result_provenance(metadata: dict) -> dict[str, object]:
+    """Resolve display metadata through import and prediction parent jobs."""
+    sources = [metadata]
+    import_run_id = str(metadata.get("import_run_id") or "")
+    if import_run_id:
+        sources.append(
+            _read_json(_run_root() / "protein-import" / import_run_id / "metadata.json")
+        )
+
+    prediction_run_id = str(metadata.get("source_prediction_run_id") or "")
+    if prediction_run_id:
+        prediction_dir = _run_root() / "refolding" / prediction_run_id
+        prediction_metadata = _read_json(prediction_dir / "metadata.json")
+        prediction_input = _read_json(prediction_dir / "input.json")
+        sources.append(prediction_metadata)
+        target_input = prediction_input.get("target") or {}
+        target_run_id = str(target_input.get("run_id") or "")
+        if target_run_id:
+            sources.append(
+                _read_json(
+                    _run_root() / "structure-jobs" / target_run_id / "metadata.json"
+                )
+            )
+
+    def first_value(key: str, default=""):
+        return next((source.get(key) for source in sources if source.get(key)), default)
+
+    receptor = next(
+        (
+            dict(source.get("receptor") or {})
+            for source in sources
+            if source.get("receptor")
+        ),
+        {},
+    )
+    ligands = next(
+        (
+            list(source.get("ligands") or [])
+            for source in sources
+            if source.get("ligands")
+        ),
+        [],
+    )
+    ligand_key = str(first_value("ligand_key"))
+    selected_resname = ligand_key.split("|", 1)[0] if ligand_key else ""
+    ligand = next(
+        (
+            item
+            for item in ligands
+            if not selected_resname
+            or str(item.get("resname") or item.get("ccd_id") or "") == selected_resname
+        ),
+        ligands[0] if ligands else {},
+    )
+    entities = list(receptor.get("entities") or [])
+    entity = entities[0] if entities else {}
+    organisms = list(
+        entity.get("source_organisms")
+        or receptor.get("source_organisms")
+        or []
+    )
+    uniprot_ids = list(entity.get("uniprot_ids") or [])
+    chains = list(first_value("protein_chains", []) or entity.get("chains") or [])
+    sequence_length = entity.get("sequence_length")
+    if not sequence_length:
+        sequence_length = first_value("protein_residues", "")
+    preparation = "Cleaned/repaired" if first_value("cleaning_run_id") else "Imported"
+    if metadata.get("clean_and_repair") is False:
+        preparation = "Imported without repair"
+    return {
+        "pdb_id": str(first_value("pdb_id")),
+        "ligand_key": ligand_key or str(ligand.get("key") or ligand.get("resname") or ""),
+        "receptor_name": str(entity.get("name") or receptor.get("title") or ""),
+        "organism": ", ".join(str(item) for item in organisms),
+        "uniprot": ", ".join(str(item) for item in uniprot_ids),
+        "chains": ", ".join(str(item) for item in chains),
+        "residues": sequence_length or "",
+        "compound": str(ligand.get("name") or ligand.get("ccd_id") or ""),
+        "formula": str(ligand.get("formula") or ""),
+        "molecular_weight": ligand.get("molecular_weight") or "",
+        "preparation": preparation,
+    }
+
+
+def _structure_md_readiness(
+    protein_pdb: str,
+    repair_report: dict,
+    *,
+    peptide_bond_limit_angstrom: float = 1.8,
+) -> dict[str, object]:
+    """Assess sequence/topology continuity without treating separate chains as breaks."""
+    residues: list[tuple[tuple[str, str, str], dict[str, tuple[float, float, float]]]] = []
+    current_key: tuple[str, str, str] | None = None
+    current_atoms: dict[str, tuple[float, float, float]] = {}
+    for line in protein_pdb.splitlines():
+        if not line.startswith("ATOM  ") or len(line) < 54:
+            continue
+        key = (
+            line[21].strip() or "_",
+            line[22:26].strip(),
+            line[26].strip() or "_",
+        )
+        if key != current_key:
+            current_key = key
+            current_atoms = {}
+            residues.append((key, current_atoms))
+        try:
+            current_atoms[line[12:16].strip()] = (
+                float(line[30:38]),
+                float(line[38:46]),
+                float(line[46:54]),
+            )
+        except ValueError:
+            continue
+
+    chains = sorted({key[0] for key, _ in residues})
+    breaks: list[dict[str, object]] = []
+    for chain in chains:
+        chain_residues = [item for item in residues if item[0][0] == chain]
+        for (left_key, left_atoms), (right_key, right_atoms) in zip(
+            chain_residues, chain_residues[1:]
+        ):
+            if "C" not in left_atoms or "N" not in right_atoms:
+                continue
+            distance = sum(
+                (left_atoms["C"][axis] - right_atoms["N"][axis]) ** 2
+                for axis in range(3)
+            ) ** 0.5
+            if distance > peptide_bond_limit_angstrom:
+                breaks.append(
+                    {
+                        "chain": chain,
+                        "after": left_key[1],
+                        "before": right_key[1],
+                        "c_n_distance_angstrom": round(distance, 3),
+                    }
+                )
+
+    fixer = dict(repair_report.get("pdbfixer") or repair_report)
+    modeller_gaps = dict(repair_report.get("modeller_internal_gap_repair") or {})
+    modeled = [
+        *list(modeller_gaps.get("modeled_gaps") or []),
+        *list(fixer.get("missing_residue_segments_added") or []),
+    ]
+    unresolved = [
+        *list(modeller_gaps.get("skipped_gaps") or []),
+        *list(fixer.get("missing_residue_segments_skipped") or []),
+    ]
+    if breaks or unresolved:
+        level = "blocked"
+        label = "Not MD-ready"
+        message = (
+            "Protein topology has unresolved sequence gaps or implausible peptide-bond "
+            "distances. Repair or intentionally terminate the affected chain before MD."
+        )
+    elif modeled:
+        level = "review"
+        label = "Review modeled gap"
+        message = (
+            "The protein is topologically continuous, but missing residues were modeled "
+            "from sequence records. Review the loop and equilibrate it carefully before "
+            "production MD."
+        )
+    else:
+        level = "pass"
+        label = "Topology continuous"
+        message = (
+            "No unresolved internal sequence gaps or peptide-bond discontinuities were "
+            "detected. This check does not replace force-field and system-setup validation."
+        )
+    return {
+        "level": level,
+        "label": label,
+        "message": message,
+        "protein_chains": chains,
+        "separate_chain_count": len(chains),
+        "peptide_bond_breaks": breaks,
+        "modeled_missing_segments": modeled,
+        "unresolved_missing_segments": unresolved,
+        "sequence_records_available": fixer.get("sequence_records_available"),
+        "peptide_bond_limit_angstrom": peptide_bond_limit_angstrom,
+    }
+
+
+def _render_structure_import_results() -> None:
+    st.markdown("#### Imported and prepared complexes")
+    st.caption(
+        "All Structure Import results are shown here, independent of the input "
+        "currently selected in another tab."
+    )
+    rows = _collect_refined_structure_jobs()
+    if not rows:
+        st.info("No prepared Structure Import results are available yet.")
+        return
+
+    all_jobs = list(iter_job_records(_run_root()))
+    jobs_by_id = {job.run_id: job for job in all_jobs}
+    design_campaign_counts: dict[str, int] = {}
+    for job in all_jobs:
+        if job.workflow != "molecule_generation_campaign":
+            continue
+        target_run_id = str(
+            job.metadata.get("target_run_id")
+            or job.parent_run_id
+            or ""
+        )
+        if target_run_id:
+            design_campaign_counts[target_run_id] = (
+                design_campaign_counts.get(target_run_id, 0) + 1
+            )
+    table_rows = []
+    for row in rows:
+        code = str(row["job_code"])
+        job = jobs_by_id.get(str(row["run_id"]))
+        context = (
+            target_lineage_summary(job, jobs_by_id)
+            if job is not None
+            else {
+                "last_step": str(row.get("source") or "Unknown"),
+                "origin": str(row.get("source") or "Unknown"),
+            }
+        )
+        table_rows.append(
+            {
+                "job": (
+                    f"./structure-results?"
+                    f"{urlencode({'run_id': row['run_id'], 'label': code})}"
+                ),
+                "Last step": context["last_step"],
+                "Design results": (
+                    "./molecule-design-results?"
+                    + urlencode({"target_run_id": row["run_id"]})
+                    if design_campaign_counts.get(str(row["run_id"]), 0)
+                    else ""
+                ),
+                "Design campaigns": design_campaign_counts.get(
+                    str(row["run_id"]), 0
+                ),
+                "status": row.get("status") or "",
+                "source": row.get("source") or "",
+                "target": row.get("pdb_id") or "",
+                "receptor": row.get("receptor_name") or "",
+                "organism": row.get("organism") or "",
+                "UniProt": row.get("uniprot") or "",
+                "chains": row.get("chains") or "",
+                "residues": row.get("residues") or "",
+                "ligand": row.get("ligand_key") or "",
+                "compound": row.get("compound") or "",
+                "formula": row.get("formula") or "",
+                "MW (Da)": row.get("molecular_weight") or "",
+                "preparation": row.get("preparation") or "",
+                "Origin / history": context["origin"],
+                "MD readiness": row.get("md_readiness") or "",
+                "tool": row.get("tool") or "",
+                "complex": bool(row.get("complex_pdb")),
+                "created": row.get("created_at") or "",
+            }
+        )
+    table_event = st.dataframe(
+        table_rows,
+        hide_index=True,
+        width="stretch",
+        key="structure_import_results_table",
+        on_select="rerun",
+        selection_mode="single-row-required",
+        selection_default={"selection": {"rows": [0]}},
+        column_config={
+            "job": st.column_config.LinkColumn(
+                "Job",
+                display_text=r"label=([^&]+)",
+            ),
+            "Design results": st.column_config.LinkColumn(
+                "Design results",
+                display_text="Open",
+            ),
+        },
+    )
+    selected_rows = list(table_event.selection.rows)
+    selected_index = selected_rows[0] if selected_rows else 0
+    selected = rows[selected_index] if 0 <= selected_index < len(rows) else rows[0]
+    run_dir = _run_root() / "structure-jobs" / str(selected["run_id"])
+    metadata = _read_json(run_dir / "metadata.json")
+    result = _read_json(run_dir / "result.json")
+    manifest = load_artifact_manifest(run_dir, task_group="structure-jobs")
+
+    summary = st.columns(4)
+    summary[0].metric("Job", str(selected["job_code"]))
+    summary[1].metric("Source", str(selected.get("source") or "import"))
+    summary[2].metric("Target", str(selected.get("pdb_id") or "—"))
+    summary[3].metric("Ligand", str(selected.get("ligand_key") or "—"))
+
+    md_assessment = dict(selected.get("md_assessment") or {})
+    if md_assessment.get("level") == "blocked":
+        st.error(str(md_assessment.get("message") or "Structure is not MD-ready."))
+    elif md_assessment.get("level") == "review":
+        st.warning(str(md_assessment.get("message") or "Review before MD."))
+    else:
+        st.info(str(md_assessment.get("message") or "Topology continuity check passed."))
+    if int(md_assessment.get("separate_chain_count") or 0) > 1:
+        st.caption(
+            f"This complex contains {md_assessment['separate_chain_count']} separate "
+            "protein chains. Separate biological chains are not reported as sequence breaks."
+        )
+    with st.expander("MD-readiness details", expanded=False):
+        st.json(md_assessment)
+
+    complex_path = Path(str(selected["complex_pdb"])) if selected.get("complex_pdb") else None
+    protein_path = Path(str(selected["protein_pdb"]))
+    if protein_path.is_file():
+        protein_preview = protein_path.read_text(errors="replace")
+        complex_preview = (
+            complex_path.read_text(errors="replace")
+            if complex_path is not None and complex_path.is_file()
+            else ""
+        )
+        st.markdown("#### Full imported structure")
+        _render_py3dmol_complex_preview(
+            inline_structure_preview_data(complex_preview, protein_preview),
+            ligand_sdf_path=str(selected["ligand_sdf"]),
+            persist_key=f"imported-structure:{selected['run_id']}",
+        )
+
+    artifact_rows = [
+        {
+            "type": artifact.artifact_type,
+            "role": artifact.role,
+            "label": artifact.label,
+            "relative path": artifact.path,
+        }
+        for artifact in manifest.artifacts
+    ]
+    detail_tabs = st.tabs(["Artifacts", "Import information", "Repair report"])
+    with detail_tabs[0]:
+        st.dataframe(artifact_rows, hide_index=True, width="stretch")
+    with detail_tabs[1]:
+        st.json({"metadata": metadata, "result": result})
+    with detail_tabs[2]:
+        repair_refs = manifest.by_type("repair_report")
+        if not repair_refs:
+            st.info("No repair report was published for this import.")
+        else:
+            repair_path = repair_refs[0].resolve(run_dir, must_exist=True)
+            st.json(_read_json(repair_path) if repair_path is not None else {})
+
+    st.link_button(
+        "Open detailed Structure Results",
+        f"./structure-results?{urlencode({'run_id': selected['run_id'], 'label': selected['job_code']})}",
+        type="primary",
+    )
+    if design_campaign_counts.get(str(selected["run_id"]), 0):
+        st.link_button(
+            "Open combined Molecule Design Results",
+            (
+                "./molecule-design-results?"
+                + urlencode({"target_run_id": selected["run_id"]})
+            ),
+            type="primary",
+        )
+
+
+def _is_structure_import_prediction(job: JobRecord) -> bool:
+    if str(job.metadata.get("launch_context") or "") == "structure_import":
+        return True
+    parent_run_id = str(job.metadata.get("parent_run_id") or "")
+    if not parent_run_id:
+        return False
+    parent_metadata = _run_root() / "complex-prediction-inputs" / parent_run_id / "metadata.json"
+    try:
+        payload = json.loads(parent_metadata.read_text())
+    except (OSError, ValueError):
+        return False
+    return payload.get("workflow") == "complex_prediction_inputs"
+
+
+def _prediction_complex_options(workflow: str) -> dict[str, tuple[JobRecord, ArtifactRef, Path]]:
+    options: dict[str, tuple[JobRecord, ArtifactRef, Path]] = {}
+    for job in iter_job_records(_run_root(), task_groups=("refolding",)):
+        if (
+            job.status != "completed"
+            or job.workflow != workflow
+            or job.artifact_manifest is None
+            or not _is_structure_import_prediction(job)
+        ):
+            continue
+        for artifact in job.artifact_manifest.by_type("predicted_complex"):
+            path = artifact.resolve(job.run_dir, must_exist=True)
+            if path is None:
+                continue
+            code = display_job_code(job.metadata.get("job_code"), job.run_id)
+            label = f"{code} | {artifact.role or artifact.label} | {artifact.label}"
+            options[label] = (job, artifact, path)
+    return options
+
+
+def _render_predicted_complex_preview(path: Path, *, key: str) -> None:
+    st.markdown("#### Predicted complex")
+    if path.stat().st_size > 10 * 1024 * 1024:
+        st.warning("The predicted structure exceeds the 10 MB inline-preview limit.")
+        return
+    try:
+        import py3Dmol
+
+        suffix = path.suffix.lower()
+        structure_format = "cif" if suffix in {".cif", ".mmcif"} else "pdb"
+        viewer = py3Dmol.view(width=1100, height=560)
+        viewer.addModel(path.read_text(errors="replace"), structure_format)
+        viewer.setStyle(
+            {"hetflag": False},
+            {"cartoon": {"color": "spectrum", "opacity": 0.9}},
+        )
+        viewer.setStyle(
+            {"hetflag": True},
+            {
+                "stick": {"colorscheme": "redCarbon", "radius": 0.2},
+                "sphere": {"colorscheme": "redCarbon", "scale": 0.16},
+            },
+        )
+        viewer.zoomTo()
+        render_persistent_3dmol(
+            viewer,
+            key=f"predicted-complex:{key}:{path.resolve()}",
+            height=580,
+        )
+        st.caption(
+            f"Protein is shown as a chain-coloured cartoon; ligand/non-polymer atoms are red. "
+            f"Source: `{path.name}`."
+        )
+    except Exception as exc:
+        st.warning(f"Could not render the selected predicted complex: {exc}")
+
+
+def _render_prediction_complex_promotion(*, workflow: str, engine_label: str, key: str) -> None:
+    st.markdown(f"#### {engine_label} output → Prepared complex")
+    st.caption(
+        "Select a completed typed predicted-complex artifact. Promotion preserves "
+        "the prediction run, runs strict Ligand-X/PDBFixer cleaning and repair, "
+        "retains the ligand, and creates a separate downstream structure job."
+    )
+    options = _prediction_complex_options(workflow)
+    if not options:
+        st.info(
+            f"No completed {engine_label} Structure Import predictions are available. "
+            f"Launch one from this page's Run tab."
+        )
+        return
+    selected_label = st.selectbox(
+        f"{engine_label} predicted complex",
+        tuple(options),
+        key=f"{key}_prediction",
+    )
+    source_job, source_artifact, source_path = options[selected_label]
+    metadata = {
+        "candidate": source_artifact.role or source_artifact.label,
+        **source_artifact.metadata,
+    }
+    st.json(metadata)
+    _render_predicted_complex_preview(source_path, key=f"{key}_{source_artifact.artifact_id}")
+    query = urlencode(
+        {
+            "task_group": source_job.task_group,
+            "run_id": source_job.run_id,
+            "label": display_job_code(source_job.metadata.get("job_code"), source_job.run_id),
+        }
+    )
+    st.link_button("Open prediction results", f"./job-results?{query}")
+    if st.button(
+        f"Create prepared complex from {engine_label}",
+        type="primary",
+        key=f"{key}_promote",
+    ):
+        try:
+            promoted = promote_predicted_complex(
+                source_job=source_job,
+                source_artifact=source_artifact,
+                source_path=source_path,
+            )
+            if promoted.status == "completed":
+                st.success(
+                    "Created prepared complex "
+                    f"{display_job_code(promoted.metadata.get('job_code'), promoted.run_id)}."
+                )
+            else:
+                st.error(str(promoted.result.get("error") or "Prediction promotion failed."))
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def _render_sequence_complex_prediction(*, engine_label: str, key: str) -> None:
+    workflow = "boltz2_refolding" if engine_label == "Boltz-2" else "alphafold3_refolding"
+    input_tab, engine_tab, run_tab, completed_tab = st.tabs(
+        ["Input", "Engine", "Run", "Completed predictions"]
+    )
+    with input_tab:
+        st.markdown("#### One protein + one ligand")
+        protein_input = st.text_area(
+            "Protein sequence (FASTA or raw)",
+            height=220,
+            key=f"{key}_protein",
+        )
+        ligand_input = st.text_input(
+            "Ligand input (LIGAND_ID,SMILES)",
+            placeholder="T3,CCO",
+            key=f"{key}_ligand",
+        )
+        st.caption(
+            "Sequence prediction requires the 20 canonical one-letter amino-acid "
+            "codes. Noncanonical chemistry must not be silently guessed: provide an "
+            "explicit canonical substitution before prediction. The predicted complex "
+            "is cleaned and repaired when it is promoted to a prepared complex. A full "
+            "sequence is predicted end-to-end, so coordinate gaps apply only to imported "
+            "experimental structures."
+        )
+        protein_error = ""
+        ligand_error = ""
+        try:
+            protein_id, sequence = normalize_sequence(protein_input)
+            st.caption(f"Protein `{protein_id}` · {len(sequence)} residues")
+        except ValueError as exc:
+            protein_id, sequence = "", ""
+            protein_error = str(exc)
+        try:
+            ligand_id, ligand_smiles = normalize_ligand(ligand_input)
+            st.caption(f"Ligand `{ligand_id}` · canonical SMILES `{ligand_smiles}`")
+        except ValueError as exc:
+            ligand_id, ligand_smiles = "", ""
+            ligand_error = str(exc)
+
+    af3_db, af3_weights, af3_msa = configured_alphafold3_reference_paths()
+    local_msa_path = None
+    local_msa_source = "missing"
+    if sequence:
+        local_msa_path, local_msa_source = find_cached_msa(sequence, af3_msa)
+    if engine_label == "Boltz-2":
+        readiness = boltz2_readiness()
+        ready = bool(readiness["ready"])
+    else:
+        readiness = alphafast_readiness(af3_db, af3_weights, af3_msa)
+        ready = bool(readiness["database_ready"] and readiness["weights_ready"])
+
+    with engine_tab:
+        if engine_label == "Boltz-2":
+            settings = st.columns(3)
+            recycles = int(
+                settings[0].number_input("Recycling steps", 1, 12, 3, key=f"{key}_recycles")
+            )
+            diffusion_samples = int(
+                settings[1].number_input("Diffusion samples", 1, 16, 5, key=f"{key}_samples")
+            )
+            sampling_steps = int(
+                settings[2].number_input(
+                    "Sampling steps", 10, 400, 200, 10, key=f"{key}_sampling_steps"
+                )
+            )
+            extras = st.columns(2)
+            use_potentials = extras[0].checkbox(
+                "Use potentials", value=True, key=f"{key}_potentials"
+            )
+            seed = int(
+                extras[1].number_input(
+                    "Prediction seed", 1, 2_147_483_000, 1001, key=f"{key}_seed"
+                )
+            )
+            if local_msa_path is not None:
+                st.success(
+                    f"Local MSA found in the shared repository ({local_msa_source}): "
+                    f"`{local_msa_path.name}`"
+                )
+            else:
+                st.warning(
+                    "No matching local MSA was found. Boltz-2 Structure Import will not "
+                    "contact an MSA server; add/generate this sequence's MSA in the shared "
+                    "local repository before launching."
+                )
+        else:
+            settings = st.columns(4)
+            recycles = int(
+                settings[0].number_input("Recycles", 1, 48, 10, key=f"{key}_recycles")
+            )
+            model_seeds = int(
+                settings[1].number_input(
+                    "Number of model seeds", 1, 20, 1, key=f"{key}_model_seeds"
+                )
+            )
+            model_seed_start = int(
+                settings[2].number_input(
+                    "First model seed", 1, 2_147_483_000, 1, key=f"{key}_model_seed_start"
+                )
+            )
+            batch_size = int(
+                settings[3].number_input("MSA batch size", 1, 100, 1, key=f"{key}_batch")
+            )
+            if local_msa_path is not None:
+                st.success(
+                    f"Local cached MSA found ({local_msa_source}). AlphaFold 3 will embed "
+                    "it directly and skip MSA generation."
+                )
+            else:
+                st.info(
+                    "No cached MSA was found. AlphaFold 3 will generate it locally with "
+                    "the installation-managed AlphaFast/MMseqs databases; no MSA server is used."
+                )
+            st.caption(
+                "AF3 preparation controls: recycling count, explicit native model-seed "
+                "range, and local MSA pipeline batch size."
+            )
+        if not ready:
+            st.warning(f"{engine_label} installation-managed references are unavailable.")
+
+    with run_tab:
+        gpu = st.selectbox(
+            "GPU", ("Automatic", "GPU 0", "GPU 1"), key=f"{key}_gpu"
+        )
+        render_run_resources(requires_gpu=True, selected_gpu=gpu, key=key)
+        blockers = []
+        if protein_error:
+            blockers.append(protein_error)
+        if ligand_error:
+            blockers.append(ligand_error)
+        if not ready:
+            blockers.append(f"{engine_label} references are unavailable.")
+        if engine_label == "Boltz-2" and sequence and local_msa_path is None:
+            blockers.append("A matching local MSA is required for Boltz-2 Structure Import.")
+        for blocker in blockers:
+            st.info(blocker)
+        if st.button(
+            f"Run {engine_label} complex preparation",
+            type="primary",
+            disabled=bool(blockers),
+            key=f"{key}_run",
+        ):
+            try:
+                input_job, target_artifact, compound_artifact, proteins = (
+                    create_complex_prediction_inputs(
+                        protein_input=protein_input,
+                        ligand_input=ligand_input,
+                    )
+                )
+                target_path = target_artifact.resolve(input_job.run_dir, must_exist=True)
+                compound_path = compound_artifact.resolve(input_job.run_dir, must_exist=True)
+                if target_path is None or compound_path is None:
+                    raise FileNotFoundError("Typed sequence-ligand inputs were not staged")
+                gpu_device = str(gpu).removeprefix("GPU ") if gpu != "Automatic" else "all"
+                if engine_label == "Boltz-2":
+                    job = queue_boltz2_refolding_job(
+                        target_path=target_path,
+                        target_artifact=target_artifact,
+                        compound_paths=(compound_path,),
+                        compound_artifacts=(compound_artifact,),
+                        protein_sequences=proteins,
+                        image=DEFAULT_BOLTZ2_IMAGE,
+                        cache_dir=configured_boltz2_cache_dir(),
+                        gpu_device=gpu_device,
+                        max_compounds=1,
+                        recycling_steps=recycles,
+                        sampling_steps=sampling_steps,
+                        diffusion_samples=diffusion_samples,
+                        use_msa_server=False,
+                        use_potentials=use_potentials,
+                        msa_paths=(local_msa_path,) if local_msa_path is not None else (),
+                        replicates=1,
+                        seed_start=seed,
+                        launch_context="structure_import",
+                    )
+                else:
+                    job = queue_alphafold3_refolding_job(
+                        target_path=target_path,
+                        target_artifact=target_artifact,
+                        compound_paths=(compound_path,),
+                        compound_artifacts=(compound_artifact,),
+                        protein_sequences=proteins,
+                        image=DEFAULT_ALPHAFOLD3_IMAGE,
+                        db_dir=af3_db,
+                        weights_dir=af3_weights,
+                        msa_repository_dir=af3_msa,
+                        gpu_device=gpu_device,
+                        max_compounds=1,
+                        batch_size=batch_size,
+                        num_recycles=recycles,
+                        model_seed_count=model_seeds,
+                        model_seed_start=model_seed_start,
+                        launch_context="structure_import",
+                    )
+                st.success(
+                    f"Queued {engine_label} complex preparation "
+                    f"{display_job_code(job.metadata.get('job_code'), job.run_id)}."
+                )
+            except Exception as exc:
+                st.error(str(exc))
+
+    with completed_tab:
+        _render_prediction_complex_promotion(
+            workflow=workflow,
+            engine_label=engine_label,
+            key=f"{key}_completed",
+        )
 
 
 def _split_ligand_id_and_smiles(value: str, fallback_ligand_id: str = "LIG") -> tuple[str, str]:
@@ -763,19 +1598,16 @@ def _run_docking_from_prepared_structure(
         + "obabel results/ligand_out.pdbqt -O results/ligand_out.sdf >/dev/null 2>&1 || true; "
         + "fi"
     )
-    command = [
-        "docker",
-        "run",
-        "--rm",
-        "--gpus",
-        "all",
-        "-v",
-        f"{run_dir}:/workspace",
-        docker_image,
-        "bash",
-        "-lc",
-        shell_cmd,
-    ]
+    tool_id = {"udp": "unidock_pro", "gnina": "gnina", "vina": "vina"}[safe_engine]
+    command = build_docker_command(
+        DockerRunSpec(
+            tool=registered_tool(tool_id, image=docker_image),
+            command=("bash", "-lc", shell_cmd),
+            mounts=(DockerMount(run_dir, "/workspace"),),
+            gpu_enabled=safe_engine != "vina",
+            use_host_user=False,
+        )
+    )
     metadata = {
         "run_id": run_id,
         "job_code": _short_job_code(run_id),
@@ -820,6 +1652,12 @@ def _run_docking_from_prepared_structure(
         "updated_at": _utc_now_iso(),
     }
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    write_registered_command_record(
+        run_dir,
+        tool_id=tool_id,
+        commands=(command,),
+        image=docker_image,
+    )
     proc = subprocess.run(command, capture_output=True, text=True, check=False)
     out_files = sorted(output_dir.rglob("*_out.pdbqt"))
     best_file = out_files[0] if out_files else None
@@ -937,19 +1775,22 @@ def _materialize_docked_structure_outputs(
     smiles_dst = Path(str(artifacts.get("ligand_ref_smi") or job_dir / f"{file_prefix}_ligand_ref.smi"))
     if reference_smiles:
         smiles_dst.write_text(reference_smiles + "\n")
+    write_structure_artifact_manifest(job_dir)
     return job_code
 
 
 def render() -> None:
-    st.title("Structure Preparation")
-    st.caption("Prepare protein-ligand systems that can be reused by MD, free energy, and property workflows.")
+    st.title("Structure Import")
+    st.caption("Import protein-ligand systems that can be reused by MD, free energy, and property workflows.")
 
     tabs = st.tabs(
         [
             "From PDB",
             "From docking",
-            "From Boltz prediction",
+            "From Boltz-2 prediction",
+            "From AlphaFold 3 prediction",
             "From custom files",
+            "Results",
         ]
     )
 
@@ -963,15 +1804,33 @@ def render() -> None:
             run = st.button("Download and inspect complex", key="prep_from_pdb", type="primary")
         prepare_image = DEFAULT_MD_IMAGE
         prepare_use_gpu = False
-        map_modified_residues = True
-        st.caption("Preparation uses default containerized cleaning with modified-residue mapping enabled.")
+        st.caption(
+            "Preparation uses MODELLER for explicit residue-specific amino-acid repair, "
+            "followed by containerized PDBFixer/OpenMM cleaning and validation."
+        )
 
         if run:
             try:
                 raw_pdb = download_pdb(pdb_id)
+                import_job = create_protein_import_job(
+                    raw_pdb,
+                    filename=f"{pdb_id.lower()}.pdb",
+                    source="pdb",
+                    pdb_id=pdb_id,
+                )
+                workflow = create_workflow(
+                    "protein-complex-preparation",
+                    name=f"{pdb_id} protein-complex preparation",
+                    parameters={"source": "pdb", "pdb_id": pdb_id},
+                    expected_steps=("protein_import", "protein_cleaning", "complex_preparation"),
+                )
+                attach_workflow_child(workflow.workflow_id, import_job, step_id="protein_import")
+                add_workflow_input(workflow.workflow_id, "protein-import", imported_target(import_job))
                 st.session_state["prep_wizard_pdb_id"] = pdb_id
                 st.session_state["prep_wizard_raw_pdb_data"] = raw_pdb
                 st.session_state["prep_wizard_ligands"] = parse_bound_ligands(raw_pdb)
+                st.session_state["prep_wizard_import_run_id"] = import_job.run_id
+                st.session_state["prep_wizard_workflow_id"] = workflow.workflow_id
                 st.success(
                     f"Downloaded {pdb_id}. Inspect the whole complex, choose chains and ligand, then run preparation."
                 )
@@ -982,11 +1841,13 @@ def render() -> None:
         ligands = st.session_state.get("prep_wizard_ligands", [])
         active_pdb_id = st.session_state.get("prep_wizard_pdb_id", pdb_id)
         if raw_pdb and ligands:
-            if st.button("Start new structure preparation task", key="prep_start_new_task"):
+            if st.button("Start new structure import task", key="prep_start_new_task"):
                 for key in [
                     "prep_wizard_pdb_id",
                     "prep_wizard_raw_pdb_data",
                     "prep_wizard_ligands",
+                    "prep_wizard_import_run_id",
+                    "prep_wizard_workflow_id",
                 ]:
                     st.session_state.pop(key, None)
                 st.rerun()
@@ -1009,13 +1870,6 @@ def render() -> None:
                 for item in chain_entries
             }
             chain_ids = [item["chain"] for item in chain_entries]
-            selected_chains = st.multiselect(
-                "Protein chain(s) to focus",
-                options=chain_ids,
-                default=chain_ids if chain_ids else [],
-                format_func=lambda c: chain_labels.get(c, c),
-                key=f"prep_chains_{active_pdb_id}",
-            )
             ligand_labels = [f"{lig['resname']} chain {lig['chain']} residue {lig['resseq']}" for lig in selectable_ligands]
             selected_idx = st.radio(
                 "Bound ligand",
@@ -1025,6 +1879,197 @@ def render() -> None:
                 key=f"prep_ligand_{active_pdb_id}",
             )
             selected = selectable_ligands[int(selected_idx)]
+            ligand_chain = str(selected.get("chain") or "")
+            default_chains = (
+                [ligand_chain]
+                if ligand_chain in chain_ids
+                else (chain_ids if chain_ids else [])
+            )
+            selected_chains = st.multiselect(
+                "Protein chain(s) to retain",
+                options=chain_ids,
+                default=default_chains,
+                format_func=lambda c: chain_labels.get(c, c),
+                key=f"prep_chains_{active_pdb_id}",
+                help=(
+                    "Defaults to the protein chain containing the selected ligand. "
+                    "Select additional chains only when they are part of the intended "
+                    "simulation system."
+                ),
+            )
+            noncanonical_sites = [
+                site
+                for site in detect_noncanonical_residues(raw_pdb)
+                if str(site["chain"]) in selected_chains
+            ]
+            noncanonical_replacements: list[dict[str, str]] = []
+            unresolved_noncanonical: list[str] = []
+            if noncanonical_sites:
+                st.markdown("#### Noncanonical amino-acid repair")
+                st.caption(
+                    "Each site is independent. A PDB MODRES annotation supplies a suggested "
+                    "default only; review it and override individual sites when the experimental "
+                    "chemistry or intended sequence differs."
+                )
+                st.dataframe(
+                    [
+                        {
+                            "site": site["key"],
+                            "component": site["resname"],
+                            "chain": site["chain"],
+                            "residue": site["resseq"],
+                            "suggested": site["suggested_target"] or "review required",
+                            "evidence": site["evidence"],
+                            "detail": site["evidence_detail"],
+                        }
+                        for site in noncanonical_sites
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                amino_acids = list(CANONICAL_AMINO_ACIDS)
+                columns = st.columns(min(3, len(noncanonical_sites)))
+                for index, site in enumerate(noncanonical_sites):
+                    suggested = str(site.get("suggested_target") or "")
+                    options = [""] + amino_acids
+                    selected_target = columns[index % len(columns)].selectbox(
+                        f"{site['resname']} {site['chain']}:{site['resseq']}"
+                        + (str(site["icode"]) if site["icode"] != "_" else ""),
+                        options=options,
+                        index=options.index(suggested) if suggested in options else 0,
+                        format_func=lambda value: (
+                            "Choose canonical amino acid"
+                            if not value
+                            else f"{value} ({CANONICAL_AMINO_ACIDS[value]})"
+                        ),
+                        key=f"noncanonical_{active_pdb_id}_{site['key']}",
+                        help=(
+                            f"Evidence: {site['evidence']}. "
+                            f"{site['evidence_detail'] or 'No canonical parent was declared.'}"
+                        ),
+                    )
+                    if selected_target:
+                        noncanonical_replacements.append(
+                            {"key": str(site["key"]), "target": selected_target}
+                        )
+                    else:
+                        unresolved_noncanonical.append(str(site["key"]))
+                if unresolved_noncanonical:
+                    st.warning(
+                        "Choose a canonical amino acid for every retained noncanonical protein "
+                        "site before preparation: " + ", ".join(unresolved_noncanonical)
+                    )
+            gap_candidates = [
+                item
+                for item in coordinate_gap_candidates(raw_pdb)
+                if str(item["chain"]) in selected_chains
+            ]
+            internal_gap_definitions: list[dict[str, object]] = []
+            unresolved_gaps: list[str] = []
+            if gap_candidates:
+                st.markdown("#### Internal gap reconstruction")
+                st.caption(
+                    "MODELLER requires the missing sequence and both observed flanking "
+                    "residues. Deposited sequence records are prefilled when available; "
+                    "otherwise enter them manually. Every gap must be explicitly confirmed."
+                )
+                deposited = detect_modeller_internal_gaps(
+                    raw_pdb,
+                    max_internal_gap=15,
+                )
+                inferred_by_range = {
+                    (
+                        str(gap["chain"]),
+                        int(gap.get("author_start") or -1),
+                        int(gap.get("author_end") or -1),
+                    ): gap
+                    for chain_data in deposited.values()
+                    for gap in chain_data.get("gaps") or []
+                }
+                for candidate in gap_candidates:
+                    gap_key = (
+                        str(candidate["chain"]),
+                        int(candidate["author_start"]),
+                        int(candidate["author_end"]),
+                    )
+                    inferred = inferred_by_range.get(gap_key, {})
+                    label = (
+                        f"Chain {candidate['chain']} · missing "
+                        f"{candidate['author_start']}–{candidate['author_end']}"
+                    )
+                    with st.expander(label, expanded=True):
+                        cols = st.columns([0.2, 0.6, 0.2])
+                        left_code = cols[0].text_input(
+                            f"Left flank {candidate['left_resname']} "
+                            f"{candidate['left_resseq']}",
+                            value=str(candidate["left_code"]),
+                            max_chars=1,
+                            key=f"gap_left_{active_pdb_id}_{gap_key}",
+                        ).strip().upper()
+                        sequence = cols[1].text_input(
+                            "Missing amino-acid sequence",
+                            value=str(inferred.get("sequence") or ""),
+                            key=f"gap_sequence_{active_pdb_id}_{gap_key}",
+                            help="Canonical one-letter amino-acid sequence; maximum 15 residues.",
+                        )
+                        sequence = "".join(sequence.split()).upper()
+                        right_code = cols[2].text_input(
+                            f"Right flank {candidate['right_resname']} "
+                            f"{candidate['right_resseq']}",
+                            value=str(candidate["right_code"]),
+                            max_chars=1,
+                            key=f"gap_right_{active_pdb_id}_{gap_key}",
+                        ).strip().upper()
+                        evidence = str(
+                            inferred.get("evidence")
+                            or "User-provided sequence; coordinate numbering discontinuity"
+                        )
+                        st.caption(
+                            f"Evidence: {evidence}. Observed coordinate flanks: "
+                            f"{candidate['left_code']}{candidate['left_resseq']} / "
+                            f"{candidate['right_code']}{candidate['right_resseq']}."
+                        )
+                        valid_sequence = bool(sequence) and not (
+                            set(sequence) - set("ACDEFGHIKLMNPQRSTVWY")
+                        )
+                        valid_flanks = (
+                            left_code == str(candidate["left_code"])
+                            and right_code == str(candidate["right_code"])
+                        )
+                        valid_length = len(sequence) <= 15
+                        confirmed = st.checkbox(
+                            "I confirm this missing sequence and both flanking residues",
+                            value=False,
+                            key=f"gap_confirm_{active_pdb_id}_{gap_key}",
+                        )
+                        if not valid_sequence:
+                            st.warning("Enter a canonical missing amino-acid sequence.")
+                        elif not valid_length:
+                            st.warning(
+                                "This gap exceeds the current 15-residue MODELLER limit."
+                            )
+                        elif not valid_flanks:
+                            st.warning(
+                                "The entered flanks do not match the observed coordinate residues."
+                            )
+                        if confirmed and valid_sequence and valid_flanks and valid_length:
+                            internal_gap_definitions.append(
+                                {
+                                    **candidate,
+                                    "sequence": sequence,
+                                    "left_code": left_code,
+                                    "right_code": right_code,
+                                    "evidence": evidence + "; user confirmed",
+                                    "confirmed": True,
+                                }
+                            )
+                        else:
+                            unresolved_gaps.append(label)
+                if unresolved_gaps:
+                    st.warning(
+                        "Confirm every internal gap before preparation: "
+                        + ", ".join(unresolved_gaps)
+                    )
             _render_structure_view(
                 raw_pdb,
                 selectable_ligands,
@@ -1038,28 +2083,58 @@ def render() -> None:
             _render_ligand_summary(selected)
             _render_workflow_selection(selected_chains, selected)
 
-            if st.button("Prepare selected protein and ligand", key=f"prep_selected_{active_pdb_id}", type="primary"):
+            if st.button(
+                "Prepare selected protein and ligand",
+                key=f"prep_selected_{active_pdb_id}",
+                type="primary",
+                disabled=bool(unresolved_noncanonical or unresolved_gaps),
+            ):
                 try:
                     with st.spinner("Running Ligand-X/HQBind-style protein preparation in container..."):
-                        prepared_payload, command, proc = _prepare_structure_with_ligandx(
-                            active_pdb_id,
-                            raw_pdb,
-                            prepare_image,
-                            prepare_use_gpu,
-                            map_modified_residues,
+                        import_run_id = str(st.session_state.get("prep_wizard_import_run_id") or "")
+                        if not import_run_id:
+                            import_job = create_protein_import_job(
+                                raw_pdb,
+                                filename=f"{active_pdb_id.lower()}.pdb",
+                                source="pdb",
+                                pdb_id=active_pdb_id,
+                            )
+                            import_run_id = import_job.run_id
+                            st.session_state["prep_wizard_import_run_id"] = import_run_id
+                        else:
+                            import_job = load_protein_import_job(import_run_id)
+                        workflow_id = str(st.session_state.get("prep_wizard_workflow_id") or "")
+                        if not workflow_id:
+                            workflow = create_workflow(
+                                "protein-complex-preparation",
+                                name=f"{active_pdb_id} protein-complex preparation",
+                                parameters={"source": "pdb", "pdb_id": active_pdb_id},
+                                expected_steps=("protein_import", "protein_cleaning", "complex_preparation"),
+                            )
+                            workflow_id = workflow.workflow_id
+                            st.session_state["prep_wizard_workflow_id"] = workflow_id
+                            attach_workflow_child(workflow_id, import_job, step_id="protein_import")
+                            add_workflow_input(workflow_id, "protein-import", imported_target(import_job))
+                        cleaning_job, prepared_payload = run_protein_cleaning_job(
+                            import_run_id,
+                            image=prepare_image,
+                            use_gpu=prepare_use_gpu,
+                            map_modified_residues=False,
+                            noncanonical_replacements=noncanonical_replacements,
+                            internal_gap_definitions=internal_gap_definitions,
                         )
-                    if proc.returncode != 0 or not prepared_payload.get("success"):
+                        attach_workflow_child(
+                            workflow_id,
+                            cleaning_job,
+                            step_id="protein_cleaning",
+                            depends_on=(import_run_id,),
+                        )
+                    if cleaning_job.status != "completed" or not prepared_payload.get("success"):
                         st.error("Containerized preparation failed; selected complex was not refined.")
-                        with st.expander("Repair Docker command", expanded=True):
-                            import shlex
-                            st.code(shlex.join(command))
-                        if proc.stdout:
-                            with st.expander("repair stdout"):
-                                st.code(proc.stdout)
-                        if proc.stderr:
-                            with st.expander("repair stderr"):
-                                st.code(proc.stderr)
+                        st.code(str(cleaning_job.run_dir))
                         return
+
+                    prepared_payload["output_dir"] = str(cleaning_job.run_dir)
 
                     prepared = prepared_payload.get("prepared_pdb_data", raw_pdb)
                     mapping_report = prepared_payload.get("modified_residue_mapping", {})
@@ -1086,11 +2161,25 @@ def render() -> None:
                     job_dir = _write_structure_job(
                         {
                             "source": "pdb",
+                            "parent_run_id": cleaning_job.run_id,
+                            "import_run_id": import_run_id,
+                            "cleaning_run_id": cleaning_job.run_id,
+                            "workflow_id": workflow_id,
+                            "workflow_parent_run_id": workflow_id,
+                            "workflow_step_id": "complex_preparation",
                             "pdb_id": active_pdb_id,
                             "ligand_count": len(prepared_ligands),
                             "ligand_key": selected_prepared.get("key"),
                             "protein_chains": selected_chains,
+                            "noncanonical_replacements": noncanonical_replacements,
+                            "internal_gap_definitions": internal_gap_definitions,
                         }
+                    )
+                    attach_workflow_child(
+                        workflow_id,
+                        JobRecord.load(job_dir, task_group="structure-jobs"),
+                        step_id="complex_preparation",
+                        depends_on=(cleaning_job.run_id,),
                     )
                     st.success("Selected protein + ligand prepared.")
                     report_cols = st.columns(3)
@@ -1113,7 +2202,7 @@ def render() -> None:
                         st.markdown("- downloaded PDB structure from RCSB")
                         st.markdown("- selected protein chains + selected ligand")
                         st.markdown("- ran containerized Ligand-X protein cleaning/refinement")
-                        st.markdown("- mapped supported modified residues to standard amino acids")
+                        st.markdown("- modeled each reviewed noncanonical amino-acid replacement with MODELLER")
                         st.markdown("- removed dropped atoms, collapsed altloc variants, and reinserted ligands")
                         st.write(
                             {
@@ -1123,6 +2212,14 @@ def render() -> None:
                             }
                         )
                         st.json(mapping_report)
+                        st.json(
+                            prepared_payload.get("modeller_noncanonical_repair")
+                            or noncanonical_replacements
+                        )
+                        st.json(
+                            prepared_payload.get("modeller_internal_gap_repair")
+                            or {"modeled_gaps": []}
+                        )
                     complex_refined_name = f"{active_pdb_id.lower()}_{selected_prepared['resname'].lower()}_complex_refined.pdb"
                     protein_refined_name = f"{active_pdb_id.lower()}_protein_refined.pdb"
                     protein_only_refined_pdb = _protein_only_pdb(prepared)
@@ -1261,6 +2358,17 @@ def render() -> None:
                             f"Check debug file: {(job_dir / f'{file_prefix}_ligand_artifact_debug.txt').name}"
                         )
 
+                    cleaning_report = (
+                        cleaning_job.run_dir
+                        / "artifacts"
+                        / "reports"
+                        / "repair_report.json"
+                    )
+                    if cleaning_report.is_file():
+                        (job_dir / "repair_report.json").write_bytes(
+                            cleaning_report.read_bytes()
+                        )
+
                     # Persist ligand correction artifacts directly in the structure job folder.
                     # Prefer explicit artifact paths, then fallback to any generated files in preview_dir.
                     explicit_paths = []
@@ -1286,6 +2394,9 @@ def render() -> None:
                         else:
                             dst_name = name
                         (job_dir / dst_name).write_bytes(src_path.read_bytes())
+                    write_structure_artifact_manifest(job_dir)
+                    _complete_structure_job(job_dir)
+                    refresh_workflow(workflow_id)
                     st.markdown("#### Refined complex (final)")
                     _render_structure_view(
                         selected_complex_pdb,
@@ -1307,16 +2418,18 @@ def render() -> None:
         if not prepared_rows:
             st.info("No compatible prepared structure jobs found yet. Create one first in the `From PDB` tab.")
         else:
-            options: dict[str, dict] = {}
-            for row in prepared_rows:
-                label = f"{row['job_code']} | {row['pdb_id'] or 'PDB?'} | {Path(row['ligand_sdf']).name}"
-                options[label] = row
-            selected_label = st.selectbox(
-                "Prepared structure job",
-                list(options.keys()),
-                key="prep_docking_source_job",
+            rows_by_run_id = {str(row["run_id"]): row for row in prepared_rows}
+            selected_choice = select_target_artifact(
+                "Prepared target",
+                ("prepared_target", "prepared_receptor"),
+                key="prep_docking_source_target",
+                show_viewer=False,
+                allowed_run_ids=set(rows_by_run_id),
             )
-            selected = options[selected_label]
+            if selected_choice is None:
+                st.info("Select a prepared target with a refined ligand to configure docking.")
+                st.stop()
+            selected = rows_by_run_id[selected_choice.job.run_id]
             protein_path = Path(str(selected["protein_pdb"]))
             ligand_path = Path(str(selected["ligand_sdf"]))
             complex_path = Path(str(selected["complex_pdb"])) if str(selected.get("complex_pdb") or "").strip() else None
@@ -1458,102 +2571,200 @@ def render() -> None:
                         ligand_sdf_path=str(ligand_path),
                         center=(float(center_x), float(center_y), float(center_z)),
                         size=(float(size_x), float(size_y), float(size_z)),
+                        persist_key=f"prepared-docking:{selected['run_id']}",
                     )
                 except Exception as exc:
                     st.warning(f"Preview unavailable: {exc}")
 
-            if st.button("Run docking from this prepared structure", type="primary", key=f"prep_docking_run_{selected['run_id']}"):
-                try:
-                    with st.spinner(f"Running {docking_engine.upper()} redocking from prepared structure..."):
-                        run = _run_docking_from_prepared_structure(
-                            engine=str(docking_engine),
-                            structure_run_id=str(selected["run_id"]),
-                            structure_job_code=str(selected["job_code"]),
-                            pdb_id=str(selected.get("pdb_id") or ""),
-                            ligand_key=str(selected.get("ligand_key") or ""),
-                            ligand_id=str(ligand_id_value),
-                            protein_pdb=protein_path,
-                            ligand_sdf=ligand_path,
-                            ligand_smiles=smiles_only,
-                            center=(float(center_x), float(center_y), float(center_z)),
-                            size=(float(size_x), float(size_y), float(size_z)),
-                            docking_mode=str(docking_mode),
-                            search_mode=str(search_mode),
-                            exhaustiveness=int(exhaustiveness),
-                            use_scrub=bool(use_scrub),
-                            scrub_ph=float(scrub_ph),
-                            scrub_skip_tautomer=bool(scrub_skip_tautomer),
-                            extra_udp_args=str(extra_udp_args),
-                            extra_vina_args=str(extra_vina_args),
-                            docker_image="avgu-docking-suite-cuda:latest",
-                        )
-                    result = run.get("result", {})
-                    if bool(result.get("success")):
-                        st.success(f"{str(docking_engine).upper()} redocking completed: {run.get('metadata', {}).get('job_code', '')}")
-                        registered_code = _materialize_docked_structure_outputs(
-                            source_structure=selected,
-                            docking_run=run,
-                        )
-                        if registered_code:
-                            st.caption(
-                                f"Docked pose saved in structure job `{registered_code}` "
-                                "for downstream MD/FEP."
-                            )
-                        st.caption("Open this structure run from Jobs – Structure to inspect docking results.")
-                    else:
-                        st.error(f"{str(docking_engine).upper()} redocking failed.")
-                    st.code(f"Docking run directory:\n{run.get('run_dir', '')}")
-                    st.code(f"Docking pose outputs:\n{Path(str(run.get('run_dir', ''))) / 'work' / 'results'}")
-                    st.caption(f"Ligand ID used: `{ligand_id_value}`")
-                    with st.expander("Docking stderr tail", expanded=not bool(result.get("success"))):
-                        st.code(str(result.get("stderr_tail") or ""))
-                except Exception as exc:
-                    st.error(f"Docking execution failed: {exc}")
+            st.info(
+                "Docking launch is centralized in Docking / Cofolding. Select this "
+                "prepared target and ligand there, configure the engine, and submit "
+                "from its Run tab where live CPU/GPU availability is shown."
+            )
 
     with tabs[2]:
-        st.markdown("#### Boltz output -> Prepared complex")
-        st.caption("Use Boltz-2 predicted structures and normalize them for downstream workflows.")
-        render_boltz2_inline()
+        _render_sequence_complex_prediction(
+            engine_label="Boltz-2",
+            key="prepare_boltz2",
+        )
 
     with tabs[3]:
+        _render_sequence_complex_prediction(
+            engine_label="AlphaFold 3",
+            key="prepare_af3",
+        )
+
+    with tabs[4]:
         st.markdown("#### Custom protein + ligand files")
-        st.caption("Upload your own protein and ligand files and register them as prepared inputs.")
-        protein_file = st.file_uploader("Protein file (PDB/mmCIF)", type=["pdb", "cif", "mmcif"], key="custom_protein")
+        st.caption(
+            "This tab is only for new local files. Existing imported targets are "
+            "selected directly in downstream workflow Target / Input tabs."
+        )
+        selected_cleaning_job = None
+        protein_file = st.file_uploader(
+            "Protein file (PDB/mmCIF)",
+            type=["pdb", "cif", "mmcif"],
+            key="custom_protein",
+        )
         ligand_file = st.file_uploader("Ligand file (SDF/MOL2/SMILES TXT)", type=["sdf", "mol2", "smi", "txt"], key="custom_ligand")
+        complex_file = st.file_uploader(
+            "Optional complete complex PDB",
+            type=["pdb"],
+            key="custom_complex",
+            help=(
+                "Include the protein and ligand in one coordinate file to publish a "
+                "prepared_complex that can be used by Target Trimming."
+            ),
+        )
+        st.caption(
+            "Uploaded structures pass through the same strict Ligand-X/PDBFixer "
+            "cleaning used for PDB imports. Supported modified residues are normalized, "
+            "missing residues/atoms are rebuilt when the source records permit it, and "
+            "ligand coordinates are retained."
+        )
         if st.button("Register custom prepared input", key="register_custom"):
-            protein_path = _save_upload("custom/protein", protein_file)
+            if selected_cleaning_job is not None:
+                target_ref = prepared_target(selected_cleaning_job)
+                resolved_target = target_ref.resolve(selected_cleaning_job.run_dir, must_exist=True)
+                protein_path = str(resolved_target) if resolved_target is not None else None
+            else:
+                protein_path = _save_upload("custom/protein", protein_file)
             ligand_path = _save_upload("custom/ligand", ligand_file)
+            complex_path = _save_upload("custom/complex", complex_file)
             if not protein_path or not ligand_path:
                 st.warning("Upload both protein and ligand files first.")
             else:
+                cleaning_job = selected_cleaning_job
+                cleaned_complex_data = ""
+                repair_report_source = None
+                if complex_path or selected_cleaning_job is None:
+                    cleaning_source = Path(complex_path or protein_path)
+                    try:
+                        import_job = create_protein_import_job(
+                            cleaning_source.read_text(errors="replace"),
+                            filename=cleaning_source.name,
+                            source="manual_complex" if complex_path else "manual_protein",
+                        )
+                        cleaning_job, cleaned_payload = run_protein_cleaning_job(
+                            import_job.run_id,
+                            image=DEFAULT_MD_IMAGE,
+                            use_gpu=False,
+                            map_modified_residues=True,
+                        )
+                    except Exception as exc:
+                        st.error(f"Structure cleaning could not start: {exc}")
+                        return
+                    if cleaning_job.status != "completed" or not cleaned_payload.get("success"):
+                        st.error(
+                            str(
+                                cleaned_payload.get("error")
+                                or cleaning_job.result.get("error")
+                                or "Structure cleaning failed"
+                            )
+                        )
+                        return
+                    cleaned_complex_data = (
+                        str(cleaned_payload.get("prepared_pdb_data") or "")
+                        if complex_path
+                        else ""
+                    )
+                    target_ref = prepared_target(cleaning_job)
+                    resolved_target = target_ref.resolve(cleaning_job.run_dir, must_exist=True)
+                    if resolved_target is None:
+                        st.error("Structure cleaning did not publish a prepared target.")
+                        return
+                    protein_path = str(resolved_target)
+                if cleaning_job is not None and cleaning_job.artifact_manifest is not None:
+                    report_refs = cleaning_job.artifact_manifest.by_type("repair_report")
+                    if report_refs:
+                        repair_report_source = report_refs[0].resolve(
+                            cleaning_job.run_dir, must_exist=True
+                        )
                 st.session_state["prepared_structure_last"] = {
                     "source": "custom",
                     "protein_path": protein_path,
                     "ligand_path": ligand_path,
                 }
-                _write_structure_job(
+                protein_source = Path(protein_path)
+                ligand_source = Path(ligand_path)
+                protein_name = f"custom_target{protein_source.suffix.lower()}"
+                ligand_name = f"custom_ligand{ligand_source.suffix.lower()}"
+                job_dir = _write_structure_job(
                     {
                         "source": "custom",
-                        "protein_path": protein_path,
-                        "ligand_path": ligand_path,
+                        "parent_run_id": cleaning_job.run_id if cleaning_job is not None else "",
+                        "cleaning_run_id": cleaning_job.run_id if cleaning_job is not None else "",
+                        "protein_path": protein_name,
+                        "ligand_path": ligand_name,
+                        "complex_path": "custom_complex_refined.pdb" if complex_path else "",
+                        "clean_and_repair": True,
                     }
                 )
+                protein_copy = job_dir / protein_name
+                ligand_copy = job_dir / ligand_name
+                protein_copy.write_bytes(protein_source.read_bytes())
+                ligand_copy.write_bytes(ligand_source.read_bytes())
+                manifest_artifacts = [
+                    ArtifactRef.from_path(
+                        job_dir,
+                        protein_copy,
+                        "prepared_receptor",
+                        role="receptor",
+                    ),
+                    ArtifactRef.from_path(
+                        job_dir,
+                        ligand_copy,
+                        "prepared_ligand_set",
+                        role="ligand",
+                    ),
+                ]
+                if complex_path:
+                    complex_copy = job_dir / "custom_complex_refined.pdb"
+                    if cleaned_complex_data.strip():
+                        complex_copy.write_text(cleaned_complex_data)
+                    else:
+                        complex_copy.write_bytes(Path(complex_path).read_bytes())
+                    manifest_artifacts.append(
+                        ArtifactRef.from_path(
+                            job_dir,
+                            complex_copy,
+                            "prepared_complex",
+                            role="complex",
+                        )
+                    )
+                if repair_report_source is not None:
+                    report_copy = job_dir / "repair_report.json"
+                    report_copy.write_bytes(repair_report_source.read_bytes())
+                    manifest_artifacts.append(
+                        ArtifactRef.from_path(
+                            job_dir,
+                            report_copy,
+                            "repair_report",
+                            role="report",
+                            metadata={
+                                "cleaning_run_id": cleaning_job.run_id
+                                if cleaning_job is not None
+                                else ""
+                            },
+                        )
+                    )
+                write_artifact_manifest(
+                    job_dir,
+                    manifest_artifacts,
+                )
+                _complete_structure_job(job_dir)
                 st.success("Custom input registered.")
                 st.code(f"Protein: {protein_path}\nLigand:  {ligand_path}")
 
+    with tabs[5]:
+        _render_structure_import_results()
+
     st.divider()
-    st.markdown("#### Next step")
-    st.caption("Prepared structures can now be used by MD, ABFE/RBFE, and ligand property workflows.")
-    n1, n2, n3 = st.columns(3)
-    with n1:
-        if st.button("Go to Bound ligand MD"):
-            _switch_to("app/pages/bound_ligand_md.py")
-    with n2:
-        if st.button("Go to Ligand ABFE"):
-            _switch_to("app/pages/abfe.py")
-    with n3:
-        if st.button("Go to Ligand RBFE"):
-            _switch_to("app/pages/rbfe.py")
+    st.caption(
+        "Prepared artifacts are selectable from the Target / Input tabs of MD, "
+        "Docking / Cofolding, Free Energy, ADMET, and QC. Use the sidebar to open "
+        "the desired workflow; launch actions are located in its Run tab."
+    )
 
 
 render()
