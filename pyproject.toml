@@ -9,6 +9,7 @@ description = "Standalone Streamlit app for Docker-backed ligand modelling workf
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "altair",
   "gemmi>=0.7,<0.8",
   "matplotlib",
   "mdtraj",
@@ -20,6 +21,7 @@ dependencies = [
   "py3Dmol",
   "pyyaml>=6,<7",
   "rdkit",
+  "scipy",
   "seaborn",
   "streamlit",
   "typer",

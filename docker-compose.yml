@@ -1,6 +1,13 @@
 name: mn-ligand
 
 services:
+  alphafast:
+    image: alphafast:latest
+    build:
+      context: ./containers/alphafast
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
   structure:
     image: ovolig-structure:latest
     build:
@@ -12,6 +19,20 @@ services:
     image: ovolig-docking:latest
     build:
       context: ./containers/docking
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  docking-suite:
+    image: avgu-docking-suite-cuda:latest
+    build:
+      context: ./containers/docking-suite
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  openvs:
+    image: openvs:local
+    build:
+      context: ./containers/openvs
       dockerfile: Dockerfile
       platforms: ["linux/x86_64"]
 
@@ -44,6 +65,13 @@ services:
       dockerfile: Dockerfile
       platforms: ["linux/x86_64"]
 
+  gromacs:
+    image: ovolig-gromacs-cu128:latest
+    build:
+      context: ./containers/gromacs-md
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
   admet:
     image: ovolig-admet:latest
     build:
@@ -52,9 +80,18 @@ services:
       platforms: ["linux/x86_64"]
 
   boltz2:
-    # Existing Blackwell/CUDA 12.8 image. This service intentionally has no
-    # build block so `docker compose build` does not replace your local image.
     image: ovoex-boltz2:latest
+    build:
+      context: ./containers/boltz2
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  boltzina:
+    image: ovolig-boltzina-cu128:latest
+    build:
+      context: ./mn_ligand/containers/boltzina
+      dockerfile: Dockerfile.cu128
+      platforms: ["linux/x86_64"]
 
   nesso:
     image: ovolig-nesso-cu128:latest

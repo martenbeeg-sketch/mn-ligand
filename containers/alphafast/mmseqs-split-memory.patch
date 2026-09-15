@@ -1,0 +1,117 @@
+diff --git a/run_data_pipeline.py b/run_data_pipeline.py
+index 57091c3..0067313 100644
+--- a/run_data_pipeline.py
++++ b/run_data_pipeline.py
+@@ -114,6 +114,12 @@ _MMSEQS_N_THREADS = flags.DEFINE_integer(
+     "Number of CPU threads for MMseqs2 non-GPU operations.",
+     lower_bound=1,
+ )
++_MMSEQS_SPLIT_MEMORY_LIMIT = flags.DEFINE_string(
++    "mmseqs_split_memory_limit",
++    "16G",
++    "Maximum memory used by each MMseqs2 target-database split. The default "
++    "keeps GPU searches below 24 GB VRAM without changing sensitivity.",
++)
+ _MMSEQS_SEQUENTIAL = flags.DEFINE_bool(
+     "mmseqs_sequential",
+     True,
+@@ -575,6 +581,7 @@ def main(_):
+         gpu_device=_GPU_DEVICE.value,
+         mmseqs_sensitivity=_MMSEQS_SENSITIVITY.value,
+         mmseqs_n_threads=_MMSEQS_N_THREADS.value,
++        mmseqs_split_memory_limit=_MMSEQS_SPLIT_MEMORY_LIMIT.value,
+         mmseqs_sequential=_MMSEQS_SEQUENTIAL.value,
+         temp_dir=_TEMP_DIR.value,
+         # Template search thresholds
+diff --git a/src/alphafold3/data/pipeline.py b/src/alphafold3/data/pipeline.py
+index 9b32362..360a4b4 100644
+--- a/src/alphafold3/data/pipeline.py
++++ b/src/alphafold3/data/pipeline.py
+@@ -332,6 +332,7 @@ class DataPipelineConfig:
+     gpu_device: int | None = None  # Used for both MMseqs2 and Foldseek
+     mmseqs_sensitivity: float = 7.5
+     mmseqs_n_threads: int = dataclasses.field(default_factory=_default_mmseqs_threads)
++    mmseqs_split_memory_limit: str | None = "16G"
+     mmseqs_sequential: bool = True
+ 
+     # Temporary directory for intermediate files (for HPC with slow network storage).
+@@ -541,6 +542,9 @@ class DataPipeline:
+             )
+         self._pdb_database_path = data_pipeline_config.pdb_database_path
+         self._run_msa_sequential = data_pipeline_config.mmseqs_sequential
++        self._mmseqs_split_memory_limit = (
++            data_pipeline_config.mmseqs_split_memory_limit
++        )
+         self._temp_dir = data_pipeline_config.temp_dir
+ 
+         # Store template_mode for reference
+@@ -1556,6 +1560,7 @@ class DataPipeline:
+             gpu_device=mmseqs_cfg.gpu_device,
+             threads=mmseqs_cfg.threads,
+             temp_dir=self._temp_dir,
++            split_memory_limit=self._mmseqs_split_memory_limit,
+         )
+ 
+         sequence_items = list(all_sequences.items())
+diff --git a/src/alphafold3/data/tools/mmseqs_batch.py b/src/alphafold3/data/tools/mmseqs_batch.py
+index 1ee1065..1b2c6b4 100644
+--- a/src/alphafold3/data/tools/mmseqs_batch.py
++++ b/src/alphafold3/data/tools/mmseqs_batch.py
+@@ -82,6 +82,7 @@ class MmseqsBatch:
+         gpu_device: int | None = None,
+         threads: int = 8,
+         temp_dir: str | None = None,
++        split_memory_limit: str | None = None,
+         search_type: int | None = None,
+     ):
+         """Initialize batch searcher.
+@@ -108,6 +109,7 @@ class MmseqsBatch:
+         self._gpu_device = gpu_device
+         self._threads = threads
+         self._temp_dir = temp_dir
++        self._split_memory_limit = split_memory_limit
+         self._search_type = search_type
+         self._is_nucleotide = (search_type == 3)
+ 
+@@ -285,6 +287,8 @@ class MmseqsBatch:
+ 
+         if self._gpu_enabled and self._search_type != 3:
+             cmd.extend(["--gpu", "1"])
++        if self._split_memory_limit:
++            cmd.extend(["--split-memory-limit", self._split_memory_limit])
+ 
+         subprocess_utils.run(
+             cmd=cmd,
+@@ -430,6 +434,7 @@ class MmseqsMultiDBBatch:
+         gpu_device: int | None = None,
+         threads: int = 8,
+         temp_dir: str | None = None,
++        split_memory_limit: str | None = None,
+     ):
+         """Initialize multi-database batch searcher.
+ 
+@@ -453,6 +458,7 @@ class MmseqsMultiDBBatch:
+         self._gpu_device = gpu_device
+         self._threads = threads
+         self._temp_dir = temp_dir
++        self._split_memory_limit = split_memory_limit
+ 
+         # Default max sequences per database
+         self._max_sequences_per_db = max_sequences_per_db or {
+@@ -515,6 +521,7 @@ class MmseqsMultiDBBatch:
+                         gpu_device=self._gpu_device,
+                         threads=self._threads,
+                         temp_dir=self._temp_dir,
++                        split_memory_limit=self._split_memory_limit,
+                     )
+ 
+                     # Submit search (will use its own temp dir for results)
+@@ -670,6 +677,8 @@ class MmseqsMultiDBBatch:
+ 
+         if self._gpu_enabled:
+             cmd.extend(["--gpu", "1"])
++        if self._split_memory_limit:
++            cmd.extend(["--split-memory-limit", self._split_memory_limit])
+ 
+         env = None
+         if self._gpu_device is not None:
