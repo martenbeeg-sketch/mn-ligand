@@ -8,7 +8,18 @@ from pathlib import Path
 
 import typer
 
-from mn_ligand.runtime import DEFAULT_APP_HOME, DEFAULT_TMPDIR, ensure_runtime_home
+from mn_ligand.runtime import (
+    app_home as configured_app_home,
+    ensure_runtime_home,
+    library_root,
+    reference_root,
+    required_mount,
+    runs_root,
+    save_installation_settings,
+    save_runtime_settings,
+    temporary_root,
+    validate_required_mount,
+)
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
@@ -20,6 +31,11 @@ worker_service_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(worker_service_app, name="worker-service")
+portability_app = typer.Typer(
+    help="Audit, export, and verify runtime portability without modifying source data.",
+    no_args_is_help=True,
+)
+app.add_typer(portability_app, name="portability")
 
 
 @app.callback()
@@ -31,19 +47,30 @@ def cli() -> None:
 def run_app(
     ctx: typer.Context,
     app_home: str = typer.Option(
-        str(DEFAULT_APP_HOME),
+        "",
         "--app-home",
         help="Runtime directory for mn-ligand jobs and local app state.",
     ),
     tmpdir: str = typer.Option(
-        str(DEFAULT_TMPDIR),
+        "",
         "--tmpdir",
         help="Writable temporary directory for Streamlit startup.",
     ),
 ):
     """Run the ligand-only Streamlit app."""
-    home_path = ensure_runtime_home(app_home, tmpdir)
-    os.environ.setdefault("TMPDIR", tmpdir)
+    if app_home.strip():
+        os.environ["MN_LIGAND_APP_HOME"] = str(Path(app_home).expanduser().resolve())
+    if tmpdir.strip():
+        os.environ["MN_LIGAND_TMP_DIR"] = str(Path(tmpdir).expanduser().resolve())
+    try:
+        validate_required_mount()
+    except RuntimeError as exc:
+        typer.echo(f"App startup refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    selected_home = configured_app_home()
+    selected_tmp = temporary_root()
+    home_path = ensure_runtime_home(selected_home, selected_tmp)
+    os.environ.setdefault("TMPDIR", str(selected_tmp))
     os.environ.setdefault("MN_LIGAND_APP_HOME", str(home_path))
     Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
 
@@ -59,19 +86,103 @@ def run_app(
 @app.command(name="init")
 def init_home(
     app_home: str = typer.Option(
-        str(DEFAULT_APP_HOME),
+        "",
         "--app-home",
         help="Dedicated runtime directory for mn-ligand.",
     ),
     tmpdir: str = typer.Option(
-        str(DEFAULT_TMPDIR),
+        "",
         "--tmpdir",
         help="Writable temporary directory for Streamlit startup.",
     ),
+    runs_dir: str = typer.Option(
+        "", "--runs-dir", help="Results and durable job directory."
+    ),
+    reference_dir: str = typer.Option(
+        "", "--reference-dir", help="Reference data directory."
+    ),
+    library_dir: str = typer.Option(
+        "", "--library-dir", help="Compound library directory."
+    ),
+    required_mount_path: str = typer.Option(
+        "",
+        "--require-mount",
+        help="Refuse startup unless this data filesystem is mounted.",
+    ),
+    no_mount_guard: bool = typer.Option(
+        False,
+        "--no-mount-guard",
+        help="Remove an existing required-mount guard during reconfiguration.",
+    ),
 ):
-    """Initialize a dedicated runtime directory for mn-ligand."""
-    home_path = ensure_runtime_home(app_home, tmpdir)
-    typer.echo(f"Initialized mn-ligand runtime directory: {home_path}")
+    """Create and persist a complete machine-local mn-ligand installation."""
+    selected_home = (
+        Path(app_home).expanduser().resolve()
+        if app_home.strip()
+        else configured_app_home()
+    )
+    os.environ["MN_LIGAND_APP_HOME"] = str(selected_home)
+    selected_tmp = (
+        Path(tmpdir).expanduser().resolve()
+        if tmpdir.strip()
+        else temporary_root()
+    )
+    selected_runs = (
+        Path(runs_dir).expanduser().resolve()
+        if runs_dir.strip()
+        else runs_root(create=False)
+    )
+    selected_references = (
+        Path(reference_dir).expanduser().resolve()
+        if reference_dir.strip()
+        else reference_root(create=False)
+    )
+    selected_libraries = (
+        Path(library_dir).expanduser().resolve()
+        if library_dir.strip()
+        else library_root(create=False)
+    )
+    if no_mount_guard and required_mount_path.strip():
+        raise typer.BadParameter(
+            "Use either --require-mount or --no-mount-guard, not both"
+        )
+    selected_mount = (
+        None
+        if no_mount_guard
+        else (
+            Path(required_mount_path).expanduser().resolve()
+            if required_mount_path.strip()
+            else required_mount()
+        )
+    )
+    if selected_mount is not None:
+        os.environ["MN_LIGAND_REQUIRED_MOUNT"] = str(selected_mount)
+    else:
+        os.environ["MN_LIGAND_REQUIRED_MOUNT"] = ""
+    try:
+        validate_required_mount()
+        home_path = ensure_runtime_home(selected_home, selected_tmp)
+        install_target = save_installation_settings(
+            runtime_home=home_path,
+            required_mount_path=selected_mount,
+        )
+        runtime_target = save_runtime_settings(
+            runs_dir=selected_runs,
+            reference_dir=selected_references,
+            library_dir=selected_libraries,
+            tmp_dir=selected_tmp,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Initialization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Installation configuration: {install_target}")
+    typer.echo(f"Runtime configuration: {runtime_target}")
+    typer.echo(f"App home: {home_path}")
+    typer.echo(f"Results and jobs: {selected_runs}")
+    typer.echo(f"Reference files: {selected_references}")
+    typer.echo(f"Libraries: {selected_libraries}")
+    typer.echo(f"Temporary files: {selected_tmp}")
+    typer.echo(f"Required mount: {required_mount() or 'none'}")
 
 
 @app.command(name="doctor")
@@ -95,6 +206,146 @@ def doctor(
     raise typer.Exit(code=diagnostics_exit_code(results))
 
 
+@portability_app.command(name="audit")
+def portability_audit(
+    runs_dir: Path | None = typer.Option(
+        None,
+        "--runs-dir",
+        help="Runs directory to inspect; defaults to the configured runtime.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the full JSON report."),
+) -> None:
+    """Read JSON metadata and classify stored absolute paths without changing it."""
+    from mn_ligand.core.portability import audit_runtime_portability
+
+    report = audit_runtime_portability(runs_dir)
+    if json_output:
+        typer.echo(json.dumps(report, indent=2))
+        return
+    counts = report["counts"]
+    typer.echo(f"Runs root: {report['runs_root']}")
+    typer.echo("Mode: read-only (no runtime files changed)")
+    for key in (
+        "json_files",
+        "unreadable_json_files",
+        "absolute_values",
+        "current_paths",
+        "relocatable_paths",
+        "reference_paths",
+        "container_paths",
+        "provenance_paths",
+        "embedded_text_paths",
+        "unresolved_paths",
+        "external_paths",
+    ):
+        typer.echo(f"{key.replace('_', ' ').title()}: {counts.get(key, 0)}")
+
+
+@portability_app.command(name="export")
+def portability_export(
+    destination: Path = typer.Argument(
+        ...,
+        help="New destination directory for the portable bundle.",
+    ),
+    runs_dir: Path | None = typer.Option(
+        None,
+        "--runs-dir",
+        help="Source runs directory; defaults to the configured runtime.",
+    ),
+    reference_dir: Path | None = typer.Option(
+        None,
+        "--reference-dir",
+        help="Source reference directory; defaults to the configured runtime.",
+    ),
+    library_dir: Path | None = typer.Option(
+        None,
+        "--library-dir",
+        help="Source compound-library directory; defaults to the configured runtime.",
+    ),
+    app_home: Path | None = typer.Option(
+        None,
+        "--app-home",
+        help="Source app home; defaults to the configured runtime.",
+    ),
+    include_references: bool = typer.Option(
+        True,
+        "--include-references/--skip-references",
+        help="Copy reference data into the portable bundle.",
+    ),
+    include_libraries: bool = typer.Option(
+        True,
+        "--include-libraries/--skip-libraries",
+        help="Copy compound libraries into the portable bundle.",
+    ),
+) -> None:
+    """Create a validated portable copy; never modify the source archive."""
+    from mn_ligand.core.portability import PortabilityError, export_portable_runtime
+
+    try:
+        result = export_portable_runtime(
+            destination,
+            source_runs=runs_dir,
+            source_references=reference_dir,
+            source_libraries=library_dir,
+            source_app_home=app_home or configured_app_home(),
+            include_references=include_references,
+            include_libraries=include_libraries,
+        )
+    except (OSError, PortabilityError, ValueError) as exc:
+        typer.echo(f"Portable export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    counts = result["counts"]
+    typer.echo(f"Portable export created: {result['destination']}")
+    typer.echo(f"Source JSON files checked: {counts['source_json_files']}")
+    typer.echo(f"Operational paths rewritten: {counts['rewritten_paths']}")
+    typer.echo("Verification: passed")
+
+
+@portability_app.command(name="verify")
+def portability_verify(
+    destination: Path = typer.Argument(..., help="Portable bundle to verify."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the full JSON report."),
+) -> None:
+    """Verify paths, declared artifacts, and checksums in a portable bundle."""
+    from mn_ligand.core.portability import verify_portable_export
+
+    report = verify_portable_export(destination)
+    if json_output:
+        typer.echo(json.dumps(report, indent=2))
+    else:
+        typer.echo(f"Portable bundle: {report['destination']}")
+        typer.echo(f"Status: {'valid' if report['valid'] else 'invalid'}")
+        for key, value in report["counts"].items():
+            typer.echo(f"{key.replace('_', ' ').title()}: {value}")
+        for error in report["errors"][:20]:
+            typer.echo(f"ERROR {error['file']}: {error['error']}", err=True)
+    if not report["valid"]:
+        raise typer.Exit(code=1)
+
+
+@portability_app.command(name="check-job")
+def portability_check_job(
+    run_dir: Path = typer.Argument(..., help="Job run directory to validate."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the full JSON report."),
+) -> None:
+    """Fail when canonical job metadata contains machine-bound paths."""
+    from mn_ligand.core.portability import validate_job_portability
+
+    report = validate_job_portability(run_dir)
+    if json_output:
+        typer.echo(json.dumps(report, indent=2))
+    else:
+        typer.echo(f"Job: {report['run_dir']}")
+        typer.echo(f"Status: {'portable' if report['valid'] else 'not portable'}")
+        for error in report["errors"][:20]:
+            typer.echo(
+                f"ERROR {error['file']} {error.get('key') or '<value>'}: {error['error']}",
+                err=True,
+            )
+    if not report["valid"]:
+        raise typer.Exit(code=1)
+
+
 @app.command(name="worker")
 def worker(
     once: bool = typer.Option(False, "--once", help="Process at most one runnable job and exit."),
@@ -113,6 +364,12 @@ def worker(
 ) -> None:
     """Run the durable local job worker."""
     from mn_ligand.core.worker import WorkerConfig, run_worker_once, serve_worker
+
+    try:
+        validate_required_mount()
+    except RuntimeError as exc:
+        typer.echo(f"Worker startup refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     selected: tuple[int, ...] | None = None
     if gpu_ids.strip():
@@ -163,8 +420,9 @@ def worker_service_install(
 
     selected = _service_gpu_ids(gpu_ids)
     try:
+        validate_required_mount()
         path = install_worker_service(selected, start=start)
-    except WorkerServiceError as exc:
+    except (RuntimeError, WorkerServiceError) as exc:
         typer.echo(f"Worker service installation failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Installed {path}")

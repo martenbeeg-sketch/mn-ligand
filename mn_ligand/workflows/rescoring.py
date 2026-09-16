@@ -21,6 +21,7 @@ from mn_ligand.core.docker_runner import (
     write_registered_command_record,
 )
 from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, short_job_code
+from mn_ligand.core.portable_paths import portable_path, resolve_stored_path
 from mn_ligand.runtime import runs_root
 from mn_ligand.workflows.docking import DEFAULT_DOCKING_IMAGE
 
@@ -365,7 +366,11 @@ def finalize_gnina_rescoring_job(run_dir: Path, *, returncode: int) -> JobRecord
     run_dir = run_dir.resolve()
     metadata_path = run_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
-    source_dir = Path(str(metadata["selection_run_dir"]))
+    source_dir = resolve_stored_path(
+        metadata["selection_run_dir"], run_dir=run_dir, must_exist=True
+    )
+    if source_dir is None:
+        raise FileNotFoundError("Pose-selection job directory is unavailable")
     source_rows = {
         row["pose_id"]: row
         for row in csv.DictReader(
@@ -539,7 +544,7 @@ def run_gnina_rescoring_job(
         "engine": "gnina",
         "parent_run_id": selection_job.run_id,
         "selection_run_id": selection_job.run_id,
-        "selection_run_dir": str(selection_job.run_dir),
+        "selection_run_dir": portable_path(selection_job.run_dir),
         "source_run_id": selection_job.parent_run_id,
         "source_engine": selection_job.metadata.get("source_engine", ""),
         "pose_count": len(rows),
@@ -610,7 +615,11 @@ def finalize_boltzina_rescoring_job(
     metadata = json.loads(metadata_path.read_text())
     native = run_dir / "output" / "boltzina_results.csv"
     normalized = run_dir / "rescoring_scores.csv"
-    selection_dir = Path(str(metadata["selection_run_dir"]))
+    selection_dir = resolve_stored_path(
+        metadata["selection_run_dir"], run_dir=run_dir, must_exist=True
+    )
+    if selection_dir is None:
+        raise FileNotFoundError("Pose-selection job directory is unavailable")
     selection_rows = {
         row["pose_id"]: row
         for row in csv.DictReader(
@@ -796,11 +805,11 @@ def run_boltzina_rescoring_job(
         "engine": "boltzina",
         "parent_run_id": selection_job.run_id,
         "selection_run_id": selection_job.run_id,
-        "selection_run_dir": str(selection_job.run_dir),
+        "selection_run_dir": portable_path(selection_job.run_dir),
         "source_run_id": selection_job.parent_run_id,
         "source_engine": selection_job.metadata.get("source_engine", ""),
         "pose_count": len(rows),
-        "boltz_work_dir": str(boltz_work_dir),
+        "boltz_work_dir": portable_path(boltz_work_dir),
         "batch_size": max(1, int(batch_size)),
         "seed": int(seed),
         "affinity_mw_correction": bool(affinity_mw_correction),

@@ -23,6 +23,7 @@ from mn_ligand.core.jobs import (
     iter_job_records,
     short_job_code,
 )
+from mn_ligand.core.portable_paths import portable_path
 from mn_ligand.runtime import runs_root
 from mn_ligand.workflows.bound_ligand_md import parse_bound_ligands
 from mn_ligand.workflows.pose_validation import _source_receptor
@@ -987,11 +988,17 @@ def create_complex_dataset(
             ligand_path = child_dir / "selected_ligand.sdf"
             ligand_path.write_text(ligand_sdf_data)
             selection_path = child_dir / "selection.json"
-            selection_payload = {
-                str(key): value
-                for key, value in row.items()
-                if str(key) != "Import"
-            }
+            selection_payload = {}
+            for key, value in row.items():
+                label = str(key)
+                if label == "Import":
+                    continue
+                text = str(value or "")
+                selection_payload[label] = (
+                    portable_path(text)
+                    if "path" in label.lower() and Path(text).is_absolute()
+                    else value
+                )
             _write_json(selection_path, selection_payload)
             source_target_id = str(
                 source_job.metadata.get("prepared_target_run_id")
@@ -1020,17 +1027,27 @@ def create_complex_dataset(
                 "prepared_target_run_id": source_target_id,
                 "source_analysis_run_id": analysis_run_id,
                 "source_pose_id": str(row["Resolved pose ID"]),
-                "source_pose_artifact_path": str(source_path),
+                "source_pose_artifact_path": portable_path(source_path),
                 "source_pose_sdf_index": source_sdf_index,
-                "source_receptor_path": str(
-                    _source_receptor(source_job).resolve()
+                "source_receptor_path": (
+                    portable_path(_source_receptor(source_job))
                     if source_job.task_group == "docking"
                     else ""
                 ),
-                "interaction_evidence_path": str(
-                    row.get("Analysis evidence path")
-                    or row.get("Predicted complex path")
-                    or ""
+                "interaction_evidence_path": (
+                    (
+                        portable_path(evidence_path)
+                        if Path(evidence_path).is_absolute()
+                        else evidence_path
+                    )
+                    if (
+                        evidence_path := str(
+                            row.get("Analysis evidence path")
+                            or row.get("Predicted complex path")
+                            or ""
+                        )
+                    )
+                    else ""
                 ),
                 "source_prediction_job_code": str(row["Source job"]),
                 "complex_dataset_run_id": dataset_id,
@@ -1125,7 +1142,7 @@ def create_complex_dataset(
                             "source_prediction_run_id": source_run_id,
                             "source_analysis_run_id": analysis_run_id,
                             "source_pose_id": str(row["Resolved pose ID"]),
-                            "source_pose_artifact_path": str(source_path),
+                            "source_pose_artifact_path": portable_path(source_path),
                             "source_pose_sdf_index": source_sdf_index,
                             "compound_id": str(row["Compound"]),
                             "selection_status": str(
@@ -1142,7 +1159,7 @@ def create_complex_dataset(
                         metadata={
                             "complex_dataset_run_id": dataset_id,
                             "source_prediction_run_id": source_run_id,
-                            "source_pose_artifact_path": str(source_path),
+                            "source_pose_artifact_path": portable_path(source_path),
                             "source_pose_sdf_index": source_sdf_index,
                             "compound_id": str(row["Compound"]),
                             "smiles": ligand_smiles,

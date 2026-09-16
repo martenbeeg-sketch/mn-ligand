@@ -19,10 +19,16 @@ from mn_ligand.runtime import (
     app_home,
     cpu_process_limit,
     cpu_process_limit_setting,
+    installation_is_configured,
+    installation_settings_path,
+    library_root,
     reference_root,
+    required_mount,
     runs_root,
     runtime_settings_path,
+    save_installation_settings,
     save_runtime_settings,
+    temporary_root,
     unidock_pro_max_compounds,
     vina_compound_timeout_minutes,
 )
@@ -49,13 +55,26 @@ def _path_status(label: str, path: Path) -> dict[str, object]:
 def render() -> None:
     st.title("Settings")
 
+    current_home = app_home()
     current_runs = runs_root(create=False)
     current_references = reference_root(create=False)
+    current_libraries = library_root(create=False)
+    current_tmp = temporary_root(create=False)
+    current_mount = required_mount()
+    if not installation_is_configured():
+        st.warning(
+            "This installation still uses automatic/legacy path discovery. Run "
+            "`mn-ligand init` once, or save this form, to create a durable "
+            "machine-local installation record. Existing data is not moved."
+        )
+    st.caption(f"App home: {current_home}")
     st.dataframe(
         pd.DataFrame(
             [
                 _path_status("Results and jobs", current_runs),
                 _path_status("Reference files", current_references),
+                _path_status("Compound libraries", current_libraries),
+                _path_status("Temporary files", current_tmp),
             ]
         ),
         hide_index=True,
@@ -69,8 +88,30 @@ def render() -> None:
     )
 
     with st.form("runtime_paths"):
+        st.markdown("#### Installation storage")
+        st.text_input(
+            "App home",
+            value=str(current_home),
+            disabled=True,
+            help=(
+                "The bootstrap location cannot be moved safely while the app is "
+                "running. Use mn-ligand init --app-home PATH to configure a new install."
+            ),
+        )
         runs_value = st.text_input("Results and jobs directory", value=str(current_runs))
         references_value = st.text_input("Reference files directory", value=str(current_references))
+        libraries_value = st.text_input(
+            "Compound libraries directory", value=str(current_libraries)
+        )
+        tmp_value = st.text_input("Temporary files directory", value=str(current_tmp))
+        mount_value = st.text_input(
+            "Required data mount (optional)",
+            value=str(current_mount or ""),
+            help=(
+                "When set, the app and workers refuse to start if this path is not "
+                "an active filesystem mount. This prevents writes beneath an unmounted pool."
+            ),
+        )
         st.markdown("#### Compute resources")
         process_limit_value = int(
             st.number_input(
@@ -123,9 +164,15 @@ def render() -> None:
 
     if submitted:
         try:
+            install_target = save_installation_settings(
+                runtime_home=current_home,
+                required_mount_path=mount_value.strip() or None,
+            )
             target = save_runtime_settings(
                 runs_dir=runs_value,
                 reference_dir=references_value,
+                library_dir=libraries_value,
+                tmp_dir=tmp_value,
                 cpu_process_limit=process_limit_value,
                 unidock_pro_batch_limit=unidock_limit_value,
                 vina_compound_timeout=vina_timeout_value,
@@ -138,7 +185,11 @@ def render() -> None:
             except ValueError:
                 config_label = str(target)
             st.success(f"Runtime paths saved in {config_label}")
-            st.warning("Existing jobs are not moved when the results directory changes.")
+            st.caption(f"Installation configuration: {install_target}")
+            st.warning(
+                "Existing data is not moved when a directory changes. Reinstall the "
+                "worker services after changing paths or the required mount."
+            )
 
     st.subheader("Reference readiness")
     expected = (
@@ -164,6 +215,7 @@ def render() -> None:
         column_config={"available": st.column_config.CheckboxColumn("Available")},
     )
     st.caption(f"Configuration: {runtime_settings_path()}")
+    st.caption(f"Installation record: {installation_settings_path()}")
 
     st.subheader("Compound formulation registry")
     st.caption(

@@ -24,6 +24,7 @@ from mn_ligand.core.residue_mapping import (
     identity_residue_mapping,
 )
 from mn_ligand.runtime import PROJECT_DIR, resolve_run_dir, runs_root
+from mn_ligand.modeller_runtime import modeller_python as resolve_modeller_python
 from mn_ligand.ligandx.lib.chemistry.preparation.target_validation import (
     audit_target_geometry,
     prepare_target_for_publication,
@@ -37,11 +38,6 @@ from mn_ligand.workflows.bound_ligand_md import (
 
 
 DEFAULT_PROTEIN_CLEANING_IMAGE = "ovolig-md-cu128:latest"
-DEFAULT_MODELLER_PYTHON = Path(
-    os.environ.get("MN_LIGAND_MODELLER_PYTHON")
-    or "/home/user/mambaforge/envs/mn-ligand-modeller/bin/python"
-)
-
 CANONICAL_AMINO_ACIDS = {
     "ALA": "A",
     "ARG": "R",
@@ -381,7 +377,7 @@ def repair_noncanonical_residues_with_modeller(
     replacements: list[dict[str, str]],
     *,
     work_dir: Path,
-    modeller_python: Path = DEFAULT_MODELLER_PYTHON,
+    modeller_python: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Apply explicit per-site amino-acid replacements with MODELLER."""
     if not replacements:
@@ -419,7 +415,7 @@ def repair_noncanonical_residues_with_modeller(
     _write_json(replacements_path, normalized)
     runner = PROJECT_DIR / "mn_ligand" / "workflows" / "modeller_residue_repair_runner.py"
     command = [
-        str(modeller_python),
+        str(modeller_python or resolve_modeller_python()),
         str(runner),
         "--input",
         str(source_path),
@@ -1181,7 +1177,7 @@ def model_internal_gaps_with_modeller(
     work_dir: Path,
     max_internal_gap: int = 15,
     model_count: int = 10,
-    modeller_python: Path = DEFAULT_MODELLER_PYTHON,
+    modeller_python: Path | None = None,
     user_gap_definitions: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Model every eligible internal sequence gap as a MODELLER ensemble."""
@@ -1230,7 +1226,7 @@ def model_internal_gaps_with_modeller(
         )
         _write_json(ranges_path, eligible)
         command = [
-            str(modeller_python),
+            str(modeller_python or resolve_modeller_python()),
             str(runner),
             "--alignment",
             alignment_path.name,

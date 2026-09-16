@@ -29,6 +29,7 @@ from mn_ligand.core.resources import (
     gpu_ids_from_command,
     select_gpu_in_command,
 )
+from mn_ligand.core.portability import PortabilityError, assert_job_portable
 from mn_ligand.runtime import runs_root
 
 
@@ -386,6 +387,30 @@ def _claim_runnable_job(
                 _block_dependency_job(job, dependency_ids)
                 claim.release()
             continue
+        if job.metadata.get("portability_schema_version"):
+            try:
+                assert_job_portable(job.run_dir)
+            except PortabilityError as exc:
+                claim = acquire_job_claim(
+                    job.run_dir,
+                    run_id=job.run_id,
+                    worker_id=config.worker_id,
+                    stale_after_seconds=config.stale_after_seconds,
+                )
+                if claim is not None:
+                    _record_admission(
+                        job,
+                        request=None,
+                        snapshot=snapshot,
+                        decision=AdmissionDecision(
+                            False,
+                            permanent=True,
+                            reasons=(str(exc),),
+                        ),
+                        status="rejected",
+                    )
+                    claim.release()
+                continue
         try:
             resources = job.metadata.get("resources")
             request = AdmissionRequest.from_dict(

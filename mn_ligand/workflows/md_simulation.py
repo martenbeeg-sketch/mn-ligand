@@ -29,6 +29,7 @@ from mn_ligand.core.docker_runner import (
     write_registered_command_record,
 )
 from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, short_job_code
+from mn_ligand.core.portability import JOB_PORTABILITY_SCHEMA_VERSION, assert_job_portable
 from mn_ligand.core.provenance import compact_target_identifier, target_key
 from mn_ligand.core.residue_mapping import (
     derive_residue_mapping,
@@ -458,6 +459,7 @@ def _new_child(
         run_dir / "metadata.json",
         {
             "schema_version": JOB_SCHEMA_VERSION,
+            "portability_schema_version": JOB_PORTABILITY_SCHEMA_VERSION,
             "run_id": run_id,
             "job_code": short_job_code(run_id),
             "job_type": task_group,
@@ -709,7 +711,7 @@ def create_md_simulation(
     add_workflow_input(workflow.workflow_id, source_job.task_group, source_artifact)
     prep_child = _new_child(
         "md-system-prep",
-        status="queued",
+        status="preparing",
         metadata={
             "workflow": "md-system-prep",
             "structure_run_id": source_job.run_id,
@@ -770,7 +772,14 @@ def create_md_simulation(
         stored_input["ligand_refined_sdf_path"] = "/output/source_ligand_refined.sdf"
     _write_json(prep_child.run_dir / "input.json", stored_input)
     prep_metadata = _read_json(prep_child.run_dir / "metadata.json")
-    prep_metadata["queued_command"] = command
+    prep_metadata.update(
+        {
+            "status": "queued",
+            "queued_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+            "queued_command": command,
+        }
+    )
     _write_json(prep_child.run_dir / "metadata.json", prep_metadata)
     write_registered_command_record(
         prep_child.run_dir,
@@ -778,6 +787,7 @@ def create_md_simulation(
         commands=(command,),
         image=image,
     )
+    assert_job_portable(prep_child.run_dir)
     attach_workflow_child(workflow.workflow_id, prep_child, step_id="preparation_equilibration")
     _create_pending_children(
         workflow,
@@ -2446,6 +2456,7 @@ def create_mmgbsa_analysis_job(
     now = _utc_now_iso()
     metadata = {
         "schema_version": JOB_SCHEMA_VERSION,
+        "portability_schema_version": JOB_PORTABILITY_SCHEMA_VERSION,
         "run_id": run_id,
         "job_code": short_job_code(run_id),
         "job_type": "md_mmgbsa",
@@ -2501,6 +2512,7 @@ def create_mmgbsa_analysis_job(
         image=image,
         selected_gpu_ids=selected_gpu_ids,
     )
+    assert_job_portable(run_dir)
     job = JobRecord.load(run_dir, task_group=MMGBSA_TASK_GROUP)
     if attach_to_workflow and source_job.workflow_id:
         replica_index = int(source_job.metadata.get("repeat_index") or 1)

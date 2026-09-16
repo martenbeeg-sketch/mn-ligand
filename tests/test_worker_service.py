@@ -33,12 +33,18 @@ def test_render_worker_service_uses_explicit_runtime_and_python_paths(tmp_path: 
         project_dir=tmp_path / "project",
         runtime_home=tmp_path / "runtime",
         tmp_dir=tmp_path / "runtime" / "tmp",
+        modeller_executable=tmp_path / "conda" / "envs" / "mn-ligand-modeller" / "bin" / "python",
     )
 
     assert "Requires=docker.service" in unit
     assert "After=docker.service" in unit
     assert f"WorkingDirectory={tmp_path / 'project'}" in unit
     assert f'Environment="MN_LIGAND_APP_HOME={tmp_path / "runtime"}"' in unit
+    assert (
+        f'Environment="MN_LIGAND_MODELLER_PYTHON='
+        f'{tmp_path / "conda" / "envs" / "mn-ligand-modeller" / "bin" / "python"}"'
+        in unit
+    )
     assert 'ExecStart="/opt/mn/bin/python" -m mn_ligand.cli worker' in unit
     assert "--gpu-ids %i --worker-id mn-ligand-gpu-%i" in unit
     assert "--job-class gpu" in unit
@@ -58,6 +64,19 @@ def test_render_cpu_worker_service_has_no_gpu_scope(tmp_path: Path) -> None:
     assert "Description=mn-ligand durable CPU worker" in unit
     assert "--worker-id mn-ligand-cpu-0 --job-class cpu" in unit
     assert "--gpu-ids" not in unit
+
+
+def test_worker_units_require_configured_data_mount(tmp_path: Path) -> None:
+    mount = tmp_path / "data"
+    unit = render_worker_service(
+        runtime_home=mount / "mn-ligand",
+        tmp_dir=mount / "mn-ligand" / "tmp",
+        required_mount_path=mount,
+    )
+
+    assert f'RequiresMountsFor="{mount}"' in unit
+    assert f'ConditionPathIsMountPoint="{mount}"' in unit
+    assert f'Environment="MN_LIGAND_REQUIRED_MOUNT={mount}"' in unit
 
 
 def test_install_writes_template_and_enables_selected_instances(tmp_path: Path) -> None:

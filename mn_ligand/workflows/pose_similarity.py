@@ -16,6 +16,7 @@ import pandas as pd
 
 from mn_ligand.core.artifacts import ArtifactRef, write_artifact_manifest
 from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, short_job_code
+from mn_ligand.core.portable_paths import portable_path, resolve_stored_path
 from mn_ligand.runtime import NATIVE_THREAD_ENVIRONMENT, adaptive_cpu_workers, runs_root
 
 
@@ -43,6 +44,24 @@ def _normalise(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _portable_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    path_keys = {"reference_path", "reference_ligand_path", "source_path"}
+
+    def encode(value: Any, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {
+                str(child_key): encode(child, str(child_key))
+                for child_key, child in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [encode(child, key) for child in value]
+        if key in path_keys and value:
+            return portable_path(str(value))
+        return _normalise(value)
+
+    return [encode(context) for context in contexts]
 
 
 def _signature(contexts: list[dict[str, Any]]) -> str:
@@ -96,7 +115,13 @@ def queue_pose_similarity_job(contexts: list[dict[str, Any]]) -> JobRecord:
     run_dir = group_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     now = _now()
-    _write_json(run_dir / "input.json", {"schema_version": POSE_SIMILARITY_SCHEMA_VERSION, "contexts": _normalise(contexts)})
+    _write_json(
+        run_dir / "input.json",
+        {
+            "schema_version": POSE_SIMILARITY_SCHEMA_VERSION,
+            "contexts": _portable_contexts(contexts),
+        },
+    )
     _write_json(run_dir / "metadata.json", {
         "schema_version": JOB_SCHEMA_VERSION,
         "run_id": run_id,
@@ -149,7 +174,9 @@ def load_pose_similarity_results(job: JobRecord) -> dict[str, tuple[pd.DataFrame
     return {str(key): _result_frame(value) for key, value in (payload.get("contexts") or {}).items() if isinstance(value, dict)}
 
 
-def _calculate_context(context: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _calculate_context(
+    context: dict[str, Any], run_dir: Path | None = None
+) -> tuple[str, dict[str, Any]]:
     """One independent target–compound comparison, safe for a CPU process."""
     os.environ["MN_LIGAND_POSE_SIMILARITY_WORKER"] = "1"
     from mn_ligand.app.pages.campaign_comparison import (  # noqa: PLC0415
@@ -157,11 +184,22 @@ def _calculate_context(context: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     )
     from mn_ligand.app.viewers import aligned_structure_data  # noqa: PLC0415
 
-    reference_path = Path(str(context["reference_path"]))
+    reference_path = resolve_stored_path(
+        context["reference_path"], run_dir=run_dir, must_exist=True
+    )
+    if reference_path is None:
+        raise FileNotFoundError("Pose-similarity reference structure is unavailable")
     rendered: list[dict[str, object]] = []
     for item in context.get("rendered") or []:
         row = pd.Series(item.get("row") or {})
-        source_path = _preferred_viewer_structure_path(Path(str(item["source_path"])), structure_kind=str(item.get("kind") or ""))
+        resolved_source = resolve_stored_path(
+            item["source_path"], run_dir=run_dir, must_exist=True
+        )
+        if resolved_source is None:
+            raise FileNotFoundError("Pose-similarity source structure is unavailable")
+        source_path = _preferred_viewer_structure_path(
+            resolved_source, structure_kind=str(item.get("kind") or "")
+        )
         kind = str(item.get("kind") or "")
         if kind == "complex":
             data, _rmsd, _matched = aligned_structure_data(str(reference_path), reference_path.stat().st_mtime_ns, str(source_path), source_path.stat().st_mtime_ns)
@@ -169,7 +207,18 @@ def _calculate_context(context: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             data, _format = _model_text(source_path, int(row.get("_viewer_pose_index") or 1))
         rendered.append({"row": row, "data": data, "kind": kind, "source_path": source_path})
     reference_data, _ = _model_text(reference_path)
-    matrix, pairs, warnings = _pose_similarity_tables(rendered, reference_structure_data=reference_data, reference_ligand_path=Path(str(context.get("reference_ligand_path") or "")) if context.get("reference_ligand_path") else None)
+    reference_ligand = (
+        resolve_stored_path(
+            context.get("reference_ligand_path"), run_dir=run_dir, must_exist=True
+        )
+        if context.get("reference_ligand_path")
+        else None
+    )
+    matrix, pairs, warnings = _pose_similarity_tables(
+        rendered,
+        reference_structure_data=reference_data,
+        reference_ligand_path=reference_ligand,
+    )
     return str(context["key"]), {
         "matrix": {"index": matrix.index.tolist(), "columns": matrix.columns.tolist(), "data": matrix.where(pd.notna(matrix), None).values.tolist()},
         "pairs": pairs.where(pd.notna(pairs), None).to_dict(orient="records"), "warnings": warnings,
@@ -189,7 +238,10 @@ def run_pose_similarity_job(run_dir: Path) -> None:
     )
     output: dict[str, Any] = {"schema_version": POSE_SIMILARITY_SCHEMA_VERSION, "contexts": {}}
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_calculate_context, context) for context in contexts]
+        futures = [
+            executor.submit(_calculate_context, context, run_dir)
+            for context in contexts
+        ]
         for index, future in enumerate(as_completed(futures), start=1):
             key, result = future.result()
             output["contexts"][key] = result

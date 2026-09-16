@@ -91,6 +91,17 @@ def _host_path_to_container_path(path: Path | None) -> str:
 
 
 def render() -> None:
+    st.title("MD Production (legacy)")
+    st.warning(
+        "This legacy submission page is read-only because it stored machine-specific "
+        "host paths. Use MD Simulation to continue prepared systems or launch new runs."
+    )
+    if st.button("Open MD Simulation", type="primary"):
+        st.switch_page("app/pages/md_simulation.py")
+    return
+
+    # Historical implementation retained below for compatibility with helper
+    # imports and old records. It is deliberately unreachable for submissions.
     try_dispatch_next_queued_gpu_job()
     st.title("MD Production")
     st.caption("MD Production UI revision: 2026-05-07-preset-fix-r4")

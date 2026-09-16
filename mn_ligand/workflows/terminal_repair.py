@@ -22,6 +22,7 @@ from mn_ligand.core.provenance import (
     modification_history,
 )
 from mn_ligand.runtime import runs_root
+from mn_ligand.modeller_runtime import modeller_python as resolve_modeller_python
 from mn_ligand.ligandx.lib.chemistry.preparation.target_validation import (
     prepare_target_for_publication,
 )
@@ -29,9 +30,6 @@ from mn_ligand.workflows.target_trimming import POLYMER_RESIDUES
 
 
 TASK_GROUP = "terminal-repair"
-DEFAULT_MODELLER_PYTHON = Path(
-    "/home/user/mambaforge/envs/mn-ligand-modeller/bin/python"
-)
 MODELLER_RUNNER = Path(__file__).resolve().parent / "modeller_terminal_extension_runner.py"
 ONE_LETTER = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -57,7 +55,7 @@ def _utc_now_iso() -> str:
 
 
 def modeller_python() -> Path:
-    return Path(os.environ.get("MN_LIGAND_MODELLER_PYTHON") or DEFAULT_MODELLER_PYTHON)
+    return resolve_modeller_python()
 
 
 def modeller_readiness() -> tuple[bool, str]:

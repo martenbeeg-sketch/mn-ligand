@@ -147,6 +147,17 @@ def _collect_md_system_prep_jobs() -> list[dict]:
 
 
 def render() -> None:
+    st.title("MD System Preparation (legacy)")
+    st.warning(
+        "This legacy submission page is read-only because it stored machine-specific "
+        "host paths. Use MD Simulation for all new preparation and production jobs."
+    )
+    if st.button("Open MD Simulation", type="primary"):
+        st.switch_page("app/pages/md_simulation.py")
+    return
+
+    # Historical implementation retained below for compatibility with helper
+    # imports and old records. It is deliberately unreachable for submissions.
     try_dispatch_next_queued_gpu_job()
     mode = str(st.session_state.get("md_task_mode", "system_prep") or "system_prep")
     is_production_mode = mode == "production"

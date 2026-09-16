@@ -259,6 +259,54 @@ conda env update -f environment.yml --prune
 pip install -e .
 ```
 
+### Install the optional MODELLER environment
+
+Protein residue repair, internal-gap modeling, and C-terminal extension use a
+separate `mn-ligand-modeller` Conda environment. Other workflows do not require
+it. MODELLER requires a license key; obtain one under the terms published by
+the MODELLER project. Never save the key in this repository or in the
+environment YAML file.
+
+Create the environment while providing the key only to the installer:
+
+```bash
+read -rsp "MODELLER license key: " KEY_MODELLER
+echo
+export KEY_MODELLER
+CONDA_CHANNEL_PRIORITY=strict conda env create -f environment-modeller.yml
+unset KEY_MODELLER
+```
+
+Verify the installation:
+
+```bash
+conda run -n mn-ligand-modeller \
+  python -c "import modeller; print(modeller.__version__)"
+```
+
+When `mn-ligand-modeller` is beside the main environment in the same Conda
+installation, mn-ligand discovers it automatically. Verify the resolved path
+on the terminal-repair page. For a custom environment name or location,
+override it explicitly:
+
+```bash
+MODELLER_PREFIX="$(conda run -n mn-ligand-modeller python -c \
+  'import sys; print(sys.prefix)')"
+export MN_LIGAND_MODELLER_PYTHON="$MODELLER_PREFIX/bin/python"
+```
+
+Set `MN_LIGAND_MODELLER_PYTHON` in every shell that starts the app or worker
+only when using this override. Worker-service installation records either the
+override or the automatically discovered interpreter directly in its unit.
+After changing the override, reinstall the units to record the new path:
+
+```bash
+mn-ligand worker-service install --gpu-ids 0
+```
+
+Replace `0` with the GPU IDs installed on that workstation. The application
+reports MODELLER readiness on the terminal-repair page.
+
 ## Build Containers
 
 If the Docker images are not already available locally:
@@ -302,29 +350,164 @@ Settings page. The default shared location is
 
 ## Run The App
 
+Initialize each workstation once before starting the app. This writes a small
+bootstrap record to `${XDG_CONFIG_HOME:-$HOME/.config}/mn-ligand/installation.json`
+and the detailed runtime settings below the selected app home. App processes
+and worker services then use the same paths without shell exports.
+
+For local user storage:
+
+```bash
+mn-ligand init
+```
+
+For a dedicated or pooled data filesystem, name the mount explicitly:
+
+```bash
+mn-ligand init \
+  --app-home /home/compute/data/mn-ligand \
+  --runs-dir /home/compute/data/mn-ligand/workdir/runs \
+  --reference-dir /home/compute/data/mn-ligand/reference_files \
+  --library-dir /home/compute/data/mn-ligand/libraries \
+  --tmpdir /home/compute/data/mn-ligand/tmp \
+  --require-mount /home/compute/data
+```
+
+The required-mount guard refuses to start the app or workers when the pool is
+not mounted, preventing accidental writes into the hidden directory on the
+system disk. Install worker units after initialization so the same mount guard
+is written into systemd:
+
+```bash
+mn-ligand worker-service install --gpu-ids 0,1
+```
+
+Custom split storage is supported with `--runs-dir`, `--reference-dir`,
+`--library-dir`, and `--tmpdir`. The same values can be inspected or changed
+under `System > Settings`; changing a path does not move existing data, and
+worker units must be reinstalled afterward.
+
 ```bash
 mn-ligand app
 ```
 
-The command creates runtime folders automatically. `mn-ligand init` is optional
-and only pre-creates those folders.
+For compatibility with established installations, the app still starts without
+an installation record and uses the automatic paths below. The Settings page
+shows a warning until the record has been created.
 
-Default runtime paths:
+On a new workstation, runtime files default to the standard per-user data
+location:
 
 ```text
-app home: /mnt/data/RESULTS/mn-ligand-workdir
-runs:     /mnt/data/RESULTS/mn-ligand-workdir/workdir/runs
-tmp:      /mnt/data/RESULTS/mn-ligand-workdir/tmp
+app home: ${XDG_DATA_HOME:-$HOME/.local/share}/mn-ligand
+runs:     <app home>/workdir/runs
+tmp:      <app home>/tmp
 ```
 
-The checkout keeps `./mn-ligand-workdir` as a compatibility symlink so
-historical metadata containing the former absolute path continues to resolve.
+For backward compatibility, an existing
+`/mnt/data/RESULTS/mn-ligand-workdir` deployment is detected and retained
+automatically. The checkout may also keep `./mn-ligand-workdir` as a
+compatibility symlink so historical metadata containing the former absolute
+path continues to resolve.
 
 You can override the runtime location:
 
 ```bash
 mn-ligand app --app-home /path/to/mn-ligand-runtime
 ```
+
+### Audit an existing runtime before relocation
+
+Historical job metadata may record absolute host paths even though declared
+artifacts are run-relative. The compatibility resolver always uses an existing
+recorded path first, so this workstation's archive is unchanged. If that path
+does not exist after a transfer, it can remap historical `workdir/runs`,
+`reference_files`, and `libraries` paths to the currently configured roots.
+New cross-job metadata uses portable `runs:///`, `reference:///`,
+`library:///`, or `app:///` references.
+
+Run the read-only audit before copying data:
+
+```bash
+mn-ligand portability audit
+mn-ligand portability audit --json > portability-audit.json
+```
+
+To inspect a staged copy without changing runtime configuration:
+
+```bash
+mn-ligand portability audit --runs-dir /path/to/copied/workdir/runs
+```
+
+The audit never writes into the runtime tree. Container-internal paths and
+historical commands are classified separately and retained as provenance.
+
+### Create a portable runtime copy
+
+Stop the worker services after active jobs have reached a terminal state, then
+export to a new, nonexistent directory:
+
+```bash
+mn-ligand worker-service stop --gpu-ids 0,1
+mn-ligand portability export /path/to/transfer/mn-ligand
+mn-ligand portability verify /path/to/transfer/mn-ligand
+```
+
+New-schema jobs are checked again by the worker before execution. A job with a
+machine-specific operational path is rejected before its command starts. Run
+the same CI/preflight check explicitly with:
+
+```bash
+mn-ligand portability check-job /path/to/workdir/runs/TASK/RUN_ID
+```
+
+The hidden legacy MD System Preparation and MD Production pages remain only as
+read-only compatibility landing pages. Use **MD Simulation** for new jobs; it
+stages source inputs into the run and records artifact-relative or
+container-local paths.
+
+The export command copies the configured app data into the standard portable
+layout:
+
+```text
+mn-ligand/
+├── workdir/runs/
+├── reference_files/
+├── libraries/
+├── portable-export.json
+└── migration-report.json
+```
+
+References and libraries are included by default for a self-contained copy.
+Use `--skip-references` or `--skip-libraries` only when the corresponding data
+is not referenced by exported operational metadata; otherwise validation
+fails. Machine-local configuration and temporary files are deliberately not
+copied.
+
+Export is staged beside the requested destination and published only after
+verification succeeds. It refuses to run when the destination exists, a job is
+queued/running/paused, an operational path cannot be resolved, a declared
+artifact is absent or has the wrong checksum, or source JSON changes while the
+copy is being made. Commands, container paths, and provenance remain unchanged.
+
+On the destination machine, copy the bundle to its final data location and
+create that machine's installation record:
+
+```bash
+mn-ligand init \
+  --app-home /home/compute/data/mn-ligand \
+  --runs-dir /home/compute/data/mn-ligand/workdir/runs \
+  --reference-dir /home/compute/data/mn-ligand/reference_files \
+  --library-dir /home/compute/data/mn-ligand/libraries \
+  --tmpdir /home/compute/data/mn-ligand/tmp \
+  --require-mount /home/compute/data
+mn-ligand portability verify /home/compute/data/mn-ligand
+mn-ligand worker-service install --gpu-ids 0,1
+```
+
+The source archive is never rewritten. Newly encoded operational references in
+the copy use `runs:///`, `reference:///`, `library:///`, and `app:///` and are
+resolved against the destination machine's configured roots.
 
 You can pass Streamlit options through:
 

@@ -89,7 +89,7 @@ services:
   boltzina:
     image: ovolig-boltzina-cu128:latest
     build:
-      context: ./mn_ligand/containers/boltzina
+      context: ./containers/boltzina
       dockerfile: Dockerfile.cu128
       platforms: ["linux/x86_64"]
 

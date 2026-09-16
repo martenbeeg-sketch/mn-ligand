@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Callable, Sequence
 from uuid import uuid4
 
-from mn_ligand.runtime import PROJECT_DIR, app_home, temporary_root
+from mn_ligand.runtime import PROJECT_DIR, app_home, required_mount, temporary_root
+from mn_ligand.modeller_runtime import modeller_python
 
 
 SERVICE_TEMPLATE_NAME = "mn-ligand-worker@.service"
@@ -64,11 +65,22 @@ def render_worker_service(
     project_dir: str | Path = PROJECT_DIR,
     runtime_home: str | Path | None = None,
     tmp_dir: str | Path | None = None,
+    modeller_executable: str | Path | None = None,
+    required_mount_path: str | Path | None = None,
 ) -> str:
     resolved_python = Path(python_executable).expanduser().absolute()
     resolved_project = Path(project_dir).expanduser().resolve()
     resolved_home = Path(runtime_home or app_home()).expanduser().resolve()
     resolved_tmp = Path(tmp_dir or temporary_root()).expanduser().resolve()
+    resolved_modeller = (
+        Path(modeller_executable or modeller_python()).expanduser().resolve()
+    )
+    mount_value = (
+        required_mount_path
+        if required_mount_path is not None
+        else required_mount()
+    )
+    resolved_mount = Path(mount_value).expanduser().resolve() if mount_value else None
     path_value = ":".join(
         dict.fromkeys(
             (
@@ -96,19 +108,37 @@ def render_worker_service(
             "gpu",
         )
     )
-    return "\n".join(
+    unit_lines = [
+        "[Unit]",
+        "Description=mn-ligand durable worker for GPU %i",
+        "Documentation=file:" + str(resolved_project / "README.md"),
+        "Requires=docker.service",
+        "After=docker.service",
+    ]
+    if resolved_mount is not None:
+        unit_lines.extend(
+            (
+                f"RequiresMountsFor={_systemd_quote(resolved_mount)}",
+                f"ConditionPathIsMountPoint={_systemd_quote(resolved_mount)}",
+            )
+        )
+    unit_lines.extend(
         (
-            "[Unit]",
-            "Description=mn-ligand durable worker for GPU %i",
-            "Documentation=file:" + str(resolved_project / "README.md"),
-            "Requires=docker.service",
-            "After=docker.service",
             "",
             "[Service]",
             "Type=simple",
             f"WorkingDirectory={resolved_project}",
             f"Environment={_systemd_quote(f'MN_LIGAND_APP_HOME={resolved_home}')}",
             f"Environment={_systemd_quote(f'MN_LIGAND_TMP_DIR={resolved_tmp}')}",
+            f"Environment={_systemd_quote(f'MN_LIGAND_MODELLER_PYTHON={resolved_modeller}')}",
+            *(
+                (
+                    "Environment="
+                    + _systemd_quote(f"MN_LIGAND_REQUIRED_MOUNT={resolved_mount}"),
+                )
+                if resolved_mount is not None
+                else ()
+            ),
             f"Environment={_systemd_quote(f'TMPDIR={resolved_tmp}')}",
             f"Environment={_systemd_quote(f'PATH={path_value}')}",
             'Environment="PYTHONUNBUFFERED=1"',
@@ -124,6 +154,7 @@ def render_worker_service(
             "",
         )
     )
+    return "\n".join(unit_lines)
 
 
 def render_cpu_worker_service(
@@ -132,11 +163,22 @@ def render_cpu_worker_service(
     project_dir: str | Path = PROJECT_DIR,
     runtime_home: str | Path | None = None,
     tmp_dir: str | Path | None = None,
+    modeller_executable: str | Path | None = None,
+    required_mount_path: str | Path | None = None,
 ) -> str:
     resolved_python = Path(python_executable).expanduser().absolute()
     resolved_project = Path(project_dir).expanduser().resolve()
     resolved_home = Path(runtime_home or app_home()).expanduser().resolve()
     resolved_tmp = Path(tmp_dir or temporary_root()).expanduser().resolve()
+    resolved_modeller = (
+        Path(modeller_executable or modeller_python()).expanduser().resolve()
+    )
+    mount_value = (
+        required_mount_path
+        if required_mount_path is not None
+        else required_mount()
+    )
+    resolved_mount = Path(mount_value).expanduser().resolve() if mount_value else None
     path_value = ":".join(
         dict.fromkeys(
             (
@@ -162,19 +204,37 @@ def render_cpu_worker_service(
             "cpu",
         )
     )
-    return "\n".join(
+    unit_lines = [
+        "[Unit]",
+        "Description=mn-ligand durable CPU worker",
+        "Documentation=file:" + str(resolved_project / "README.md"),
+        "Requires=docker.service",
+        "After=docker.service",
+    ]
+    if resolved_mount is not None:
+        unit_lines.extend(
+            (
+                f"RequiresMountsFor={_systemd_quote(resolved_mount)}",
+                f"ConditionPathIsMountPoint={_systemd_quote(resolved_mount)}",
+            )
+        )
+    unit_lines.extend(
         (
-            "[Unit]",
-            "Description=mn-ligand durable CPU worker",
-            "Documentation=file:" + str(resolved_project / "README.md"),
-            "Requires=docker.service",
-            "After=docker.service",
             "",
             "[Service]",
             "Type=simple",
             f"WorkingDirectory={resolved_project}",
             f"Environment={_systemd_quote(f'MN_LIGAND_APP_HOME={resolved_home}')}",
             f"Environment={_systemd_quote(f'MN_LIGAND_TMP_DIR={resolved_tmp}')}",
+            f"Environment={_systemd_quote(f'MN_LIGAND_MODELLER_PYTHON={resolved_modeller}')}",
+            *(
+                (
+                    "Environment="
+                    + _systemd_quote(f"MN_LIGAND_REQUIRED_MOUNT={resolved_mount}"),
+                )
+                if resolved_mount is not None
+                else ()
+            ),
             f"Environment={_systemd_quote(f'TMPDIR={resolved_tmp}')}",
             f"Environment={_systemd_quote(f'PATH={path_value}')}",
             'Environment="PYTHONUNBUFFERED=1"',
@@ -190,6 +250,7 @@ def render_cpu_worker_service(
             "",
         )
     )
+    return "\n".join(unit_lines)
 
 
 def _run(
@@ -220,6 +281,8 @@ def install_worker_service(
     project_dir: str | Path = PROJECT_DIR,
     runtime_home: str | Path | None = None,
     tmp_dir: str | Path | None = None,
+    modeller_executable: str | Path | None = None,
+    required_mount_path: str | Path | None = None,
     runner: ServiceRunner = subprocess.run,
 ) -> Path:
     selected = tuple(dict.fromkeys(int(value) for value in gpu_ids))
@@ -235,6 +298,8 @@ def install_worker_service(
             project_dir=project_dir,
             runtime_home=runtime_home,
             tmp_dir=tmp_dir,
+            modeller_executable=modeller_executable,
+            required_mount_path=required_mount_path,
         )
     )
     temporary.replace(destination)
@@ -248,6 +313,8 @@ def install_worker_service(
             project_dir=project_dir,
             runtime_home=runtime_home,
             tmp_dir=tmp_dir,
+            modeller_executable=modeller_executable,
+            required_mount_path=required_mount_path,
         )
     )
     cpu_temporary.replace(cpu_destination)

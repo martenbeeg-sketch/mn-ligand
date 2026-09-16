@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from mn_ligand import runtime
 
 
@@ -16,6 +18,8 @@ RUNTIME_ENV_VARS = {
     "MN_LIGAND_TMP_DIR",
     "MN_LIGAND_INPUT_DIR",
     "MN_LIGAND_CONFIG",
+    "MN_LIGAND_INSTALL_CONFIG",
+    "MN_LIGAND_REQUIRED_MOUNT",
     "MN_LIGAND_CPU_PROCESS_LIMIT",
     "MN_LIGAND_UNIDOCK_PRO_MAX_COMPOUNDS",
     "TMPDIR",
@@ -26,21 +30,30 @@ def _without_runtime_environment() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key not in RUNTIME_ENV_VARS}
 
 
-def test_defaults_use_external_results_storage() -> None:
+def test_defaults_preserve_legacy_storage_when_present() -> None:
     with patch.dict(os.environ, _without_runtime_environment(), clear=True):
-        assert runtime.app_home() == Path("/mnt/data/RESULTS/mn-ligand-workdir")
-        assert runtime.runs_root(create=False) == (
-            Path("/mnt/data/RESULTS/mn-ligand-workdir/workdir/runs")
-        )
+        expected_home = runtime.DEFAULT_APP_HOME.resolve()
+        assert runtime.app_home() == expected_home
+        assert runtime.runs_root(create=False) == expected_home / "workdir" / "runs"
         expected_references = (
             runtime.SHARED_REFERENCE_DIR
             if runtime.SHARED_REFERENCE_DIR.is_dir()
-            else Path("/mnt/data/RESULTS/mn-ligand-workdir/reference_files")
+            else expected_home / "reference_files"
         )
         assert runtime.reference_root() == expected_references
-        assert runtime.library_root() == Path("/mnt/data/RESULTS/mn-ligand-workdir/libraries")
-        assert runtime.temporary_root() == Path("/mnt/data/RESULTS/mn-ligand-workdir/tmp")
+        assert runtime.library_root() == expected_home / "libraries"
+        assert runtime.temporary_root() == expected_home / "tmp"
         assert runtime.input_root(create=False) == Path("/tmp/mn-ligand-inputs")
+
+
+def test_fresh_install_uses_xdg_user_data_directory(tmp_path: Path) -> None:
+    env = _without_runtime_environment()
+    env["XDG_DATA_HOME"] = str(tmp_path / "xdg-data")
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch.object(runtime, "LEGACY_APP_HOME", tmp_path / "missing-legacy"),
+    ):
+        assert runtime.default_app_home() == tmp_path / "xdg-data" / "mn-ligand"
 
 
 def test_app_home_derives_portable_subdirectories() -> None:
@@ -102,6 +115,32 @@ def test_persisted_runtime_paths_are_loaded_and_created(tmp_path: Path) -> None:
         assert runtime.cpu_process_limit_setting() == 12
         assert runtime.cpu_process_limit() == 12
         assert runtime.unidock_pro_max_compounds() == 15_000
+        assert runtime.temporary_root() == (tmp_path / "home" / "tmp").resolve()
+
+
+def test_installation_record_bootstraps_app_home(tmp_path: Path) -> None:
+    env = _without_runtime_environment()
+    env["MN_LIGAND_INSTALL_CONFIG"] = str(tmp_path / "config" / "installation.json")
+    installed_home = tmp_path / "data" / "mn-ligand"
+    with patch.dict(os.environ, env, clear=True):
+        target = runtime.save_installation_settings(runtime_home=installed_home)
+        os.environ.pop("MN_LIGAND_APP_HOME", None)
+
+        assert target == (tmp_path / "config" / "installation.json").resolve()
+        assert runtime.installation_is_configured()
+        assert runtime.app_home() == installed_home.resolve()
+
+
+def test_missing_required_mount_is_rejected_before_directory_creation(
+    tmp_path: Path,
+) -> None:
+    env = _without_runtime_environment()
+    env["MN_LIGAND_REQUIRED_MOUNT"] = str(tmp_path / "unmounted-pool")
+    with patch.dict(os.environ, env, clear=True):
+        with pytest.raises(RuntimeError, match="not mounted"):
+            runtime.ensure_runtime_home(tmp_path / "unmounted-pool" / "app")
+
+    assert not (tmp_path / "unmounted-pool" / "app").exists()
 
 
 def test_cpu_process_limit_supports_automatic_and_environment_override(

@@ -1,0 +1,7 @@
+name: mn-ligand-modeller
+channels:
+  - salilab
+  - conda-forge
+dependencies:
+  - python=3.11
+  - modeller=10.8

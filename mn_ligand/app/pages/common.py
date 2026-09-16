@@ -20,6 +20,7 @@ from mn_ligand.core.docker_runner import (
     write_registered_command_record,
 )
 from mn_ligand.core.jobs import display_job_code, iter_job_records, short_job_code
+from mn_ligand.core.portable_paths import resolve_stored_path
 from mn_ligand.runtime import input_root, runs_root
 
 
@@ -193,36 +194,8 @@ def _run_root() -> Path:
 
 
 def resolve_run_artifact_path(path_value: str | Path | None, *, must_exist: bool = False) -> Path | None:
-    """Resolve artifact paths across legacy and current run-root layouts.
-
-    Supports old absolute paths from:
-    .../ovo-ligand/.ovo-home/workdir/runs/<...>
-    by remapping them under the current `_run_root()`.
-    """
-    if path_value is None:
-        return None
-    raw = str(path_value).strip()
-    if not raw:
-        return None
-
-    candidate = Path(raw).expanduser()
-    if candidate.exists():
-        return candidate
-
-    marker = "/.ovo-home/workdir/runs/"
-    mapped: Path | None = None
-    normalized = raw.replace("\\", "/")
-    if marker in normalized:
-        rel = normalized.split(marker, 1)[1].lstrip("/")
-        mapped = _run_root() / rel
-    elif not candidate.is_absolute():
-        mapped = _run_root() / candidate
-
-    if mapped is None:
-        return None if must_exist else candidate
-    if must_exist and not mapped.exists():
-        return None
-    return mapped
+    """Resolve artifact paths across current and historical runtime roots."""
+    return resolve_stored_path(path_value, must_exist=must_exist)
 
 
 def _gpu_lock_path() -> Path:

@@ -290,6 +290,35 @@ def test_worker_fails_malformed_gpu_request_without_stranding_claim(tmp_path: Pa
     assert not (run_dir / ".worker-claim.json").exists()
 
 
+def test_worker_rejects_new_schema_job_with_absolute_host_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(tmp_path))
+    run_dir = _queue(
+        tmp_path,
+        "portable-1",
+        [sys.executable, "-c", "print('must not run')"],
+    )
+    metadata_path = run_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["portability_schema_version"] = 1
+    metadata_path.write_text(json.dumps(metadata))
+    (run_dir / "input.json").write_text(
+        json.dumps({"source_path": "/home/old-machine/source.pdb"})
+    )
+
+    result = run_worker_once(
+        WorkerConfig.create(runs_dir=tmp_path, gpu_ids=(), heartbeat_seconds=0.05)
+    )
+
+    assert result is None
+    rejected = json.loads(metadata_path.read_text())
+    assert rejected["status"] == "failed"
+    assert rejected["admission"]["status"] == "rejected"
+    assert "portability validation failed" in rejected["error"].lower()
+    assert not (run_dir / ".worker-claim.json").exists()
+
+
 def test_worker_marks_nonzero_process_failed(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(tmp_path))
     run_dir = _queue(tmp_path, "run-3", [sys.executable, "-c", "raise SystemExit(3)"])

@@ -25,6 +25,7 @@ from mn_ligand.core.docker_runner import (
     write_registered_command_record,
 )
 from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, short_job_code
+from mn_ligand.core.portable_paths import portable_path, resolve_stored_path
 from mn_ligand.runtime import reference_root, runs_root
 
 
@@ -222,7 +223,9 @@ def prepare_msa_dependent_commands(
     prepared = [list(command) for command in commands]
     if not metadata.get("msa_preparation_required"):
         return prepared
-    repository = Path(str(metadata.get("msa_repository_dir") or "")).expanduser()
+    repository = resolve_stored_path(metadata.get("msa_repository_dir"), must_exist=True)
+    if repository is None:
+        raise RuntimeError("Required MSA repository is unavailable")
     if not repository.is_dir():
         raise RuntimeError(f"Required MSA repository is unavailable: {repository}")
     workflow = str(metadata.get("workflow") or "")
@@ -552,8 +555,8 @@ def alphafast_readiness(
     weights_dir = Path(weights_dir).expanduser().resolve()
     weights = sorted(weights_dir.glob("af3*.bin.zst")) if weights_dir.is_dir() else []
     return {
-        "database_dir": str(db_dir),
-        "weights_dir": str(weights_dir),
+        "database_dir": portable_path(db_dir),
+        "weights_dir": portable_path(weights_dir),
         "database_ready": db_dir.is_dir() and (db_dir / "mmseqs").is_dir(),
         "weights_ready": bool(weights),
         "weights_files": [path.name for path in weights],
@@ -656,7 +659,9 @@ def finalize_alphafold3_msa_job(run_dir: Path, *, returncode: int) -> JobRecord:
     run_dir = Path(run_dir).resolve()
     metadata_path = run_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
-    repository = Path(str(metadata.get("msa_repository_dir") or "")).expanduser()
+    repository = resolve_stored_path(metadata.get("msa_repository_dir"), must_exist=True)
+    if repository is None:
+        raise RuntimeError("Required MSA repository is unavailable")
     sequences = list(
         dict.fromkeys(
             _clean_sequence(value)
@@ -865,7 +870,7 @@ def queue_alphafold3_msa_job(
         "protein_sequence": sequences[0],
         "protein_sequences": sequences,
         "protein_sequence_count": len(sequences),
-        "msa_repository_dir": str(repository.expanduser().resolve()),
+        "msa_repository_dir": portable_path(repository),
         "launch_campaign_id": str(launch_campaign_id),
         "launch_campaign_label": str(launch_campaign_label),
         "campaign_purpose": str(campaign_purpose),
@@ -924,7 +929,7 @@ def queue_alphafold3_msa_job(
                     hashlib.sha256(sequence.encode()).hexdigest()
                     for sequence in sequences
                 ],
-                "msa_repository_dir": str(repository.expanduser().resolve()),
+                "msa_repository_dir": portable_path(repository),
                 "gpu_device": str(gpu_device) if use_gpu else "cpu",
                 "use_mmseqs_gpu": bool(use_gpu),
                 "mmseqs_cpu_threads": (
@@ -1041,7 +1046,10 @@ def finalize_alphafold3_refolding_job(run_dir: Path, *, returncode: int) -> JobR
     repository_value = str(metadata.get("msa_repository_dir") or "")
     if returncode == 0 and repository_value and (run_dir / "data").is_dir():
         try:
-            msa_metrics.update(cache_generated_msas(run_dir / "data", Path(repository_value)))
+            repository = resolve_stored_path(repository_value, must_exist=True)
+            if repository is None:
+                raise FileNotFoundError("Configured MSA repository is unavailable")
+            msa_metrics.update(cache_generated_msas(run_dir / "data", repository))
         except Exception as exc:
             msa_metrics["cache_error"] = str(exc)
     artifacts, metrics = _collect_alphafast_outputs(run_dir) if returncode == 0 else ([], [])
@@ -1162,7 +1170,7 @@ def run_alphafold3_refolding_job(
         "tool": "AlphaFold 3", "engine": "AlphaFold 3", "docker_image": image,
         "parent_run_id": target_artifact.run_id, "use_gpu": True,
         "gpu_device": str(gpu_device), "compound_count": len(compounds),
-        "msa_repository_dir": str(msa_repository_dir.expanduser().resolve()),
+        "msa_repository_dir": portable_path(msa_repository_dir),
         "protein_input_mode": "sequence" if protein_sequences is not None else "prepared_target",
         "polymer_entity_counts": {
             kind: sum(1 for entity_kind, _, _ in polymers if entity_kind == kind)
@@ -1291,9 +1299,9 @@ def boltz2_readiness(cache_dir: Path | None = None) -> dict[str, Any]:
     structure_checkpoint = cache / "boltz2_conf.ckpt"
     affinity_checkpoint = cache / "boltz2_aff.ckpt"
     return {
-        "cache_dir": str(cache),
-        "structure_checkpoint": str(structure_checkpoint),
-        "affinity_checkpoint": str(affinity_checkpoint),
+        "cache_dir": portable_path(cache),
+        "structure_checkpoint": portable_path(structure_checkpoint),
+        "affinity_checkpoint": portable_path(affinity_checkpoint),
         "structure_ready": structure_checkpoint.is_file(),
         "affinity_ready": affinity_checkpoint.is_file(),
         "ready": structure_checkpoint.is_file() and affinity_checkpoint.is_file(),
@@ -1990,11 +1998,11 @@ def nesso_readiness(
     model_path = checkpoint / "model.safetensors"
     hparams_path = checkpoint / "hparams.json"
     return {
-        "checkpoint_dir": str(checkpoint),
-        "model_path": str(model_path),
-        "hparams_path": str(hparams_path),
-        "ccd_path": str(ccd),
-        "esm_cache_dir": str(esm_cache),
+        "checkpoint_dir": portable_path(checkpoint),
+        "model_path": portable_path(model_path),
+        "hparams_path": portable_path(hparams_path),
+        "ccd_path": portable_path(ccd),
+        "esm_cache_dir": portable_path(esm_cache),
         "checkpoint_ready": model_path.is_file() and hparams_path.is_file(),
         "ccd_ready": ccd.is_file(),
         "esm_ready": esm_ready,

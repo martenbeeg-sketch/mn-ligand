@@ -158,18 +158,56 @@ the applications.
 
 Runtime paths are resolved by `mn_ligand/runtime.py` and exposed on Settings:
 
+- machine bootstrap: `${XDG_CONFIG_HOME:-$HOME/.config}/mn-ligand/installation.json`
+  records the selected app home and optional required filesystem mount;
 - app home: `MN_LIGAND_APP_HOME`, defaulting to
-  `/mnt/data/RESULTS/mn-ligand-workdir` for this deployment;
+  `${XDG_DATA_HOME:-$HOME/.local/share}/mn-ligand` on a fresh installation;
+  an existing `/mnt/data/RESULTS/mn-ligand-workdir` deployment is retained
+  automatically for backward compatibility;
 - runs: `MN_LIGAND_RUN_DIR` or the configured `runs_dir`;
 - references/models: `MN_LIGAND_REFERENCE_DIR` or configured `reference_dir`;
 - compound libraries: `MN_LIGAND_LIBRARY_DIR`;
 - imported inputs: `MN_LIGAND_INPUT_DIR`.
-- temporary files: `MN_LIGAND_TMP_DIR` or
-  `/mnt/data/RESULTS/mn-ligand-workdir/tmp` by default.
+- temporary files: `MN_LIGAND_TMP_DIR` or `<app home>/tmp` by default.
+
+Run `mn-ligand init` once per machine to create the bootstrap record and the
+app-home `config/runtime.json`. When `required_mount` is configured, app and
+worker startup must fail before creating directories if that path is not an
+active writable mount. Generated systemd worker units must include both
+`RequiresMountsFor` and `ConditionPathIsMountPoint`. Existing installations
+without a bootstrap record retain legacy/default discovery and must not be
+moved automatically.
 
 Artifacts stored in manifests must use run-relative paths. Never persist a host
 absolute path as an artifact reference. Host paths may appear transiently in a
 Docker command or runtime diagnostic.
+
+Cross-job and shared-resource paths use the resolver in
+`mn_ligand/core/portable_paths.py`. Existing recorded paths always win; only a
+missing path is remapped to the configured runs, reference, library, or app
+root. New operational metadata uses the `runs:///`, `reference:///`,
+`library:///`, and `app:///` schemes. Historical command paths remain immutable
+provenance. `mn-ligand portability audit` is read-only and must remain so.
+
+`mn-ligand portability export DESTINATION` is the only supported metadata
+rewrite path. It operates on a new staged copy, rewrites only recognized
+operational fields whose files exist under a managed root, validates declared
+artifact checksums, verifies that source JSON did not change, and atomically
+publishes the destination. It must never edit the source archive, overwrite an
+existing destination, rewrite command/container/provenance paths, or publish a
+bundle with unresolved operational references. `portability verify` is
+read-only. The portable bundle itself uses the ordinary app-home layout so a
+new machine can point `mn-ligand init --app-home` directly at it.
+
+New job writers that opt into `portability_schema_version: 1` must pass
+`assert_job_portable(run_dir)` before becoming runnable. The durable worker
+enforces the same check before executing the command. Canonical operational
+fields may contain run-relative paths, `runs:///`, `reference:///`,
+`library:///`, or `app:///` references, and documented container paths; host
+absolute paths belong only in command/native provenance. Use
+`mn-ligand portability check-job RUN_DIR` as the CI/preflight rule. The legacy
+MD submission pages are read-only; all new MD jobs use the current MD
+Simulation workflow.
 
 Historical run folders are immutable inputs. Do not rename, move, or rewrite
 them merely to fit a new schema. Legacy inference belongs in loaders.
@@ -220,8 +258,9 @@ Core definitions are in `mn_ligand/core/jobs.py`,
 - Target Sequence Modification is the visible Prepare page for imported
   complexes. Its `Trimming` tab applies chain-specific N/C-terminal residue
   bounds only to protein atoms while retaining the ligand. Its
-  `C-terminal Repair` tab uses
-  `/home/user/mambaforge/envs/mn-ligand-modeller/bin/python` and MODELLER to
+  `C-terminal Repair` tab uses the interpreter selected by
+  `MN_LIGAND_MODELLER_PYTHON` from the separately installed
+  `mn-ligand-modeller` environment (see `environment-modeller.yml`) to
   generate a short-extension ensemble while retaining all source-complex and
   ligand coordinates. Both paths publish new typed `prepared_complex` and
   `prepared_receptor` artifacts without changing the source. The former

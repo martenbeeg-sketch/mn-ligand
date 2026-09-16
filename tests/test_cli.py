@@ -11,16 +11,21 @@ from mn_ligand.core.diagnostics import DiagnosticResult
 from mn_ligand.core.worker_service import ServiceCommandResult
 
 
-def test_init_creates_portable_runtime_layout() -> None:
+def test_init_creates_portable_runtime_layout(monkeypatch) -> None:
     runner = CliRunner()
     with tempfile.TemporaryDirectory() as temp_dir:
         base = Path(temp_dir)
         home = base / "portable-home"
         tmpdir = base / "portable-tmp"
-        result = runner.invoke(
-            app,
-            ["init", "--app-home", str(home), "--tmpdir", str(tmpdir)],
+        monkeypatch.setenv(
+            "MN_LIGAND_INSTALL_CONFIG", str(base / "config" / "installation.json")
         )
+        monkeypatch.setenv("MN_LIGAND_CONFIG", str(base / "config" / "runtime.json"))
+        with patch.dict("os.environ", {}, clear=False):
+            result = runner.invoke(
+                app,
+                ["init", "--app-home", str(home), "--tmpdir", str(tmpdir)],
+            )
 
         assert result.exit_code == 0, result.output
         assert str(home.resolve()) in result.output
@@ -28,6 +33,8 @@ def test_init_creates_portable_runtime_layout() -> None:
         assert (home / "reference_files").is_dir()
         assert (home / "libraries").is_dir()
         assert tmpdir.is_dir()
+        assert (base / "config" / "installation.json").is_file()
+        assert (base / "config" / "runtime.json").is_file()
 
 
 def test_doctor_emits_json_and_success_exit_code() -> None:
@@ -50,6 +57,100 @@ def test_doctor_fails_when_required_check_fails() -> None:
 
     assert result.exit_code == 1
     assert "FAIL  Docker Engine: Unavailable" in result.output
+
+
+def test_portability_audit_reports_read_only_mode(tmp_path: Path) -> None:
+    runner = CliRunner()
+    report = {
+        "runs_root": str(tmp_path),
+        "counts": {"json_files": 3, "absolute_values": 2},
+    }
+    with patch(
+        "mn_ligand.core.portability.audit_runtime_portability",
+        return_value=report,
+    ):
+        result = runner.invoke(app, ["portability", "audit"])
+
+    assert result.exit_code == 0, result.output
+    assert "Mode: read-only" in result.output
+    assert "Json Files: 3" in result.output
+
+
+def test_portability_export_reports_verified_bundle(tmp_path: Path) -> None:
+    runner = CliRunner()
+    result_payload = {
+        "destination": str(tmp_path / "portable"),
+        "counts": {
+            "source_json_files": 4,
+            "rewritten_paths": 2,
+        },
+        "verification": {"valid": True},
+    }
+    with patch(
+        "mn_ligand.core.portability.export_portable_runtime",
+        return_value=result_payload,
+    ) as export:
+        result = runner.invoke(
+            app,
+            ["portability", "export", str(tmp_path / "portable")],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Verification: passed" in result.output
+    assert export.call_args.kwargs["include_references"] is True
+    assert export.call_args.kwargs["include_libraries"] is True
+
+
+def test_portability_verify_returns_failure_for_invalid_bundle(tmp_path: Path) -> None:
+    runner = CliRunner()
+    report = {
+        "destination": str(tmp_path / "portable"),
+        "valid": False,
+        "counts": {"json_files": 1},
+        "errors": [{"file": "metadata.json", "error": "missing artifact"}],
+    }
+    with patch(
+        "mn_ligand.core.portability.verify_portable_export",
+        return_value=report,
+    ):
+        result = runner.invoke(
+            app,
+            ["portability", "verify", str(tmp_path / "portable")],
+        )
+
+    assert result.exit_code == 1
+    assert "Status: invalid" in result.output
+    assert "missing artifact" in result.output
+
+
+def test_portability_check_job_returns_failure_for_machine_bound_path(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    report = {
+        "run_dir": str(tmp_path / "run-1"),
+        "valid": False,
+        "counts": {"absolute_host_paths": 1},
+        "errors": [
+            {
+                "file": "input.json",
+                "key": "source_path",
+                "error": "absolute host path is not portable: /old/source.pdb",
+            }
+        ],
+    }
+    with patch(
+        "mn_ligand.core.portability.validate_job_portability",
+        return_value=report,
+    ):
+        result = runner.invoke(
+            app,
+            ["portability", "check-job", str(tmp_path / "run-1")],
+        )
+
+    assert result.exit_code == 1
+    assert "Status: not portable" in result.output
+    assert "source_path" in result.output
 
 
 def test_worker_once_reports_idle() -> None:
