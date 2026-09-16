@@ -185,6 +185,43 @@ def init_home(
     typer.echo(f"Required mount: {required_mount() or 'none'}")
 
 
+@app.command(name="install-launchers")
+def install_launchers(
+    desktop: bool = typer.Option(
+        True,
+        "--desktop/--no-desktop",
+        help="Also create a desktop launcher.",
+    ),
+    bin_dir: Path | None = typer.Option(
+        None,
+        "--bin-dir",
+        help="Wrapper destination; defaults to ~/.local/bin.",
+    ),
+    desktop_dir: Path | None = typer.Option(
+        None,
+        "--desktop-dir",
+        help="Desktop destination; defaults to ~/Desktop.",
+    ),
+) -> None:
+    """Install activation-free command and desktop launchers."""
+    from mn_ligand.launchers import install_user_launchers
+
+    try:
+        installed = install_user_launchers(
+            bin_dir=bin_dir,
+            desktop_dir=desktop_dir,
+            create_desktop=desktop,
+        )
+    except OSError as exc:
+        typer.echo(f"Launcher installation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Command launcher: {installed['cli_wrapper']}")
+    typer.echo(f"One-command app launcher: {installed['app_wrapper']}")
+    if installed["desktop_launcher"]:
+        typer.echo(f"Desktop launcher: {installed['desktop_launcher']}")
+    typer.echo("Start the app with: mn-ligand-app")
+
+
 @app.command(name="doctor")
 def doctor(
     images: bool = typer.Option(

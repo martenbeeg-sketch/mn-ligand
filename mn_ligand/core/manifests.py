@@ -76,6 +76,38 @@ class ReferenceRequirement:
 
 
 @dataclass(frozen=True)
+class ValidationEvidence:
+    date: str
+    evidence_type: str
+    description: str
+    job_ids: tuple[str, ...] = ()
+    image_digest: str = ""
+    tests: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ValidationEvidence:
+        date = str(payload.get("date") or "").strip()
+        evidence_type = str(payload.get("evidence_type") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        if not date or not evidence_type or not description:
+            raise ValueError(
+                "Validation evidence requires date, evidence_type, and description"
+            )
+        job_ids = tuple(str(value).strip() for value in payload.get("job_ids") or ())
+        tests = tuple(str(value).strip() for value in payload.get("tests") or ())
+        if any(not value for value in (*job_ids, *tests)):
+            raise ValueError("Validation evidence contains an empty reference")
+        return cls(
+            date=date,
+            evidence_type=evidence_type,
+            description=description,
+            job_ids=job_ids,
+            image_digest=str(payload.get("image_digest") or "").strip(),
+            tests=tests,
+        )
+
+
+@dataclass(frozen=True)
 class ToolManifest:
     tool_id: str
     name: str
@@ -93,6 +125,7 @@ class ToolManifest:
     weights_license: str = "not_applicable"
     commercial_use: str = "unverified"
     citation: str = ""
+    validation_evidence: tuple[ValidationEvidence, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ToolManifest:
@@ -136,6 +169,10 @@ class ToolManifest:
             weights_license=str(payload.get("weights_license") or "not_applicable"),
             commercial_use=str(payload.get("commercial_use") or "unverified"),
             citation=str(payload.get("citation") or ""),
+            validation_evidence=tuple(
+                ValidationEvidence.from_dict(dict(item))
+                for item in payload.get("validation_evidence") or ()
+            ),
         )
 
     def resolved_healthcheck(self) -> list[str]:

@@ -55,6 +55,7 @@ def test_diagnostics_pass_with_paths_docker_and_image(tmp_path: Path, monkeypatc
 
     assert diagnostics_exit_code(results) == 0
     assert next(item for item in results if item.check_id == "docker").status == "pass"
+    assert next(item for item in results if item.check_id == "digest:fixture").status == "pass"
     assert next(item for item in results if item.check_id == "image:fixture").status == "pass"
 
 

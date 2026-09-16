@@ -221,15 +221,25 @@
       "name": "GROMACS molecular dynamics",
       "version": "2026.3",
       "image": "ovolig-gromacs-cu128:latest",
-      "image_digest": "",
-      "integration_status": "implemented",
-      "status_notes": "CUDA 12.8 Blackwell-oriented adapter with app-owned Roe-Brooks preparation, CPU double-precision minimization, checkpointed production, normalized MDTraj analysis, and g_mmpbsa endpoint jobs. Native scientific smoke validation remains pending.",
+      "image_digest": "sha256:3311652fae52c3425a4c29f39c0116443c84606eda625ded4cad5a46ce091bf0",
+      "integration_status": "validated",
+      "status_notes": "Validated native CUDA 12.8 adapter with app-owned Roe-Brooks preparation, CPU double-precision minimization, checkpointed production, exact 50-to-100 ns continuation, normalized MDTraj analysis, and g_mmpbsa endpoint jobs. Validation establishes adapter execution and artifact integrity; physical interpretation still requires ordinary convergence and system-specific scientific review.",
       "accepted_artifact_types": ["prepared_complex", "docked_complex", "equilibrated_system", "md_topology", "md_checkpoint", "md_index"],
       "produced_artifact_types": ["equilibrated_system", "md_topology", "md_index", "md_trajectory", "md_checkpoint", "md_protocol_report", "endpoint_energy"],
       "resources": {"gpu": true, "min_vram_gb": 4, "cpu_threads": 8, "ram_gb": 24, "scratch_gb": 50, "exclusive_gpu": true, "cuda_min": "12.8"},
       "healthcheck": ["docker", "run", "--rm", "{image}", "gmx", "--version"],
       "code_license": "LGPL-2.1-or-later; g_mmpbsa GPL-3.0",
-      "commercial_use": "allowed subject to bundled component licenses"
+      "commercial_use": "allowed subject to bundled component licenses",
+      "validation_evidence": [
+        {
+          "date": "2026-09-16",
+          "evidence_type": "native-production-and-regression",
+          "description": "One completed preparation, three independent replicas continued exactly from 50 to 100 ns, and three successful immutable g_mmpbsa endpoint jobs; all declared native artifacts were present. Focused adapter, orchestration, analysis, and handoff regression suite passed.",
+          "job_ids": ["eefd72d5-832b-4a1e-a392-ee76170a44a2", "c060732d-9fc7-41a8-94ea-349fe501340c", "0baddfd8-c9d0-4411-89c0-36aec1f14854", "cc3d3fcf-b683-4f77-9202-d4b9472c3e59", "4cc0a526-2b75-4cd5-b721-511f5adce641", "5869bdd6-2aea-4749-8c71-ce39455205d0", "07715dda-e000-4d00-b6dd-ad9c7f1131c1"],
+          "image_digest": "sha256:3311652fae52c3425a4c29f39c0116443c84606eda625ded4cad5a46ce091bf0",
+          "tests": ["tests/test_gromacs_md.py", "tests/test_md_simulation.py"]
+        }
+      ]
     },
     {
       "tool_id": "admet_ai",
@@ -329,9 +339,9 @@
       "name": "PLIP",
       "version": "3.0.0 (2f4911d307490479ac023b22d6faa8f59b577ca8)",
       "image": "ovolig-plip:latest",
-      "image_digest": "",
-      "integration_status": "experimental",
-      "status_notes": "CPU-only focused protein-ligand interaction analysis with immutable native XML/TXT reports and normalized contact rows. Built on the locally available PLIP runtime.",
+      "image_digest": "sha256:9339862b17a5db844f9c5223f0f3dddf7f95030233411432a84e98c6f7054f5b",
+      "integration_status": "validated",
+      "status_notes": "Validated CPU-native focused protein-ligand interaction adapter with immutable native XML/TXT reports, author-residue normalization, typed contact rows, result display, and downstream comparison handoff. Contacts are geometric classifications, not binding-affinity measurements.",
       "accepted_artifact_types": ["docked_pose", "docked_complex", "predicted_complex", "prepared_receptor"],
       "produced_artifact_types": ["interaction_summary", "protein_ligand_interactions", "interaction_analysis_report", "native_interaction_output"],
       "resources": {"gpu": false, "cpu_threads": 1, "ram_gb": 4, "scratch_gb": 4},
@@ -339,23 +349,43 @@
       "code_license": "GPL-2.0",
       "weights_license": "not_applicable",
       "commercial_use": "allowed subject to GPL-2.0",
-      "citation": "Adasme MF et al. Nucleic Acids Research. 2021;49(W1):W530-W534. doi:10.1093/nar/gkab294"
+      "citation": "Adasme MF et al. Nucleic Acids Research. 2021;49(W1):W530-W534. doi:10.1093/nar/gkab294",
+      "validation_evidence": [
+        {
+          "date": "2026-09-16",
+          "evidence_type": "native-smoke-archive-and-regression",
+          "description": "Current dated image analyzed three cofolded poses with 31 normalized contacts and zero failures. The immutable archive contains 343 completed native jobs, including documented smoke jobs 1F469 and 3DD68. Focused normalization, numbering, display, comparison, and handoff tests passed.",
+          "job_ids": ["7e649647-b9df-4c4b-af42-1f4692331453", "8e44241a-b2b4-4f37-9040-3dd6896904b3", "cdc6db44-ea0b-4800-9bec-b959af99dfce"],
+          "image_digest": "sha256:9339862b17a5db844f9c5223f0f3dddf7f95030233411432a84e98c6f7054f5b",
+          "tests": ["tests/test_interaction_analysis.py", "tests/test_results_explorer.py", "tests/test_md_candidate_selection.py"]
+        }
+      ]
     },
     {
       "tool_id": "pandamap",
       "name": "PandaMap",
       "version": "4.2.1 (000734721a3dfb22a585294cd90821f9260dab76)",
       "image": "ovolig-pandamap:latest",
-      "image_digest": "",
-      "integration_status": "experimental",
-      "status_notes": "CPU-only expanded protein-ligand interaction mapping with native diagrams, normalized contact rows, and clearly labeled empirical delta-G estimates.",
+      "image_digest": "sha256:fb4e3f888a8e402817590dc4c489b50fd9b2b0cb684dc21710e97f7e0842956c",
+      "integration_status": "validated",
+      "status_notes": "Validated CPU-native expanded protein-ligand interaction adapter with native diagrams, author-residue normalization, typed contact rows, result display, and downstream comparison handoff. Reported delta-G values remain clearly labeled empirical estimates, not experimental or rigorous free energies.",
       "accepted_artifact_types": ["docked_pose", "docked_complex", "predicted_complex", "prepared_receptor"],
       "produced_artifact_types": ["interaction_summary", "protein_ligand_interactions", "interaction_analysis_report", "native_interaction_output"],
       "resources": {"gpu": false, "cpu_threads": 1, "ram_gb": 4, "scratch_gb": 4},
       "healthcheck": ["docker", "run", "--rm", "{image}", "--help"],
       "code_license": "MIT",
       "weights_license": "not_applicable",
-      "commercial_use": "allowed"
+      "commercial_use": "allowed",
+      "validation_evidence": [
+        {
+          "date": "2026-09-16",
+          "evidence_type": "native-smoke-archive-and-regression",
+          "description": "Current dated image analyzed three cofolded poses with 127 normalized contacts, three native diagrams, and zero failures. The immutable archive contains 343 completed native jobs, including documented smoke job A3B55. Focused normalization, numbering, display, comparison, and handoff tests passed.",
+          "job_ids": ["5454f340-f056-4c2c-a2ac-a3b5526ccc71", "f034c9cf-a7df-4709-bd70-ea0a9e9c9453"],
+          "image_digest": "sha256:fb4e3f888a8e402817590dc4c489b50fd9b2b0cb684dc21710e97f7e0842956c",
+          "tests": ["tests/test_interaction_analysis.py", "tests/test_results_explorer.py", "tests/test_md_candidate_selection.py"]
+        }
+      ]
     },
     {
       "tool_id": "omtra_generation",

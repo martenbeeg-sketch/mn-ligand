@@ -61,6 +61,15 @@ def test_bundled_registry_declares_current_migrated_tools() -> None:
     assert registry.get("unidock_pro").produced_artifact_types == ("pose_set", "docking_scores")
     assert registry.get("openmm_md").image == "ovolig-md-cu128:latest"
     assert registry.get("gromacs_md").image == "ovolig-gromacs-cu128:latest"
+    assert registry.get("gromacs_md").integration_status == "validated"
+    assert registry.get("plip").integration_status == "validated"
+    assert registry.get("pandamap").integration_status == "validated"
+    assert registry.get("gromacs_md").validation_evidence[0].job_ids[-1] == (
+        "07715dda-e000-4d00-b6dd-ad9c7f1131c1"
+    )
+    assert registry.get("plip").validation_evidence[0].image_digest == (
+        "sha256:9339862b17a5db844f9c5223f0f3dddf7f95030233411432a84e98c6f7054f5b"
+    )
     assert registry.get("openvs").integration_status == "experimental"
     assert registry.get("openvs").resources.gpu is False
     assert registry.get("openvs").produced_artifact_types == (
@@ -119,4 +128,12 @@ def test_registry_rejects_unknown_integration_status() -> None:
     tool["integration_status"] = "installed-means-ready"
 
     with pytest.raises(ValueError, match="integration status"):
+        ToolRegistry.from_dict({"schema_version": 1, "tools": [tool]})
+
+
+def test_registry_rejects_incomplete_validation_evidence() -> None:
+    tool = _tool()
+    tool["validation_evidence"] = [{"date": "2026-09-16"}]
+
+    with pytest.raises(ValueError, match="Validation evidence requires"):
         ToolRegistry.from_dict({"schema_version": 1, "tools": [tool]})

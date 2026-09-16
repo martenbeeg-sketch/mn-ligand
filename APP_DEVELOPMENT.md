@@ -549,8 +549,14 @@ Core definitions are in `mn_ligand/core/jobs.py`,
   `g-mmpbsa`. On 2026-07-29 the image built successfully and passed a CUDA water
   smoke plus shortened 4LNW Roe preparation, 10-step production, shared
   trajectory analysis, and one-frame MM/PBSA artifact smoke on an RTX 4090.
-  Full density-gate/production scientific validation and RTX 5090 runtime
-  qualification remain explicit tasks.
+  A subsequent evidence audit on 2026-09-16 validated one native preparation
+  (`EE761`), three exact 50-to-100 ns continuation replicas (`349FE`, `36AEC`,
+  `D4B94`), and three immutable g_mmpbsa jobs (`511F5`, `CE394`, `AD9C7`).
+  Every declared topology, coordinate, XTC, checkpoint, TPR, index, EDR,
+  analysis, and endpoint artifact was present, and the focused GROMACS/MD
+  regression suite passed. The adapter is therefore integration-validated;
+  system-specific convergence and physical interpretation remain scientific
+  review tasks. RTX 5090 runtime qualification remains an explicit task.
 - The normal Roe–Brooks launch view does not show the irrelevant legacy
   Preview/Short/Longer step presets. Density-gate controls live under Advanced
   preparation settings. Selecting compatibility preparation explicitly reveals
@@ -596,6 +602,12 @@ conda activate mn-ligand
 python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
+
+`mn-ligand install-launchers` generates machine-local wrappers in
+`~/.local/bin` and an optional desktop entry. It uses the environment's exact
+installed `mn-ligand` executable and does not depend on shell activation or a
+`.bashrc` function. Generated launchers are installation state and are not
+stored in the repository.
 
 On the current workstation the explicit interpreter is:
 
@@ -978,6 +990,18 @@ predicted-to-author mapping JSON. Ligand selection uses chain and sequence ID
 because mmCIF residue names such as `LIG1`/`LIG_L` are truncated to `LIG` by
 PDB serialization. PandaMap interaction detection remains parallel while its
 Matplotlib rendering is serialized because the renderer is not thread-safe.
+
+Interaction validation audit (2026-09-16): the immutable archive contains 343
+completed native PLIP jobs and 343 completed native PandaMap jobs. The current
+dated images were also rerun in isolated temporary workspaces against three
+cofolded poses: PLIP emitted 31 normalized contacts and PandaMap emitted 127
+contacts plus three native diagrams, with zero failures. The focused numbering,
+normalization, result-display, comparison, and handoff suite passed. Both
+adapters are now integration-validated. PLIP contacts remain geometric
+classifications; PandaMap delta-G values remain empirical estimates rather than
+experimental or rigorous free energies. Most later archived failures were a
+resolved deployment-code mismatch involving `NATIVE_THREAD_ENVIRONMENT`, not
+native tool failures; historical records remain unchanged.
 
 ## Results Explorer status
 

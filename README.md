@@ -391,6 +391,19 @@ worker units must be reinstalled afterward.
 mn-ligand app
 ```
 
+To start the app without activating the Conda/Mamba environment, install the
+per-user launchers once while the environment is active:
+
+```bash
+mn-ligand install-launchers
+```
+
+Afterward, start it from any terminal with the single command
+`mn-ligand-app`, or double-click **MN Ligand** on the desktop. The installer
+also creates `~/.local/bin/mn-ligand`, so all CLI commands work without
+activation. These generated launchers point to the selected environment's
+executable; rerun the installer after recreating or moving that environment.
+
 For compatibility with established installations, the app still starts without
 an installation record and uses the automatic paths below. The Settings page
 shows a warning until the record has been created.
@@ -534,6 +547,13 @@ The same checks are available from `System > Settings`. Missing image digests
 are reported as warnings until a reproducible digest is recorded. A registry
 entry indicates configuration readiness only; it does not replace native-output
 and downstream-handoff validation for a scientific adapter.
+
+Validated tools may include structured `validation_evidence` records containing
+the audit date, immutable native job IDs, tested image digest, and regression
+test files. `doctor --json` exposes the evidence count and validating job IDs.
+Integration validation confirms execution, normalization, artifacts, failure
+handling, display, and handoff; it does not turn predicted contacts, endpoint
+energies, or generated molecules into experimental measurements.
 
 ## Local Worker
 

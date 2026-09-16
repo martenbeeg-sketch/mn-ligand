@@ -128,13 +128,39 @@ def run_diagnostics(
                 f"integration:{tool.tool_id}",
                 f"{tool.name} integration",
                 readiness_status,
-                f"{tool.integration_status}: {tool.status_notes or 'No status notes recorded'}",
+                (
+                    f"{tool.integration_status}: "
+                    f"{tool.status_notes or 'No status notes recorded'}"
+                    + (
+                        f" Evidence records: {len(tool.validation_evidence)}."
+                        if tool.validation_evidence
+                        else ""
+                    )
+                ),
+                {
+                    "validation_evidence_count": len(tool.validation_evidence),
+                    "validation_job_ids": [
+                        job_id
+                        for evidence in tool.validation_evidence
+                        for job_id in evidence.job_ids
+                    ],
+                },
             )
         )
         if not tool.image_digest:
             results.append(
                 DiagnosticResult(
                     f"digest:{tool.tool_id}", tool.name, "warn", f"Image digest is not pinned for {tool.image}"
+                )
+            )
+        else:
+            results.append(
+                DiagnosticResult(
+                    f"digest:{tool.tool_id}",
+                    tool.name,
+                    "pass",
+                    f"Image digest recorded: {tool.image_digest}",
+                    {"image": tool.image, "image_digest": tool.image_digest},
                 )
             )
         for requirement in tool.references:
