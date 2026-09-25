@@ -36,8 +36,9 @@ def test_render_worker_service_uses_explicit_runtime_and_python_paths(tmp_path: 
         modeller_executable=tmp_path / "conda" / "envs" / "mn-ligand-modeller" / "bin" / "python",
     )
 
-    assert "Requires=docker.service" in unit
-    assert "After=docker.service" in unit
+    # These are systemd --user units; docker.service belongs to the system
+    # manager and is not a valid unit dependency in the user manager.
+    assert "docker.service" not in unit
     assert f"WorkingDirectory={tmp_path / 'project'}" in unit
     assert f'Environment="MN_LIGAND_APP_HOME={tmp_path / "runtime"}"' in unit
     assert (

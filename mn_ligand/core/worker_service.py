@@ -112,8 +112,6 @@ def render_worker_service(
         "[Unit]",
         "Description=mn-ligand durable worker for GPU %i",
         "Documentation=file:" + str(resolved_project / "README.md"),
-        "Requires=docker.service",
-        "After=docker.service",
     ]
     if resolved_mount is not None:
         unit_lines.extend(
@@ -208,8 +206,6 @@ def render_cpu_worker_service(
         "[Unit]",
         "Description=mn-ligand durable CPU worker",
         "Documentation=file:" + str(resolved_project / "README.md"),
-        "Requires=docker.service",
-        "After=docker.service",
     ]
     if resolved_mount is not None:
         unit_lines.extend(
