@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 def _atomic_text(path: Path, text: str, *, mode: int) -> None:
@@ -37,9 +37,34 @@ def install_user_launchers(
     bin_dir: Path | None = None,
     desktop_dir: Path | None = None,
     create_desktop: bool = True,
+    worker_gpu_ids: Sequence[int] | None = None,
+    install_workers: bool = True,
 ) -> dict[str, Any]:
-    """Install activation-free terminal and desktop launchers for this environment."""
+    """Install launchers and, by default, shared user worker services."""
     cli = _environment_cli()
+    selected_gpu_ids: tuple[int, ...] = ()
+    if install_workers:
+        if worker_gpu_ids is None:
+            from mn_ligand.core.resources import discover_gpu_ids
+
+            selected_gpu_ids = discover_gpu_ids()
+        else:
+            selected_gpu_ids = tuple(
+                dict.fromkeys(int(value) for value in worker_gpu_ids)
+            )
+        if not selected_gpu_ids:
+            raise RuntimeError(
+                "No worker GPU IDs were selected or detected. Re-run with "
+                "--worker-gpu-ids, or use --no-workers to install app-only launchers."
+            )
+
+        # Install and enable once. The launcher starts these fixed systemd units
+        # on every app launch; systemd makes repeated starts idempotent, so two
+        # UI windows do not create duplicate worker processes.
+        from mn_ligand.core.worker_service import install_worker_service
+
+        install_worker_service(selected_gpu_ids, start=False)
+
     selected_bin = Path(
         bin_dir or Path.home() / ".local" / "bin"
     ).expanduser().resolve()
@@ -53,7 +78,17 @@ def install_user_launchers(
     )
     _atomic_text(
         app_wrapper,
-        f"#!/bin/sh\nset -eu\nexec {quoted_cli} app \"$@\"\n",
+        "#!/bin/sh\nset -eu\n"
+        + (
+            f"if ! {quoted_cli} worker-service start --gpu-ids "
+            f"{shlex.quote(','.join(str(value) for value in selected_gpu_ids))}\n"
+            "then\n"
+            '  echo "Warning: mn-ligand workers did not start; queued jobs may wait." >&2\n'
+            "fi\n"
+            if install_workers
+            else ""
+        )
+        + f"exec {quoted_cli} app \"$@\"\n",
         mode=0o755,
     )
 
@@ -96,4 +131,6 @@ def install_user_launchers(
         "cli_wrapper": str(cli_wrapper),
         "app_wrapper": str(app_wrapper),
         "desktop_launcher": str(desktop_path) if desktop_path else "",
+        "worker_gpu_ids": list(selected_gpu_ids),
+        "worker_services_installed": install_workers,
     }

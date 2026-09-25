@@ -202,23 +202,57 @@ def install_launchers(
         "--desktop-dir",
         help="Desktop destination; defaults to ~/Desktop.",
     ),
+    workers: bool = typer.Option(
+        True,
+        "--workers/--no-workers",
+        help="Install shared CPU/GPU worker services and start them with the app launcher.",
+    ),
+    worker_gpu_ids: str = typer.Option(
+        "",
+        "--worker-gpu-ids",
+        help="GPU IDs for worker services, comma-separated; default detects local GPUs.",
+    ),
 ) -> None:
-    """Install activation-free command and desktop launchers."""
+    """Install command/desktop launchers and optionally shared worker services."""
     from mn_ligand.launchers import install_user_launchers
+
+    selected_gpu_ids: tuple[int, ...] | None = None
+    if worker_gpu_ids.strip():
+        try:
+            parts = tuple(
+                part.strip()
+                for part in worker_gpu_ids.split(",")
+                if part.strip()
+            )
+            if not parts or any(not part.isdigit() for part in parts):
+                raise ValueError("GPU IDs must be comma-separated non-negative integers")
+            selected_gpu_ids = tuple(dict.fromkeys(int(part) for part in parts))
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--worker-gpu-ids") from exc
 
     try:
         installed = install_user_launchers(
             bin_dir=bin_dir,
             desktop_dir=desktop_dir,
             create_desktop=desktop,
+            worker_gpu_ids=selected_gpu_ids,
+            install_workers=workers,
         )
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         typer.echo(f"Launcher installation failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Command launcher: {installed['cli_wrapper']}")
     typer.echo(f"One-command app launcher: {installed['app_wrapper']}")
     if installed["desktop_launcher"]:
         typer.echo(f"Desktop launcher: {installed['desktop_launcher']}")
+    if installed["worker_services_installed"]:
+        typer.echo(
+            "Worker services enabled for GPU(s): "
+            + ",".join(str(value) for value in installed["worker_gpu_ids"])
+            + "; the app launcher starts them on each launch."
+        )
+    else:
+        typer.echo("Worker services were not configured by this launcher install.")
     typer.echo("Start the app with: mn-ligand-app")
 
 
