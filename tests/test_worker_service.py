@@ -74,8 +74,8 @@ def test_worker_units_require_configured_data_mount(tmp_path: Path) -> None:
         required_mount_path=mount,
     )
 
-    assert f'RequiresMountsFor="{mount}"' in unit
-    assert f'ConditionPathIsMountPoint="{mount}"' in unit
+    assert f"RequiresMountsFor={mount}" in unit
+    assert f"ConditionPathIsMountPoint={mount}" in unit
     assert f'Environment="MN_LIGAND_REQUIRED_MOUNT={mount}"' in unit
 
 

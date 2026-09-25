@@ -118,8 +118,8 @@ def render_worker_service(
     if resolved_mount is not None:
         unit_lines.extend(
             (
-                f"RequiresMountsFor={_systemd_quote(resolved_mount)}",
-                f"ConditionPathIsMountPoint={_systemd_quote(resolved_mount)}",
+                f"RequiresMountsFor={resolved_mount}",
+                f"ConditionPathIsMountPoint={resolved_mount}",
             )
         )
     unit_lines.extend(
@@ -214,8 +214,8 @@ def render_cpu_worker_service(
     if resolved_mount is not None:
         unit_lines.extend(
             (
-                f"RequiresMountsFor={_systemd_quote(resolved_mount)}",
-                f"ConditionPathIsMountPoint={_systemd_quote(resolved_mount)}",
+                f"RequiresMountsFor={resolved_mount}",
+                f"ConditionPathIsMountPoint={resolved_mount}",
             )
         )
     unit_lines.extend(
