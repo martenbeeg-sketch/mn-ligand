@@ -109,6 +109,33 @@ def test_install_writes_template_and_enables_selected_instances(tmp_path: Path) 
     ]
 
 
+def test_install_without_start_or_enable_disables_login_autostart(tmp_path: Path) -> None:
+    runner = RecordingRunner()
+
+    install_worker_service(
+        (0,),
+        start=False,
+        enable=False,
+        unit_dir=tmp_path,
+        python_executable="/opt/mn/bin/python",
+        project_dir=tmp_path / "project",
+        runtime_home=tmp_path / "runtime",
+        tmp_dir=tmp_path / "runtime" / "tmp",
+        runner=runner,
+    )
+
+    assert runner.commands == [
+        ("systemctl", "--user", "daemon-reload"),
+        (
+            "systemctl",
+            "--user",
+            "disable",
+            "mn-ligand-worker@0.service",
+            CPU_SERVICE_NAME,
+        ),
+    ]
+
+
 def test_manage_status_preserves_nonzero_status_for_cli(tmp_path: Path) -> None:
     runner = RecordingRunner(returncode=3)
 

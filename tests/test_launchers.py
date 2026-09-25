@@ -19,10 +19,10 @@ def test_install_user_launchers_uses_current_environment_cli(
     monkeypatch.setenv("MN_LIGAND_CLI", str(environment_cli))
     bin_dir = tmp_path / "bin"
     desktop_dir = tmp_path / "Desktop"
-    worker_installs: list[tuple[tuple[int, ...], bool]] = []
+    worker_installs: list[tuple[tuple[int, ...], bool, bool]] = []
 
-    def record_worker_install(gpu_ids, *, start=True, **_kwargs):
-        worker_installs.append((tuple(gpu_ids), start))
+    def record_worker_install(gpu_ids, *, start=True, enable=True, **_kwargs):
+        worker_installs.append((tuple(gpu_ids), start, enable))
         return tmp_path / "mn-ligand-worker@.service"
 
     monkeypatch.setattr(
@@ -47,7 +47,7 @@ def test_install_user_launchers_uses_current_environment_cli(
     assert subprocess.run(
         ["sh", "-n", result["app_wrapper"]], check=False
     ).returncode == 0
-    assert worker_installs == [((0,), False)]
+    assert worker_installs == [((0,), False, False)]
     assert result["worker_services_installed"] is True
     desktop = Path(result["desktop_launcher"]).read_text()
     assert f"Exec={bin_dir / 'mn-ligand-app'}" in desktop

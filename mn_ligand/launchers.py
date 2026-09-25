@@ -58,12 +58,12 @@ def install_user_launchers(
                 "--worker-gpu-ids, or use --no-workers to install app-only launchers."
             )
 
-        # Install and enable once. The launcher starts these fixed systemd units
-        # on every app launch; systemd makes repeated starts idempotent, so two
-        # UI windows do not create duplicate worker processes.
+        # Install without login autostart. The launcher starts these fixed
+        # systemd units on app launch; repeated starts are idempotent, so two UI
+        # windows do not create duplicate worker processes.
         from mn_ligand.core.worker_service import install_worker_service
 
-        install_worker_service(selected_gpu_ids, start=False)
+        install_worker_service(selected_gpu_ids, start=False, enable=False)
 
     selected_bin = Path(
         bin_dir or Path.home() / ".local" / "bin"

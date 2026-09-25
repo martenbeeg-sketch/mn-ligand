@@ -606,13 +606,14 @@ python -m pytest -q
 `mn-ligand install-launchers` generates machine-local wrappers in
 `~/.local/bin` and an optional desktop entry. It uses the environment's exact
 installed `mn-ligand` executable and does not depend on shell activation or a
-`.bashrc` function. By default, it also installs and enables user-scoped CPU
-and per-GPU systemd worker services. The generated app launcher starts those
-same named services before opening Streamlit, so launching a second app window
-does not spawn duplicate workers. The workers continue independently if the
-app window closes. Use `--worker-gpu-ids 0` on a single-GPU host, or
-`--no-workers` for an app-only launcher. Generated launchers and service units
-are machine-local installation state and are not stored in the repository.
+`.bashrc` function. By default, it also installs user-scoped CPU and per-GPU
+systemd worker services without enabling login autostart. The generated app
+launcher starts those same named services before opening Streamlit, so
+launching a second app window does not spawn duplicate workers. The workers
+continue independently if the app window closes. Use `--worker-gpu-ids 0` on
+a single-GPU host, or `--no-workers` for an app-only launcher. Generated
+launchers and service units are machine-local installation state and are not
+stored in the repository.
 On a single-GPU host such as PC004033, install or refresh them after deploying
 the updated app with:
 
@@ -620,8 +621,9 @@ the updated app with:
 mn-ligand install-launchers --worker-gpu-ids 0
 ```
 
-Run this as the desktop user (no `sudo`). It enables the worker units; the
+Run this as the desktop user (no `sudo`). It installs the worker units; the
 generated `mn-ligand-app` command and desktop shortcut start them when opened.
+They do not start automatically at user login.
 
 On the current workstation the explicit interpreter is:
 

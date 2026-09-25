@@ -247,9 +247,9 @@ def install_launchers(
         typer.echo(f"Desktop launcher: {installed['desktop_launcher']}")
     if installed["worker_services_installed"]:
         typer.echo(
-            "Worker services enabled for GPU(s): "
+            "Worker services installed for GPU(s): "
             + ",".join(str(value) for value in installed["worker_gpu_ids"])
-            + "; the app launcher starts them on each launch."
+            + "; they start when the app launcher opens (not at user login)."
         )
     else:
         typer.echo("Worker services were not configured by this launcher install.")

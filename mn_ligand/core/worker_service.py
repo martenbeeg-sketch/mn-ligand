@@ -276,6 +276,7 @@ def install_worker_service(
     gpu_ids: Sequence[int] = DEFAULT_GPU_IDS,
     *,
     start: bool = True,
+    enable: bool = True,
     unit_dir: Path | None = None,
     python_executable: str | Path = sys.executable,
     project_dir: str | Path = PROJECT_DIR,
@@ -320,7 +321,10 @@ def install_worker_service(
     cpu_temporary.replace(cpu_destination)
     _run(("systemctl", "--user", "daemon-reload"), runner=runner)
     instances = tuple(service_instance_name(value) for value in selected)
-    action = ("enable", "--now") if start else ("enable",)
+    if start:
+        action = ("enable", "--now") if enable else ("start",)
+    else:
+        action = ("enable",) if enable else ("disable",)
     _run(
         ("systemctl", "--user", *action, *instances, CPU_SERVICE_NAME),
         runner=runner,
