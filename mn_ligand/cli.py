@@ -253,7 +253,7 @@ def install_launchers(
         )
     else:
         typer.echo("Worker services were not configured by this launcher install.")
-    typer.echo("Start the app with: mn-ligand-app")
+    typer.echo(f"Start the app with: {installed['app_wrapper']}")
 
 
 @app.command(name="doctor")

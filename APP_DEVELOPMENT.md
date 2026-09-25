@@ -622,8 +622,8 @@ mn-ligand install-launchers --worker-gpu-ids 0
 ```
 
 Run this as the desktop user (no `sudo`). It installs the worker units; the
-generated `mn-ligand-app` command and desktop shortcut start them when opened.
-They do not start automatically at user login.
+generated `~/.local/bin/mn-ligand-app` command and desktop shortcut start them
+when opened. They do not start automatically at user login.
 
 On the current workstation the explicit interpreter is:
 

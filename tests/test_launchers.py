@@ -92,5 +92,8 @@ def test_install_launchers_cli_can_skip_desktop(tmp_path: Path, monkeypatch) -> 
     )
 
     assert result.exit_code == 0, result.output
-    assert "Start the app with: mn-ligand-app" in result.output
+    assert (
+        f"Start the app with: {tmp_path / 'bin' / 'mn-ligand-app'}"
+        in result.output
+    )
     assert not (tmp_path / "Desktop").exists()
