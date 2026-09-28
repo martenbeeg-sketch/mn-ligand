@@ -38,6 +38,7 @@ from mn_ligand.ligandx.services.md.workflow.system_builder import (
 )
 from mn_ligand.workflows.bound_ligand_md import (
     _amber_partition_atom_counts,
+    _ambertools_mpi_command,
     _parse_amber_final_results,
     _source_ligand_key,
     recompute_mmgbsa,
@@ -47,6 +48,7 @@ from mn_ligand.workflows.md_simulation import (
     INDEPENDENT_REPLICA,
     SYSTEM_PARAMETER_KEYS,
     advance_md_workflow,
+    advance_md_workflows,
     compatibility_contract,
     compatibility_differences,
     compatibility_fingerprint,
@@ -1113,6 +1115,17 @@ def test_amber_pb_parser_combines_nonpolar_and_dispersion_terms(
     assert parsed["delta_np_kcal"] == pytest.approx(26.4059)
 
 
+def test_ambertools_mpi_uses_hardware_thread_slots() -> None:
+    assert _ambertools_mpi_command("mpirun", "MMPBSA.py.MPI", 16) == [
+        "mpirun",
+        "--allow-run-as-root",
+        "--use-hwthread-cpus",
+        "-np",
+        "16",
+        "MMPBSA.py.MPI",
+    ]
+
+
 def test_recompute_mmgbsa_derives_gromacs_ligand_from_common_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2086,3 +2099,55 @@ def test_worker_marks_native_mmgbsa_failure_failed(tmp_path: Path, monkeypatch) 
     failed = JobRecord.load(queued.run_dir, task_group="md-mmgbsa")
     assert failed.status == "failed"
     assert failed.result["error"] == "native failure"
+
+
+def test_failed_md_workflow_keeps_advancing_while_required_children_are_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(runs_dir))
+    advanced: list[str] = []
+
+    for workflow_id, child_status in (
+        ("failed-with-pending-analysis", "queued"),
+        ("failed-with-terminal-children", "completed"),
+    ):
+        workflow_dir = runs_dir / "workflows" / workflow_id
+        analysis_dir = runs_dir / "md-analysis" / f"analysis-{workflow_id}"
+        workflow_dir.mkdir(parents=True)
+        analysis_dir.mkdir(parents=True)
+        _write_json(
+            analysis_dir / "metadata.json",
+            {
+                "schema_version": 1,
+                "run_id": analysis_dir.name,
+                "status": child_status,
+                "awaiting_parent": child_status == "queued",
+            },
+        )
+        _write_json(
+            workflow_dir / "workflow.json",
+            {
+                "schema_version": 1,
+                "workflow_id": workflow_id,
+                "workflow_type": "md-simulation",
+                "status": "failed",
+                "children": [
+                    {
+                        "run_id": analysis_dir.name,
+                        "task_group": "md-analysis",
+                        "step_id": "replicate_analysis",
+                        "required": True,
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(
+        "mn_ligand.workflows.md_simulation.advance_md_workflow",
+        lambda workflow_id: advanced.append(workflow_id),
+    )
+
+    assert advance_md_workflows() == 1
+    assert advanced == ["failed-with-pending-analysis"]

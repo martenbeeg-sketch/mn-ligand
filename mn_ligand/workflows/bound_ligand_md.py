@@ -903,7 +903,11 @@ def _compute_mmgbsa_ambertools(
             cores_effective = max(1, min(cores_effective, frame_count))
 
         if use_mpi and mmpbsa_mpi_bin and mpirun_bin and cores_effective > 1 and mpi4py_ok:
-            base_cmd = [mpirun_bin, "--allow-run-as-root", "-np", str(cores_effective), mmpbsa_mpi_bin]
+            base_cmd = _ambertools_mpi_command(
+                mpirun_bin,
+                mmpbsa_mpi_bin,
+                cores_effective,
+            )
             method = "ambertools_mmpbsa_mpi"
         else:
             base_cmd = [mmpbsa_bin or "MMPBSA.py"]
@@ -1051,6 +1055,27 @@ def _amber_partition_atom_counts(
         "ligand_atoms": ligand_atoms,
         "balanced": complex_atoms == receptor_atoms + ligand_atoms,
     }
+
+
+def _ambertools_mpi_command(
+    mpirun_bin: str,
+    mmpbsa_mpi_bin: str,
+    cores: int,
+) -> list[str]:
+    """Build an MPI command whose slots include logical CPUs.
+
+    Open MPI otherwise counts physical cores as slots. On hosts where the
+    configured worker limit exceeds the physical-core count but fits within
+    available hardware threads, that default rejects a valid process count.
+    """
+    return [
+        mpirun_bin,
+        "--allow-run-as-root",
+        "--use-hwthread-cpus",
+        "-np",
+        str(max(1, int(cores))),
+        mmpbsa_mpi_bin,
+    ]
 
 
 def _source_ligand_key(selected: dict[str, Any]) -> str:

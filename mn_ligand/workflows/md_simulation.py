@@ -4360,8 +4360,34 @@ def advance_md_workflows() -> int:
         if not run_dir.is_dir():
             continue
         payload = _read_json(run_dir / "workflow.json")
-        if payload.get("workflow_type") != MD_WORKFLOW_TYPE or payload.get("status") in {"completed", "failed", "cancelled"}:
+        if payload.get("workflow_type") != MD_WORKFLOW_TYPE:
             continue
+        status = str(payload.get("status") or "")
+        if status in {"completed", "cancelled"}:
+            continue
+        if status == "failed":
+            # A failed replica-level analysis must not strand sibling endpoint
+            # jobs or an awaiting-parent aggregate report. Keep advancing only
+            # while required children are still active; once all children are
+            # terminal, preserve the failed workflow as terminal.
+            active_child = False
+            for child in payload.get("children") or ():
+                if not bool(child.get("required", True)):
+                    continue
+                child_dir = resolve_run_dir(
+                    str(child.get("task_group") or ""),
+                    str(child.get("run_id") or ""),
+                )
+                if child_dir is None:
+                    continue
+                child_status = str(
+                    _read_json(child_dir / "metadata.json").get("status") or ""
+                )
+                if child_status in {"queued", "preparing", "running", "paused"}:
+                    active_child = True
+                    break
+            if not active_child:
+                continue
         advance_md_workflow(run_dir.name)
         advanced += 1
     return advanced
