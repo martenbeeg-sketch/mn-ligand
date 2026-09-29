@@ -4,221 +4,281 @@ services:
   alphafast:
     image: mn-alphafast:cu128
     build:
-      context: ./containers/alphafast
-      dockerfile: ../../../mn-tool-containers/shared/alphafast/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: shared/alphafast/Dockerfile
       platforms: ["linux/x86_64"]
 
   structure:
     image: mn-structure:latest
     build:
-      context: ./containers/structure
-      dockerfile: ../../../mn-tool-containers/mn-ligand/structure/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/structure/Dockerfile
       platforms: ["linux/x86_64"]
 
   docking:
     image: mn-docking:latest
     build:
-      context: ./containers/docking
-      dockerfile: ../../../mn-tool-containers/mn-ligand/docking/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/docking/Dockerfile
       platforms: ["linux/x86_64"]
 
   docking-suite:
     image: mn-docking-suite:cu128
     build:
-      context: ./containers/docking-suite
-      dockerfile: ../../../mn-tool-containers/mn-ligand/docking-suite/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/docking-suite/Dockerfile
       platforms: ["linux/x86_64"]
 
   openvs:
     image: mn-openvs:local
     build:
-      context: ./containers/openvs
-      dockerfile: ../../../mn-tool-containers/mn-ligand/openvs/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/openvs/Dockerfile
       platforms: ["linux/x86_64"]
 
   fpocket:
     image: mn-fpocket:4bb0d84
     build:
-      context: ./containers/fpocket
-      dockerfile: ../../../mn-tool-containers/mn-ligand/fpocket/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/fpocket/Dockerfile
       platforms: ["linux/x86_64"]
 
   p2rank:
     image: mn-p2rank:d8c8e0d
     build:
-      context: ./tools_to_implement/p2rank
-      dockerfile: ../../../mn-tool-containers/mn-ligand/p2rank/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/p2rank/Dockerfile
       platforms: ["linux/x86_64"]
 
   pesto:
     image: mn-pesto:cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/shared/pesto/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: shared/pesto/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
 
   md:
     image: mn-md:cu128
     build:
-      context: ./containers/md
-      dockerfile: ../../../mn-tool-containers/mn-ligand/md/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/md/Dockerfile
       platforms: ["linux/x86_64"]
 
   gromacs:
     image: mn-gromacs:2026.3-cu128
     build:
-      context: ./containers/gromacs-md
-      dockerfile: ../../../mn-tool-containers/mn-ligand/gromacs-md/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/gromacs-md/Dockerfile
       platforms: ["linux/x86_64"]
 
   admet:
     image: mn-admet:latest
     build:
-      context: ./containers/admet
-      dockerfile: ../../../mn-tool-containers/mn-ligand/admet/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/admet/Dockerfile
       platforms: ["linux/x86_64"]
 
   boltz2:
     image: mn-boltz2:cu128
     build:
-      context: ./containers/boltz2
-      dockerfile: ../../../mn-tool-containers/shared/boltz2/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: shared/boltz2/Dockerfile
       platforms: ["linux/x86_64"]
 
   boltzina:
     image: mn-boltzina:cu128
     build:
-      context: ./containers/boltzina
-      dockerfile: ../../../mn-tool-containers/mn-ligand/boltzina/Dockerfile.cu128
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/boltzina/Dockerfile.cu128
       platforms: ["linux/x86_64"]
 
   nesso:
     image: mn-nesso:1.0.0-cu128
     build:
-      context: ./tools_to_implement/nesso
-      dockerfile: ../../../mn-tool-containers/mn-ligand/nesso/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/nesso/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
 
   omtra:
     image: mn-omtra:cu128-745127d
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.omtra
-      args: {SOURCE_COMMIT: 745127dabfa1}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.omtra
+      args: {SOURCE_COMMIT: 745127dabfa173cc999f5265ce9c09e93184037b}
     gpus: all
 
   pocketxmol:
     image: mn-pocketxmol:cu128-65488cf
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pocketxmol
-      args: {SOURCE_COMMIT: 65488cf635c8}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.pocketxmol
+      args: {SOURCE_COMMIT: 65488cf635c856101dbe703ac97e2f10f58e005c}
     gpus: all
 
   flowr-root:
     image: mn-flowr-root:cu128-b2263e2
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.flowr_root
-      args: {SOURCE_COMMIT: b2263e2516ad}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.flowr_root
+      args: {SOURCE_COMMIT: b2263e2516ad798d0119f8c4b531698860cc846e}
     gpus: all
 
   conditar:
     image: mn-conditar:cu128-4294d286
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.conditar
-      args: {SOURCE_COMMIT: 4294d2863751}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.conditar
+      args: {SOURCE_COMMIT: 4294d286375116942762b0688c4e012fceeec1c9}
     gpus: all
 
   paopt:
     image: mn-paopt:cu128-4294d286
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.paopt
-      args: {SOURCE_COMMIT: 4294d2863751}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.paopt
+      args: {SOURCE_COMMIT: 4294d286375116942762b0688c4e012fceeec1c9}
     gpus: all
 
   drugrpg:
     image: mn-drugrpg:cu128-6fa0e41
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.drugrpg
-      args: {SOURCE_COMMIT: 6fa0e417a523}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.drugrpg
+      args: {SOURCE_COMMIT: 6fa0e417a523627728eac26a75e3eaab8f3926dc}
     gpus: all
 
   pfm:
     image: mn-pfm:cu128-33be6c1
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pfm
-      args: {SOURCE_COMMIT: 33be6c1f3dc9}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.pfm
+      args: {SOURCE_COMMIT: 33be6c1f3dc9f42deb7a27be974ab9f5fc241497}
     gpus: all
 
   pocketflow:
     image: mn-pocketflow:cu128-a31a5a0
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pocketflow
-      args: {SOURCE_COMMIT: a31a5a03f7d1}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.pocketflow
+      args: {SOURCE_COMMIT: a31a5a03f7d12e6e69af83bdf56d9b28ed936fc9}
     gpus: all
 
   lddm:
     image: mn-lddm:cu128-f254fb4
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.lddm
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.lddm
       args: {SOURCE_COMMIT: f254fb4f8525b3803e79eb95e9f1a163fe8b2459}
     gpus: all
 
   pgmg:
     image: mn-pgmg:cu128-85fb712
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pgmg
-      args: {SOURCE_COMMIT: 85fb7120022d}
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/generation/Dockerfile.pgmg
+      args: {SOURCE_COMMIT: 85fb7120022dfe2edcb4b827fbfbdf67d187260c}
     gpus: all
 
   posebusters:
     image: mn-posebusters:1a5f26a
     build:
-      context: ./tools_to_implement/posebusters
-      dockerfile: ../../../mn-tool-containers/mn-ligand/posebusters/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/posebusters/Dockerfile
       platforms: ["linux/x86_64"]
 
   plip:
     image: mn-plip:latest
     build:
-      context: ./tools_to_implement/plip
-      dockerfile: ../../../mn-tool-containers/mn-ligand/plip/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/plip/Dockerfile
       platforms: ["linux/x86_64"]
 
   pandamap:
     image: mn-pandamap:0007347
     build:
-      context: ./tools_to_implement/PandaMap
-      dockerfile: ../../../mn-tool-containers/mn-ligand/pandamap/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/pandamap/Dockerfile
       platforms: ["linux/x86_64"]
 
   qc:
     image: mn-qc:latest
     build:
-      context: ./containers/qc
-      dockerfile: ../../../mn-tool-containers/mn-ligand/qc/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/qc/Dockerfile
       platforms: ["linux/x86_64"]
 
   abfe:
     image: mn-abfe:cu128
     build:
-      context: ./containers/abfe
-      dockerfile: ../../../mn-tool-containers/mn-ligand/abfe/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/abfe/Dockerfile
       platforms: ["linux/x86_64"]
 
   rbfe:
     image: mn-rbfe:cu128
     build:
-      context: ./containers/rbfe
-      dockerfile: ../../../mn-tool-containers/mn-ligand/rbfe/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: mn-ligand/rbfe/Dockerfile
       platforms: ["linux/x86_64"]

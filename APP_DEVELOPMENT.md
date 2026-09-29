@@ -350,8 +350,8 @@ Core definitions are in `mn_ligand/core/jobs.py`,
   `mn_ligand/workflows/benchmark_datasets.py` defines the canonical schema,
   safe ZIP/TAR ingestion, explicit CSV/JSON/YAML manifests, generic layout
   detection, and PoseBench-aware Astex/PoseBusters/DockGen/CASP15 profiles.
-  The source checkout under `tools_to_implement/PoseBench` is format and metric
-  guidance only; benchmark execution never imports it at runtime.
+  An optional archived PoseBench checkout is format and metric guidance only;
+  benchmark execution never imports it at runtime.
   Import is the primary page content and uses
   `Input → Format → Validation → Run → Results`. Each Results row links its Job
   ID to the immutable dataset explorer and has a separate combined-results link
@@ -1069,8 +1069,8 @@ The former disabled Generative Design placeholder has moved into a dedicated
 existing-ligand design pages. Pharmacophore hypothesis creation lives under
 `Prepare > Pharmacophore Hypotheses`. The intended
 campaign contract covers the
-local OMTRA, PocketXMol, FLOWR.root, conDitar, conDitar + paOPT, DrugRPG, PFM,
-PocketFlow, and PGMG checkouts.
+OMTRA, PocketXMol, FLOWR.root, conDitar, conDitar + paOPT, DrugRPG, PFM,
+PocketFlow, and PGMG image integrations.
 
 Pharmacophore intent is app-owned rather than engine-owned. A versioned,
 immutable `pharmacophore_hypothesis` stores enabled features and an internal

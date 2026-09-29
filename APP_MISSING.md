@@ -163,19 +163,16 @@ generation campaign and downstream pose validation that requires an author
 - `MN_LIGAND_APP_HOME` and `MN_LIGAND_RUN_DIR` exist, but there is no central
   runtime module, editable persisted Settings page, or reference/library path
   contract.
-- Docker commands sometimes mount the repository source, coupling execution to a
-  checkout rather than an installed package/image contract.
+- Older workflows may retain source mounts for compatibility. Current image
+  recipes are owned by the sibling `mn-tool-containers` repository.
 - Current docs still contain historical absolute paths from a different checkout.
 
-### Source checkouts are not integrations
+### Historical note about source checkouts
 
-The untracked `tools_to_implement/` directory contains useful upstream source,
-but none of these tools should be listed as an app feature until it has a pinned
-image, manifest, adapter, normalized result parser, and tested UI/workflow route.
-
-The local set includes HiQBind, OpenVS, OMTRA, Uni-Dock Pro, GNINA, fpocket,
-PeSTo, Boltz, OpenMM, GROMACS, OpenFE, gmx_qk, PocketXMol, PocketFlow, GenMol,
-DrugRPG, PFM, PGMG, and FlowR-related code.
+This planning document predates the shared `mn-tool-containers` repository.
+Upstream tool checkouts retained outside the app are archival references only.
+The shared repository owns pinned image recipes and source patches; app feature
+status is defined by the current manifests, adapters, and workflows.
 
 ## 2. Structure prediction tools already available
 

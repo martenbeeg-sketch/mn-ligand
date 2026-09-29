@@ -1338,7 +1338,7 @@ Architecture inspiration reviewed in the neighboring application:
   `manifests.py`, `modules.py`, and `pipeline.py`
 - `mn_protein_design/runtime.py` and `app/pages/settings.py`
 - `mn_protein_design/workflows/design_campaigns.py`
-- local source checkouts under `tools_to_implement/`
+- optional archived upstream source checkouts outside the app repository
 
 `mn-protein-design` and `mn-ligand` are separate applications with different
 scientific domains, entities, workflows, and release lifecycles. Only generic

@@ -1,0 +1,6 @@
+**
+!containers
+!containers/**
+!mn_ligand
+!mn_ligand/workflows
+!mn_ligand/workflows/posebusters_qualification.py

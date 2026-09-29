@@ -30,6 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "posebusters>=0.3.1",
 ]
 
 [tool.pytest.ini_options]

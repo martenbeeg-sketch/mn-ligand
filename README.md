@@ -1183,8 +1183,8 @@ multi-run campaigns publish mean/sample-SD affinity, binder-probability, and
 confidence statistics. Structure Import disables the Boltz MSA server and
 requires a matching MSA from the shared local sequence-hashed repository.
 
-Nesso-1 uses `mn-nesso:1.0.0-cu128`, built from the pinned local source in
-`tools_to_implement/nesso`. It expects `nesso/v1.0.0/model.safetensors`,
+Nesso-1 uses `mn-nesso:1.0.0-cu128`, built from its pinned upstream source
+during the Docker image build. It expects `nesso/v1.0.0/model.safetensors`,
 `nesso/v1.0.0/hparams.json`, and the publisher-trusted `nesso/ccd.pkl` under the
 shared reference root. The adapter reuses the existing
 `facebook/esm2_t33_650M_UR50D` Hugging Face cache read-only. Native
