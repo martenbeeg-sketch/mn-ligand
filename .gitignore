@@ -26,5 +26,5 @@ build/
 /DOCKING_COFOLDING_METHODS_*.md
 /RETROSPECTIVE_REASSESSMENT_METHODS_*.md
 /reports/
-/tools_to_implement/
+/tools_to_implement
 .~lock.*
