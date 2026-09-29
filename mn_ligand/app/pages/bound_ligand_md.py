@@ -54,7 +54,7 @@ LIGAND_NAME_FALLBACKS = {
     "STI": "Imatinib",
 }
 
-DEFAULT_MD_IMAGE = "ovolig-md-cu128:latest"
+DEFAULT_MD_IMAGE = "mn-md:cu128"
 UI_EDIT_STAMP_UTC = "2026-05-05 12:30 UTC"
 
 FIXED_MD_DEFAULTS = {

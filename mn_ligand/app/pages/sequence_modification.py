@@ -12,11 +12,15 @@ def render() -> None:
         "retaining its ligand. Every operation creates a new typed target version; "
         "the source structure is never modified."
     )
-    trimming_tab, repair_tab = st.tabs(["Trimming", "C-terminal Repair"])
-    with trimming_tab:
-        target_trimming.render(embedded=True)
-    with repair_tab:
+    trimming_tab, repair_tab = st.tabs(
+        ["Trimming", "C-terminal Repair"],
+        key="sequence_modification_tabs",
+        on_change="rerun",
+    )
+    if repair_tab.open:
         repair.render(embedded=True)
+    if trimming_tab.open:
+        target_trimming.render(embedded=True)
 
 
 render()

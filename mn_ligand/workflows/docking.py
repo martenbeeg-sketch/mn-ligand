@@ -30,9 +30,14 @@ from mn_ligand.runtime import (
     adaptive_cpu_workers,
     app_home,
     cpu_process_limit,
+    reference_root,
     runs_root,
     unidock_pro_max_compounds,
     vina_compound_timeout_minutes,
+)
+from mn_ligand.workflows.lddm import (
+    LDDM_CHECKPOINTS,
+    mean_coordinate_uncertainty,
 )
 
 
@@ -40,7 +45,7 @@ UNIDOCK_PRO_MODES = ("classic", "hybrid", "ligand_based")
 UNIDOCK_PRO_SEARCH_MODES = ("fast", "balance", "detail")
 UNIDOCK_PRO_MAX_COMPOUNDS = DEFAULT_UNIDOCK_PRO_MAX_COMPOUNDS
 UNIDOCK_PRO_MAX_TORSIONS = 48
-DEFAULT_DOCKING_IMAGE = "avgu-docking-suite-cuda:latest"
+DEFAULT_DOCKING_IMAGE = "mn-docking-suite:cu128"
 
 _RDKIT_3D_SCRIPT = r"""from __future__ import annotations
 
@@ -251,6 +256,35 @@ def select_gnina_pose(
 
 def _score_rows(results_dir: Path, engine: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    if str(engine).strip().lower() == "lddm":
+        for path in sorted(results_dir.glob("*_out.sdf")):
+            supplier = Chem.SDMolSupplier(
+                str(path), removeHs=False, sanitize=False, strictParsing=False
+            )
+            for pose_index, molecule in enumerate(supplier, start=1):
+                if molecule is None or not molecule.GetNumConformers():
+                    continue
+                compound_id = (
+                    molecule.GetProp("compound_id")
+                    if molecule.HasProp("compound_id")
+                    else path.name.removesuffix("_out.sdf")
+                )
+                rows.append(
+                    {
+                        "compound_id": compound_id,
+                        "engine": engine,
+                        "best_score_kcal_mol": None,
+                        "cnn_score": None,
+                        "cnn_affinity": None,
+                        "lddm_mean_uncertainty": mean_coordinate_uncertainty(
+                            molecule
+                        ),
+                        "pose_file": path.name,
+                        "pose_index": pose_index,
+                        "pose_selection_criterion": "lowest_mean_coordinate_uncertainty",
+                    }
+                )
+        return rows
     vina_pattern = re.compile(r"REMARK VINA RESULT:\s*(-?\d+(?:\.\d+)?)")
     minimized_pattern = re.compile(r"REMARK\s+minimizedAffinity\s+(-?\d+(?:\.\d+)?)")
     cnn_pattern = re.compile(r"REMARK\s+CNNscore\s+(-?\d+(?:\.\d+)?)")
@@ -783,12 +817,15 @@ def finalize_docking_campaign_job(run_dir: Path, *, returncode: int) -> JobRecor
     size_payload = dict(metadata.get("size") or {})
     center = tuple(float(center_payload[axis]) for axis in "xyz")
     size = tuple(float(size_payload[axis]) for axis in "xyz")
-    score_rows, pose_diagnostics = docking_pose_diagnostics(
-        run_dir,
-        score_rows,
-        center=center,
-        size=size,
-    )
+    if safe_engine == "lddm":
+        pose_diagnostics = {}
+    else:
+        score_rows, pose_diagnostics = docking_pose_diagnostics(
+            run_dir,
+            score_rows,
+            center=center,
+            size=size,
+        )
     score_rows = [
         row
         for row in score_rows
@@ -810,6 +847,7 @@ def finalize_docking_campaign_job(run_dir: Path, *, returncode: int) -> JobRecor
             "best_score_kcal_mol",
             "cnn_score",
             "cnn_affinity",
+            "lddm_mean_uncertainty",
             "pose_file",
             "pose_index",
             "pose_selection_criterion",
@@ -926,11 +964,13 @@ def finalize_docking_campaign_job(run_dir: Path, *, returncode: int) -> JobRecor
         for compound_id in {pair[0] for pair in completed_pairs}
         if sum(pair[0] == compound_id for pair in completed_pairs) == replicates
     }
-    summary_rows = _replicate_summary_rows(score_rows)
+    summary_rows = (
+        [] if safe_engine == "lddm" else _replicate_summary_rows(score_rows)
+    )
     for row in summary_rows:
         row.update(pose_diagnostics.get(str(row.get("compound_id") or ""), {}))
     summary_path = run_dir / "docking_replicate_summary.csv"
-    if replicates > 1:
+    if replicates > 1 and safe_engine != "lddm":
         with summary_path.open("w", newline="") as handle:
             fields = [
                 "compound_id",
@@ -1021,6 +1061,9 @@ def finalize_docking_campaign_job(run_dir: Path, *, returncode: int) -> JobRecor
             )
         ),
     }
+    if safe_engine == "lddm":
+        result["pose_scoring"] = "not_provided_by_LDDM"
+        result["affinity_estimated"] = False
     _write_json(run_dir / "result.json", result)
     artifacts = [
         ArtifactRef.from_path(run_dir, scores_path, "docking_scores", role="ranked_scores"),
@@ -1064,10 +1107,14 @@ def finalize_docking_campaign_job(run_dir: Path, *, returncode: int) -> JobRecor
                 pose_set_path,
                 "pose_set",
                 role="docked_poses",
-                metadata={"compound_count": len(score_rows), "engine": safe_engine},
+                metadata={
+                    "compound_count": len({str(row.get("compound_id") or "") for row in score_rows}),
+                    "pose_count": len(score_rows),
+                    "engine": safe_engine,
+                },
             )
         )
-    if replicates > 1:
+    if replicates > 1 and safe_engine != "lddm":
         artifacts.append(
             ArtifactRef.from_path(
                 run_dir,
@@ -1098,6 +1145,200 @@ def finalize_docking_campaign_job(run_dir: Path, *, returncode: int) -> JobRecor
     return JobRecord.load(run_dir, task_group="docking")
 
 
+def _run_lddm_docking_campaign_job(
+    *,
+    receptor_path: Path,
+    target_artifact: ArtifactRef,
+    compound_paths: Sequence[Path],
+    compound_artifacts: Sequence[ArtifactRef],
+    center: tuple[float, float, float],
+    size: tuple[float, float, float],
+    box_mode: str,
+    box_padding_angstrom: float | None,
+    image: str,
+    gpu_device: str,
+    poses: int,
+    reference_ligand_path: Path | None,
+    reference_ligand_artifact: ArtifactRef | None,
+    replicates: int,
+    seed_start: int,
+    maximum_compounds: int,
+    lddm_checkpoint_path: str,
+    lddm_n_steps: int,
+    lddm_sampler: str,
+    lddm_sampling_noise: float,
+    launch_campaign_id: str,
+    launch_campaign_label: str,
+    campaign_purpose: str,
+    enqueue_only: bool,
+) -> JobRecord:
+    """Run fixed-topology LDDM pose sampling in a docking campaign."""
+    if reference_ligand_path is None:
+        raise ValueError("LDDM docking requires a coordinate-bearing reference ligand")
+    checkpoint_path = str(
+        lddm_checkpoint_path or next(iter(LDDM_CHECKPOINTS.values()))
+    )
+    if checkpoint_path not in LDDM_CHECKPOINTS.values():
+        raise ValueError("Unsupported LDDM checkpoint selection")
+    checkpoint = reference_root() / checkpoint_path
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"LDDM checkpoint is missing: {checkpoint_path}")
+    poses = int(poses)
+    replicates = int(replicates)
+    seed_start = int(seed_start)
+    if not 1 <= poses <= 100:
+        raise ValueError("LDDM poses per compound must be between 1 and 100")
+    if not 1 <= replicates <= 100:
+        raise ValueError("LDDM replicates must be between 1 and 100")
+    if seed_start < 1 or seed_start + replicates - 1 >= 2_147_483_647:
+        raise ValueError("LDDM seed range must contain positive 32-bit integers")
+    if int(lddm_n_steps) < 1:
+        raise ValueError("LDDM integration steps must be positive")
+    if not 0.0 <= float(lddm_sampling_noise) <= 20.0:
+        raise ValueError("LDDM sampling noise must be between 0 and 20")
+    if lddm_sampler not in {"ForwardEuler", "HeunSampler"}:
+        raise ValueError(f"Unsupported LDDM sampler: {lddm_sampler}")
+    if not image or image == DEFAULT_DOCKING_IMAGE:
+        image = "mn-lddm:cu128-f254fb4"
+
+    records = load_compound_records(compound_paths, maximum=maximum_compounds)
+    run_id = str(uuid4())
+    run_dir = runs_root() / "docking" / run_id
+    input_dir = run_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=False)
+    (run_dir / "prepared").mkdir()
+    (run_dir / "results").mkdir()
+    (input_dir / "receptor.pdb").write_bytes(receptor_path.read_bytes())
+    (input_dir / "reference_ligand.sdf").write_bytes(reference_ligand_path.read_bytes())
+    with (input_dir / "compounds.tsv").open("w", newline="") as handle:
+        output = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        output.writerow(["compound_id", "smiles"])
+        output.writerows((item["compound_id"], item["smiles"]) for item in records)
+
+    selected_device = str(gpu_device).strip().lower().removeprefix("device=")
+    gpu_ids = (
+        None
+        if selected_device in {"", "all"}
+        else tuple(int(value) for value in selected_device.split(","))
+    )
+    command = build_docker_command(
+        DockerRunSpec(
+            tool=registered_tool("lddm_generation", image=image),
+            command=(
+                "--operation", "lddm-docking-campaign",
+                "--target", "/work/input/receptor.pdb",
+                "--reference-ligand", "/work/input/reference_ligand.sdf",
+                "--checkpoint", f"/references/{checkpoint_path}",
+                "--docking-compounds", "/work/input/compounds.tsv",
+                "--output", "/work/results",
+                "--count", str(int(poses)),
+                "--batch-size", str(int(poses)),
+                "--replicates", str(int(replicates)),
+                "--seed", str(int(seed_start)),
+                "--n-steps", str(int(lddm_n_steps)),
+                "--sampler", str(lddm_sampler),
+                "--sampling-noise", str(float(lddm_sampling_noise)),
+            ),
+            mounts=(
+                DockerMount(run_dir, "/work"),
+                DockerMount(reference_root(), "/references", read_only=True),
+            ),
+            gpu_enabled=True,
+            gpu_devices=gpu_ids,
+            use_host_user=False,
+        )
+    )
+    now = _utc_now_iso()
+    metadata: dict[str, Any] = {
+        "schema_version": JOB_SCHEMA_VERSION,
+        "run_id": run_id,
+        "job_code": short_job_code(run_id),
+        "job_type": "docking_campaign",
+        "workflow": "docking_campaign",
+        "operation": "docking",
+        "status": "queued" if enqueue_only else "running",
+        "engine": "lddm",
+        "tool": "lddm",
+        "parent_run_id": target_artifact.run_id,
+        "prepared_target_run_id": target_artifact.run_id,
+        "compound_run_ids": list(dict.fromkeys(item.run_id for item in compound_artifacts)),
+        "compound_count": len(records),
+        "launch_campaign_id": str(launch_campaign_id),
+        "launch_campaign_label": str(launch_campaign_label),
+        "campaign_purpose": str(campaign_purpose),
+        "center": {axis: float(value) for axis, value in zip("xyz", center)},
+        "size": {axis: float(value) for axis, value in zip("xyz", size)},
+        "box_mode": str(box_mode),
+        "box_padding_angstrom": float(box_padding_angstrom) if box_padding_angstrom is not None else None,
+        "mode": "reference_ligand_pocket",
+        "poses_per_compound": int(poses),
+        "replicates": int(replicates),
+        "seed_start": int(seed_start),
+        "use_scrub": False,
+        "docker_image": image,
+        "gpu_device": str(gpu_device),
+        "lddm_checkpoint_path": checkpoint_path,
+        "lddm_n_steps": int(lddm_n_steps),
+        "lddm_sampler": str(lddm_sampler),
+        "lddm_sampling_noise": float(lddm_sampling_noise),
+        "affinity_estimated": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _write_json(run_dir / "metadata.json", metadata)
+    _write_json(
+        run_dir / "input.json",
+        {
+            "target_artifact": target_artifact.to_dict(),
+            "compound_artifacts": [item.to_dict() for item in compound_artifacts],
+            "reference_ligand_artifact": reference_ligand_artifact.to_dict() if reference_ligand_artifact else None,
+            "parameters": {
+                key: metadata[key]
+                for key in (
+                    "engine", "compound_count", "poses_per_compound", "replicates",
+                    "seed_start", "lddm_checkpoint_path", "lddm_n_steps", "lddm_sampler",
+                    "lddm_sampling_noise", "launch_campaign_id", "launch_campaign_label",
+                    "campaign_purpose",
+                )
+            },
+            "command": [value.replace(str(run_dir), "<run-dir>") for value in command],
+        },
+    )
+    tool = registered_tool("lddm_generation", image=image)
+    resources = tool.resources.to_dict()
+    if gpu_ids:
+        resources["gpu_ids"] = list(gpu_ids)
+    write_registered_command_record(
+        run_dir,
+        tool_id="lddm_generation",
+        commands=(command,),
+        image=image,
+        selected_gpu_ids=gpu_ids or (),
+    )
+    if enqueue_only:
+        metadata.update(
+            {
+                "status": "queued",
+                "queued_at": now,
+                "queued_command": command,
+                "gpu_queued": True,
+                "resources": resources,
+                "worker_finalizer": "docking_campaign",
+            }
+        )
+        _write_json(run_dir / "metadata.json", metadata)
+        write_artifact_manifest(run_dir, [])
+        return JobRecord.load(run_dir, task_group="docking")
+    try:
+        process = subprocess.run(command, capture_output=True, text=True, check=False)
+        returncode, stdout, stderr = int(process.returncode), process.stdout or "", process.stderr or ""
+    except Exception as exc:
+        returncode, stdout, stderr = -1, "", str(exc)
+    (run_dir / "stdout.log").write_text(stdout)
+    (run_dir / "stderr.log").write_text(stderr)
+    return finalize_docking_campaign_job(run_dir, returncode=returncode)
+
+
 def run_docking_campaign_job(
     *,
     receptor_path: Path,
@@ -1125,6 +1366,10 @@ def run_docking_campaign_job(
     maximum_compounds: int = 0,
     cpu_workers: int | None = None,
     compound_timeout_minutes: int | None = None,
+    lddm_checkpoint_path: str = "",
+    lddm_n_steps: int = 100,
+    lddm_sampler: str = "ForwardEuler",
+    lddm_sampling_noise: float = 5.0,
     extra_args: Sequence[str] = (),
     launch_campaign_id: str = "",
     launch_campaign_label: str = "",
@@ -1132,9 +1377,36 @@ def run_docking_campaign_job(
     enqueue_only: bool = False,
 ) -> JobRecord:
     safe_engine = str(engine).strip().lower()
-    if safe_engine not in {"udp", "vina", "gnina"}:
+    if safe_engine not in {"udp", "vina", "gnina", "lddm"}:
         raise ValueError(f"Unsupported docking engine: {engine}")
     safe_mode = str(mode).strip().lower()
+    if safe_engine == "lddm":
+        return _run_lddm_docking_campaign_job(
+            receptor_path=receptor_path,
+            target_artifact=target_artifact,
+            compound_paths=compound_paths,
+            compound_artifacts=compound_artifacts,
+            center=center,
+            size=size,
+            box_mode=box_mode,
+            box_padding_angstrom=box_padding_angstrom,
+            image=image,
+            gpu_device=gpu_device,
+            poses=poses,
+            reference_ligand_path=reference_ligand_path,
+            reference_ligand_artifact=reference_ligand_artifact,
+            replicates=replicates,
+            seed_start=seed_start,
+            maximum_compounds=maximum_compounds,
+            lddm_checkpoint_path=lddm_checkpoint_path,
+            lddm_n_steps=lddm_n_steps,
+            lddm_sampler=lddm_sampler,
+            lddm_sampling_noise=lddm_sampling_noise,
+            launch_campaign_id=launch_campaign_id,
+            launch_campaign_label=launch_campaign_label,
+            campaign_purpose=campaign_purpose,
+            enqueue_only=enqueue_only,
+        )
     if safe_engine == "udp" and safe_mode not in {"classic", "hybrid"}:
         raise ValueError(f"Unsupported receptor docking mode: {mode}")
     if safe_engine == "udp" and safe_mode == "hybrid" and reference_ligand_path is None:

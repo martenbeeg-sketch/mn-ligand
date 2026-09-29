@@ -24,6 +24,7 @@ from mn_ligand.core.jobs import (
     short_job_code,
 )
 from mn_ligand.runtime import reference_root, runs_root
+from mn_ligand.workflows.lddm import LDDM_CHECKPOINTS
 
 
 GENERATION_TASK_GROUP = "molecule-generation"
@@ -53,7 +54,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "OMTRA",
         "Multi-condition foundation models",
         "omtra_generation",
-        "ovolig-omtra-cu128:latest",
+        "mn-omtra:cu128-745127d",
         ("pocket", "reference_ligand", "pharmacophore", "protein_pharmacophore"),
         ("generation/omtra/checkpoint.ckpt",),
         "Pocket-, ligand-, pharmacophore-, and combined protein/pharmacophore-conditioned 3D design.",
@@ -65,7 +66,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "FLOWR.root",
         "Multi-condition foundation models",
         "flowr_root_generation",
-        "ovolig-flowr-root-cu128:latest",
+        "mn-flowr-root:cu128-b2263e2",
         ("pocket", "reference_ligand", "interaction_profile", "scaffold", "fragment"),
         ("generation/flowr_root/flowr_root_v2.2.ckpt",),
         "Pocket-aware generation with ProLIF interaction conditioning, scaffold hopping, growing, and inpainting.",
@@ -77,7 +78,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "PocketXMol",
         "Pocket and fragment design",
         "pocketxmol_generation",
-        "ovolig-pocketxmol-cu128:latest",
+        "mn-pocketxmol:cu128-65488cf",
         ("pocket", "reference_ligand", "scaffold", "fragment"),
         (
             "generation/pocketxmol/data/trained_models/pxm_use/checkpoints/pocketxmol.ckpt",
@@ -96,7 +97,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "conDitar",
         "Pocket and property optimization",
         "conditar_generation",
-        "ovolig-conditar-cu128:latest",
+        "mn-conditar:cu128-4294d286",
         ("pocket", "reference_ligand"),
         (
             "generation/conditar/Diff.pt",
@@ -112,7 +113,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "conDitar + paOPT",
         "Pocket and property optimization",
         "paopt_generation",
-        "ovolig-paopt-cu128:latest",
+        "mn-paopt:cu128-4294d286",
         ("pocket", "reference_ligand", "property_objectives"),
         (
             "generation/conditar/Diff.pt",
@@ -128,7 +129,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "DrugRPG",
         "Pocket and property optimization",
         "drugrpg_generation",
-        "ovolig-drugrpg-cu128:latest",
+        "mn-drugrpg:cu128-6fa0e41",
         ("pocket", "reference_ligand"),
         ("generation/drugrpg/training.pt",),
         "Physics-guided pocket-conditioned diffusion for custom target pockets.",
@@ -140,7 +141,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "PFM",
         "Pocket de novo generation",
         "pfm_generation",
-        "ovolig-pfm-cu128:latest",
+        "mn-pfm:cu128-33be6c1",
         ("pocket",),
         (
             "generation/pfm/pfm.pth",
@@ -157,7 +158,7 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         "PocketFlow",
         "Pocket de novo generation",
         "pocketflow_generation",
-        "ovolig-pocketflow-cu128:latest",
+        "mn-pocketflow:cu128-a31a5a0",
         ("pocket",),
         (
             "generation/pocketflow/ZINC-pretrained-255000.pt",
@@ -167,11 +168,23 @@ GENERATOR_SPECS: tuple[GeneratorSpec, ...] = (
         adapter_ready=True,
     ),
     GeneratorSpec(
+        "lddm",
+        "LDDM",
+        "Pocket and fragment design",
+        "lddm_generation",
+        "mn-lddm:cu128-f254fb4",
+        ("pocket", "reference_ligand", "fragment"),
+        ("generation/lddm/lddm_CDBB.ckpt",),
+        "Pocket-conditioned de novo design and fragment growing with selectable CD+BB (MIT) or CD+BB+BN (CC-BY-NC 4.0) weights.",
+        integration_status="experimental",
+        adapter_ready=True,
+    ),
+    GeneratorSpec(
         "pgmg",
         "PGMG",
         "Pharmacophore-first design",
         "pgmg_generation",
-        "ovolig-pgmg-cu128:latest",
+        "mn-pgmg:cu128-85fb712",
         ("pharmacophore",),
         (
             "generation/pgmg/model.pth",
@@ -502,9 +515,18 @@ def queue_generation_job(
         )
     if requested_count < 1:
         raise ValueError("Requested molecule count must be positive")
+    settings = dict(engine_settings or {})
+    required_references = spec.reference_paths
+    if spec.engine_id == "lddm":
+        checkpoint_path = str(
+            settings.get("checkpoint_path") or spec.reference_paths[0]
+        )
+        if checkpoint_path not in LDDM_CHECKPOINTS.values():
+            raise ValueError("Unsupported LDDM checkpoint selection")
+        required_references = (checkpoint_path,)
     missing_references = [
         value
-        for value in spec.reference_paths
+        for value in required_references
         if not (reference_root() / value).is_file()
     ]
     if missing_references:
@@ -532,6 +554,10 @@ def queue_generation_job(
         )
     if spec.engine_id == "paopt" and reference_artifact is None:
         raise ValueError("paOPT requires a reference ligand")
+    if spec.engine_id == "lddm" and reference_artifact is None:
+        raise ValueError(
+            "LDDM requires a reference ligand to identify the binding pocket"
+        )
     required_contacts = pharmacophore_required_contacts(
         pharmacophore_artifact
     )
@@ -602,7 +628,6 @@ def queue_generation_job(
             )
         pharmacophore_path = reference_path
 
-    settings = dict(engine_settings or {})
     command_arguments = [
         "--output",
         "/work/native",
@@ -706,6 +731,55 @@ def queue_generation_job(
                 f"/work/{pocket_path.relative_to(run_dir).as_posix()}",
             ]
         )
+    elif spec.engine_id == "lddm":
+        if target_path is None or reference_path is None:
+            raise ValueError(
+                "LDDM requires both a prepared target and a reference ligand"
+            )
+        command_arguments.extend(
+            [
+                "--target",
+                f"/work/{target_path.relative_to(run_dir).as_posix()}",
+                "--reference-ligand",
+                f"/work/{reference_path.relative_to(run_dir).as_posix()}",
+                "--n-steps",
+                str(max(1, int(settings.get("n_steps") or 100))),
+                "--sampler",
+                str(settings.get("sampler") or "ForwardEuler"),
+                "--sampling-noise",
+                str(float(settings.get("sampling_noise", 5.0))),
+            ]
+        )
+        selected_checkpoint = str(
+            settings.get("checkpoint_path") or spec.reference_paths[0]
+        )
+        command_arguments[command_arguments.index("--checkpoint") + 1] = (
+            f"/references/{selected_checkpoint}"
+        )
+        molecule_size = str(settings.get("molecule_size") or "").strip()
+        if str(settings.get("redesign_mode") or "") == "fragment_growing":
+            fragment_size = len(settings.get("preserve_atom_indices") or ())
+            grow_size = max(1, int(settings.get("grow_size") or 10))
+            molecule_size = str(fragment_size + grow_size)
+        if molecule_size:
+            command_arguments.extend(["--molecule-size", molecule_size])
+        fragment_growing = (
+            str(settings.get("redesign_mode") or "") == "fragment_growing"
+            or "grow or link" in str(engine_mode).lower()
+        )
+        if fragment_growing:
+            command_arguments.extend(
+                [
+                    "--fragment-ligand",
+                    f"/work/{reference_path.relative_to(run_dir).as_posix()}",
+                ]
+            )
+        if str(settings.get("redesign_mode") or "") == "fragment_growing":
+            command_arguments.extend(["--redesign-mode", "fragment_growing"])
+            for value in settings.get("preserve_atom_indices") or ():
+                command_arguments.extend(
+                    ["--preserve-atom-index", str(int(value))]
+                )
     elif spec.engine_id == "conditar":
         command_arguments.extend(
             [
@@ -937,6 +1011,11 @@ def queue_generation_job(
         "campaign_run_id": campaign_job.run_id,
         "target_run_id": target_artifact.run_id,
         "engine_mode": str(engine_mode),
+        "checkpoint_path": (
+            str(settings.get("checkpoint_path") or spec.reference_paths[0])
+            if spec.engine_id == "lddm"
+            else ""
+        ),
         "requested_count": int(requested_count),
         "batch_size": max(1, int(batch_size)),
         "max_runtime_seconds": max_runtime_seconds,

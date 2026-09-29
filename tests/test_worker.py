@@ -19,6 +19,7 @@ from mn_ligand.core.resources import (
     GPUCapacity,
     ResourceSnapshot,
     acquire_cpu_lease,
+    shared_state_dir,
 )
 
 
@@ -367,6 +368,7 @@ def test_worker_honors_cancellation_request(tmp_path: Path, monkeypatch) -> None
     config = WorkerConfig.create(runs_dir=tmp_path, gpu_ids=(), heartbeat_seconds=0.05)
 
     class FakeProcess:
+        pid = 987654
         returncode: int | None = None
 
         def poll(self) -> int | None:
@@ -385,13 +387,25 @@ def test_worker_honors_cancellation_request(tmp_path: Path, monkeypatch) -> None
     def fake_popen(*_: object, **__: object) -> Any:
         return FakeProcess()
 
+    process = FakeProcess()
+
+    def fake_killpg(pid: int, _: int) -> None:
+        assert pid == process.pid
+        process.terminate()
+
+    monkeypatch.setattr("mn_ligand.core.worker.os.killpg", fake_killpg)
+
     def request_cancellation(_: float) -> None:
         metadata_path = run_dir / "metadata.json"
         metadata = json.loads(metadata_path.read_text())
         metadata["cancellation_requested"] = True
         metadata_path.write_text(json.dumps(metadata))
 
-    result = run_worker_once(config, popen=fake_popen, sleep=request_cancellation)
+    result = run_worker_once(
+        config,
+        popen=lambda *_args, **_kwargs: process,
+        sleep=request_cancellation,
+    )
 
     assert result is not None and result["status"] == "cancelled"
     assert json.loads((run_dir / "metadata.json").read_text())["status"] == "cancelled"
@@ -552,7 +566,7 @@ def test_worker_waits_for_shared_cpu_slots_then_releases_reservation(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(tmp_path))
-    monkeypatch.setenv("MN_LIGAND_CPU_PROCESS_LIMIT", "4")
+    monkeypatch.setenv("MN_COMPUTE_SCHEDULER_CPU_SLOTS", "4")
     run_dir = _queue(
         tmp_path,
         "cpu-pool-1",
@@ -563,7 +577,7 @@ def test_worker_waits_for_shared_cpu_slots_then_releases_reservation(
         3,
         run_id="already-running",
         worker_id="other-worker",
-        runs_dir=tmp_path,
+        state_root=shared_state_dir(),
         capacity=4,
     )
     assert held is not None
@@ -583,14 +597,14 @@ def test_worker_waits_for_shared_cpu_slots_then_releases_reservation(
     completed = json.loads((run_dir / "metadata.json").read_text())
     assert completed["reserved_cpu_threads"] == 2
     assert completed["cpu_pool_capacity"] == 4
-    assert not list((tmp_path / ".worker" / "locks").glob("cpu-[0-9]*.json"))
+    assert not list((shared_state_dir() / ".worker" / "locks").glob("cpu-[0-9]*.json"))
 
 
 def test_gpu_worker_uses_the_same_shared_cpu_pool(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(tmp_path))
-    monkeypatch.setenv("MN_LIGAND_CPU_PROCESS_LIMIT", "4")
+    monkeypatch.setenv("MN_COMPUTE_SCHEDULER_CPU_SLOTS", "4")
     run_dir = _queue(
         tmp_path,
         "gpu-cpu-pool-1",
@@ -601,7 +615,7 @@ def test_gpu_worker_uses_the_same_shared_cpu_pool(
         4,
         run_id="cpu-owner",
         worker_id="cpu-worker",
-        runs_dir=tmp_path,
+        state_root=shared_state_dir(),
         capacity=4,
     )
     assert held is not None
@@ -619,7 +633,7 @@ def test_gpu_worker_uses_the_same_shared_cpu_pool(
     )
 
     assert run_worker_once(config) is None
-    assert not (tmp_path / ".worker" / "locks" / "gpu-0.json").exists()
+    assert not (shared_state_dir() / ".worker" / "locks" / "gpu-0.json").exists()
     waiting = json.loads((run_dir / "metadata.json").read_text())
     assert "shared 4-thread CPU pool" in waiting["admission"]["reasons"][0]
     assert held.release()
@@ -628,7 +642,7 @@ def test_gpu_worker_uses_the_same_shared_cpu_pool(
 
     assert result is not None and result["gpu_id"] == 0
     assert result["cpu_threads"] == 1
-    assert not list((tmp_path / ".worker" / "locks").glob("cpu-[0-9]*.json"))
+    assert not list((shared_state_dir() / ".worker" / "locks").glob("cpu-[0-9]*.json"))
 
 
 def test_worker_rejects_impossible_request_and_continues_queue(

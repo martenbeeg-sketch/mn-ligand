@@ -92,6 +92,7 @@ def test_running_gpu_cancellation_terminates_process_and_releases_lease(
     _write_json(job.run_dir / "metadata.json", metadata)
 
     class Process:
+        pid = 987655
         returncode: int | None = None
         terminated = False
 
@@ -110,6 +111,12 @@ def test_running_gpu_cancellation_terminates_process_and_releases_lease(
             return int(self.returncode or 0)
 
     process = Process()
+
+    def fake_killpg(pid: int, _: int) -> None:
+        assert pid == process.pid
+        process.terminate()
+
+    monkeypatch.setattr("mn_ligand.core.worker.os.killpg", fake_killpg)
 
     def request_cancel(_seconds: float) -> None:
         current = JobRecord.load(job.run_dir, task_group=job.task_group)

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mn_ligand.app.pages.run_resources import resource_rows
 from mn_ligand.core.worker_health import inspect_worker_health, record_worker_heartbeat
+from mn_ligand.core.resources import shared_state_dir
 
 
 def test_worker_health_combines_systemd_heartbeat_queue_and_lease(tmp_path: Path) -> None:
@@ -30,10 +33,19 @@ def test_worker_health_combines_systemd_heartbeat_queue_and_lease(tmp_path: Path
         run_id="active-1",
         selected_gpu=0,
     )
-    lock_dir = tmp_path / ".worker" / "locks"
+    lock_dir = shared_state_dir() / ".worker" / "locks"
     lock_dir.mkdir(parents=True)
     (lock_dir / "gpu-0.json").write_text(
-        json.dumps({"run_id": "active-1", "owner_id": "mn-ligand-gpu-0"})
+        json.dumps(
+            {
+                "run_id": "active-1",
+                "owner_id": "mn-ligand-gpu-0",
+                "app_id": "mn-ligand",
+                "gpu_id": 0,
+                "pid": os.getpid(),
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
     )
     for slot in range(4):
         (lock_dir / f"cpu-{slot}.json").write_text(
@@ -41,7 +53,11 @@ def test_worker_health_combines_systemd_heartbeat_queue_and_lease(tmp_path: Path
                 {
                     "run_id": "active-1",
                     "owner_id": "mn-ligand-gpu-0",
+                    "app_id": "mn-ligand",
                     "cpu_slot": slot,
+                    "requested_cpu_threads": 4,
+                    "pid": os.getpid(),
+                    "heartbeat_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
         )

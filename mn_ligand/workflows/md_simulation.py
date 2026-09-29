@@ -63,8 +63,8 @@ from mn_ligand.workflows.bound_ligand_md import parse_bound_ligands
 
 
 MD_WORKFLOW_TYPE = "md-simulation"
-DEFAULT_MD_IMAGE = "ovolig-md-cu128:latest"
-DEFAULT_GROMACS_MD_IMAGE = "ovolig-gromacs-cu128:latest"
+DEFAULT_MD_IMAGE = "mn-md:cu128"
+DEFAULT_GROMACS_MD_IMAGE = "mn-gromacs:2026.3-cu128"
 EXACT_CONTINUATION = "exact_checkpoint"
 INDEPENDENT_REPLICA = "independent_replica"
 HISTORICAL_MD_WORKFLOW_STATES = frozenset(

@@ -178,6 +178,13 @@ def test_campaign_queues_engine_specific_native_controls(
         "drugrpg": {"max_atoms": 36},
         "pfm": {},
         "pgmg": {},
+        "lddm": {
+            "checkpoint_path": "generation/lddm/lddm_CDBB.ckpt",
+            "n_steps": 100,
+            "sampler": "ForwardEuler",
+            "sampling_noise": 5.0,
+            "molecule_size": 32,
+        },
     }
     for value in settings.values():
         value.update(

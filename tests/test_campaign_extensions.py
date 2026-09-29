@@ -177,7 +177,7 @@ def test_openvs_extension_uses_missing_repetition_ids(tmp_path: Path) -> None:
     runner = 'for replicate in $(seq 1 "$OPENVS_REPLICATES"); do\n  true\ndone\n'
     command = [
         "docker", "run", "--rm", "-e", "OPENVS_REPLICATES=1", "-e",
-        "OPENVS_SEED_START=1001", "openvs:local", "bash", "/workspace/input/run_openvs.sh",
+        "OPENVS_SEED_START=1001", "mn-openvs:local", "bash", "/workspace/input/run_openvs.sh",
     ]
     job = _job(tmp_path, "openvs_docking", command, {"replicates": 1, "seed_start": 1001})
     (job.run_dir / "input" / "run_openvs.sh").write_text(runner)
@@ -196,7 +196,7 @@ def test_openvs_extension_uses_missing_repetition_ids(tmp_path: Path) -> None:
 
 
 def test_openvs_completed_repetitions_use_native_directories(tmp_path: Path) -> None:
-    job = _job(tmp_path, "openvs_docking", ["docker", "run", "openvs:local"], {"replicates": 3})
+    job = _job(tmp_path, "openvs_docking", ["docker", "run", "mn-openvs:local"], {"replicates": 3})
     for replicate in (1, 2, 3):
         output = job.run_dir / "native" / f"replicate_{replicate:03d}"
         chunk = output / "ligands_000"
@@ -210,7 +210,7 @@ def test_openvs_completed_repetitions_use_native_directories(tmp_path: Path) -> 
 
 
 def test_openvs_incomplete_nonempty_directory_is_not_completed(tmp_path: Path) -> None:
-    command = ["docker", "run", "openvs:local"]
+    command = ["docker", "run", "mn-openvs:local"]
     job = _job(tmp_path, "openvs_docking", command, {"replicates": 3})
     incomplete = job.run_dir / "native" / "replicate_001" / "ligands_000"
     incomplete.mkdir(parents=True)
@@ -230,7 +230,7 @@ def test_openvs_recovery_marks_logical_repetition_complete(tmp_path: Path) -> No
     runner = 'for replicate in $(seq 1 "$OPENVS_REPLICATES"); do\n  true\ndone\n'
     command = [
         "docker", "run", "--rm", "-e", "OPENVS_REPLICATES=1", "-e",
-        "OPENVS_SEED_START=1001", "openvs:local", "bash", "/workspace/input/run_openvs.sh",
+        "OPENVS_SEED_START=1001", "mn-openvs:local", "bash", "/workspace/input/run_openvs.sh",
     ]
     job = _job(tmp_path, "openvs_docking", command, {"replicates": 1, "seed_start": 1001})
     job.metadata["recovered_repetition_indices"] = [1]

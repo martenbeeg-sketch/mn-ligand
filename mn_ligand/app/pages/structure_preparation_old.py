@@ -283,7 +283,7 @@ def _run_udp_redocking_from_prepared_structure(
     center: tuple[float, float, float],
     size: tuple[float, float, float],
     exhaustiveness: int,
-    docker_image: str = "avgu-docking-suite-cuda:latest",
+    docker_image: str = "mn-docking-suite:cu128",
 ) -> dict:
     run_id = str(uuid4())
     run_dir = _run_root() / "structure-jobs" / structure_run_id / "docking_runs" / run_id
@@ -855,7 +855,7 @@ def render() -> None:
                             center=(float(center_x), float(center_y), float(center_z)),
                             size=(float(size_x), float(size_y), float(size_z)),
                             exhaustiveness=int(exhaustiveness),
-                            docker_image="avgu-docking-suite-cuda:latest",
+                            docker_image="mn-docking-suite:cu128",
                         )
                     result = run.get("result", {})
                     if bool(result.get("success")):

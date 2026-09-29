@@ -26,6 +26,7 @@ TASK_LABELS = {
     "structure-jobs": "Structure Import",
     "structure-docking": "Docking",
     "docking": "Docking",
+    "lddm-evaluation": "LDDM Pose Agreement",
     "batch-docking": "Virtual Screening",
     "prepared-structures": "Legacy Structure Import",
     "boltz2": "Structure Prediction",
@@ -248,7 +249,7 @@ def render() -> None:
     date_filter = filter_row[3].selectbox(
         "Created",
         ["Any time", "Today", "Last 7 days", "Last 30 days"],
-        index=1,
+        index=0,
         key="unified_jobs_date",
     )
 
@@ -299,7 +300,7 @@ def render() -> None:
         return
 
     st.dataframe(
-        filtered[["job", "status", "task", "tool", "workflow", "progress", "gpu", "artifacts", "detail", "created_at"]],
+        filtered[["job", "status", "task", "tool", "workflow", "progress", "gpu", "artifacts", "warning", "detail", "created_at"]],
         hide_index=True,
         width="stretch",
         column_config={

@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Callable, Sequence
 from uuid import uuid4
 
-from mn_ligand.core.resources import cpu_pool_capacity
+from mn_ligand.core.resources import (
+    active_resource_reservations,
+    cpu_pool_capacity,
+    shared_state_dir,
+)
 from mn_ligand.runtime import runs_root
 
 
@@ -156,20 +160,23 @@ def inspect_worker_health(
     root = (run_dir or runs_root()).resolve()
     queued_jobs = len(iter_queued_jobs(root))
     cpu_capacity = cpu_pool_capacity()
-    cpu_slots_leased = len(
-        tuple((root / ".worker" / "locks").glob("cpu-[0-9]*.json"))
-    )
+    shared_root = shared_state_dir()
+    reservations = active_resource_reservations(shared_root)
+    cpu_slots_leased = sum(len(row.get("cpu_slots") or []) for row in reservations)
+    reserved_gpu_ids = {
+        str(device)
+        for row in reservations
+        for device in row.get("gpu_devices") or []
+    }
     services: list[WorkerServiceHealth] = []
-    active_leases = 0
+    active_leases = len(reserved_gpu_ids)
     for gpu_id_value in gpu_ids:
         gpu_id = int(gpu_id_value)
         unit = f"mn-ligand-worker@{gpu_id}.service"
         properties, error = _systemd_properties(unit, runner=runner)
         worker_id = f"mn-ligand-gpu-{gpu_id}"
         heartbeat = _read_json(worker_heartbeat_path(root, worker_id))
-        lease = _read_json(root / ".worker" / "locks" / f"gpu-{gpu_id}.json")
-        if lease:
-            active_leases += 1
+        lease = _read_json(shared_root / ".worker" / "locks" / f"gpu-{gpu_id}.json")
         heartbeat_age = _age_seconds(heartbeat.get("heartbeat_at"))
         active = properties.get("ActiveState") == "active"
         substate = properties.get("SubState") or "unavailable"

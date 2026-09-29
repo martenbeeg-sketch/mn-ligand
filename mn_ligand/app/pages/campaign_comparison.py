@@ -82,6 +82,14 @@ from mn_ligand.workflows.pose_similarity import (
 
 
 ENGINE_METRICS: dict[str, tuple[tuple[str, str, bool], ...]] = {
+    # LDDM uncertainty is a pose-confidence estimate, not energy or affinity.
+    "LDDM": (
+        (
+            "lddm_mean_uncertainty",
+            "Mean coordinate uncertainty (lower is more confident)",
+            False,
+        ),
+    ),
     "AutoDock Vina": (
         ("best_score_kcal_mol", "Docking score (kcal/mol)", False),
     ),
@@ -203,6 +211,7 @@ PRIMARY_METRIC = {
 STRUCTURE_ENGINE_ORDER = (
     "AlphaFold 3",
     "Boltz-2",
+    "LDDM",
     "GNINA",
     "Uni-Dock Pro",
     "AutoDock Vina",
@@ -1089,8 +1098,8 @@ def _campaign_results_workbook(
     raw = _campaign_raw_attempt_rows(metrics)
     sheets = {
         "All raw data": raw,
-        "Metric values": long,
-        "Metrics by repeat": wide,
+        "Metrics long": long,
+        "Metrics by replicate": wide,
         "Selected campaigns": selected_jobs,
         "Pose validity": pose_rows,
         "Pose provenance": pose_provenance,
@@ -1406,6 +1415,8 @@ def _native_metric_plots_zip(
             plt.close(figure)
             png_path = f"plots/{slug}.png"
             archive.writestr(png_path, png_buffer.getvalue())
+            csv_path = f"data/{slug}.csv"
+            archive.writestr(csv_path, _csv_bytes(prepared))
             manifest["plots"].append(
                 {
                     "engine": engine,
@@ -1415,6 +1426,7 @@ def _native_metric_plots_zip(
                     "compound_label_mode": compound_label_mode,
                     "compound_label_layout": compound_label_layout,
                     "png": png_path,
+                    "csv": csv_path,
                     "rows": len(prepared),
                 }
             )
@@ -1453,6 +1465,7 @@ STRUCTURE_ENGINE_STYLES.update(
         "GNINA · Vina-ranked": ("redCarbon", "red"),
     }
 )
+STRUCTURE_ENGINE_STYLES["AutoDock Vina"] = ("yellowCarbon", "yellow")
 
 # Fixed across campaigns so color intensity has the same scientific meaning
 # in every matrix. Values beyond the displayed maximum use the worst color
@@ -2570,6 +2583,7 @@ def _engine_name(workflow: str, tool: str) -> str:
             "gnina": "GNINA",
             "udp": "Uni-Dock Pro",
             "unidock": "Uni-Dock Pro",
+            "lddm": "LDDM",
         }.get(normalized, tool or workflow)
     if workflow == "openvs_docking":
         return "RosettaLigand"
@@ -3556,6 +3570,7 @@ def load_campaign_comparison_data(
                     for column in (
                         "replicate",
                         "seed",
+                        "pose_index",
                         "model_seed",
                         "prediction_id",
                         "model_id",
@@ -3670,6 +3685,12 @@ def load_campaign_comparison_data(
                 )
                 for column in selection_frame.columns:
                     frame[column] = selection_frame[column]
+            if engine == "LDDM" and "pose_index" in frame:
+                frame["_viewer_pose_index"] = (
+                    pd.to_numeric(frame["pose_index"], errors="coerce")
+                    .fillna(1)
+                    .astype(int)
+                )
             frame["_ligand_smiles"] = frame["candidate_id"].map(
                 compound_smiles
             ).fillna(compound_default_smiles)
@@ -7492,6 +7513,12 @@ def _render_correlations(frame: pd.DataFrame) -> None:
             "At least two metrics with five overlapping compounds are needed."
         )
         return
+    if frame.get("engine", pd.Series(dtype=str)).astype(str).eq("LDDM").any():
+        st.caption(
+            "LDDM contributes sampled poses for structural comparison. It does "
+            "not report docking energy or binding affinity, so it has no score "
+            "ranking in this view."
+        )
     metric_scope = st.segmented_control(
         "Metric set",
         ("Focused summary", "All available metrics", "Custom"),
@@ -15021,30 +15048,34 @@ def _render_target_structural_explorer(frame: pd.DataFrame) -> None:
             ),
         )
     rmsd_tab, structures_tab = st.tabs(
-        ("RMSD & pose agreement", "3D structures")
+        ("RMSD & pose agreement", "3D structures"),
+        key="campaign-target-structural-view-tabs",
+        on_change="rerun",
     )
-    with rmsd_tab:
-        st.markdown("## RMSD and pose agreement")
-        st.caption(
-            "Every selected pose is reported, including a reason when it "
-            "cannot enter an RMSD matrix."
-        )
-        _render_rmsd_analysis(
-            focused,
-            gnina_criterion_label=gnina_criterion_label,
-        )
-    with structures_tab:
-        st.markdown("## 3D structures")
-        st.caption(
-            "This view uses the same targets, compounds, repetitions, target "
-            "presentation, and GNINA ranking as the RMSD tab. Engines may be "
-            "hidden locally below without changing the RMSD matrices."
-        )
-        _render_target_viewer_context(
-            focused,
-            gnina_criterion_label=gnina_criterion_label,
-            available_frame=frame,
-        )
+    if rmsd_tab.open:
+        with rmsd_tab:
+            st.markdown("## RMSD and pose agreement")
+            st.caption(
+                "Every selected pose is reported, including a reason when it "
+                "cannot enter an RMSD matrix."
+            )
+            _render_rmsd_analysis(
+                focused,
+                gnina_criterion_label=gnina_criterion_label,
+            )
+    if structures_tab.open:
+        with structures_tab:
+            st.markdown("## 3D structures")
+            st.caption(
+                "This view uses the same targets, compounds, repetitions, target "
+                "presentation, and GNINA ranking as the RMSD tab. Engines may be "
+                "hidden locally below without changing the RMSD matrices."
+            )
+            _render_target_viewer_context(
+                focused,
+                gnina_criterion_label=gnina_criterion_label,
+                available_frame=frame,
+            )
 
 
 def target_compound_matrix(selected_metrics: pd.DataFrame) -> pd.DataFrame:
@@ -15603,13 +15634,41 @@ def render() -> None:
         st.markdown("## 3D structures")
         _render_structure_comparison(selected_metrics)
         return
+    # These preferences are edited in Native metrics and also affect charts in
+    # the other tabs. Read their persisted values before the lazy tab bodies so
+    # those panels can render independently.
+    compound_label_mode = str(
+        st.session_state.get(
+            "campaign_native_compound_label_mode_v2", "Compound IDs"
+        )
+        or "Compound IDs"
+    )
+    compound_label_layout = str(
+        st.session_state.get(
+            "campaign_native_compound_label_layout", "Automatic"
+        )
+        or "Automatic"
+    )
+    repetition_mode = str(
+        st.session_state.get(
+            "campaign_native_repetition_mode", "Best repetitions"
+        )
+        or "Best repetitions"
+    )
+    best_repetition_count = int(
+        st.session_state.get("campaign_native_best_repetitions", 1) or 1
+    )
     (
         overview_tab,
         scores_tab,
         structural_tab,
         explorer_tab,
         workspace_tab,
-    ) = st.tabs(campaign_perspective_labels(campaign_shape))
+    ) = st.tabs(
+        campaign_perspective_labels(campaign_shape),
+        key="campaign-comparison-main-tabs",
+        on_change="rerun",
+    )
     with scores_tab:
         (
             native_tab,
@@ -15617,971 +15676,989 @@ def render() -> None:
             rescoring_tab,
             consensus_tab,
         ) = st.tabs(
-            ["Native metrics", "Correlations", "Rescoring", "Consensus"]
+            ["Native metrics", "Correlations", "Rescoring", "Consensus"],
+            key="campaign-comparison-score-tabs",
+            on_change="rerun",
         )
     with structural_tab:
         pose_validation_tab, interaction_analysis_tab = st.tabs(
-            ["Pose validity", "Interactions"]
+            ["Pose validity", "Interactions"],
+            key="campaign-comparison-structural-tabs",
+            on_change="rerun",
         )
     viewer_tab = explorer_tab
     with workspace_tab:
-        data_tab, collections_tab = st.tabs(["Data", "Analysis Sets"])
-    with overview_tab:
-        summary_columns = st.columns(4)
-        summary_columns[0].metric("Engine runs", len(selected_jobs))
-        summary_columns[1].metric(
-            "Engines", selected_jobs["engine"].nunique()
+        data_tab, collections_tab = st.tabs(
+            ["Data", "Analysis Sets"],
+            key="campaign-comparison-workspace-tabs",
+            on_change="rerun",
         )
-        summary_columns[2].metric(
-            (
-                "Prepared targets"
-                if target_ligand_comparison
-                else "Compounds"
-            ),
-            (
-                selected_jobs["target_run_id"].nunique()
-                if target_ligand_comparison
-                else selected_metrics["candidate_id"].nunique()
-            ),
-        )
-        summary_columns[3].metric(
-            "Metric rows", len(selected_metrics)
-        )
-        coverage_index = "target" if target_ligand_comparison else "candidate_id"
-        coverage_source = selected_jobs if target_ligand_comparison else selected_metrics
-        coverage = pd.crosstab(
-            coverage_source[coverage_index],
-            coverage_source["engine"],
-        ).reset_index()
-        st.markdown("#### Result coverage")
-        st.dataframe(
-            coverage,
-            hide_index=True,
-            width="stretch",
-        )
-        if target_ligand_comparison:
-            _render_target_engine_coverage(selected_jobs)
-        st.markdown("#### Included campaigns")
-        st.dataframe(
-            selected_jobs[
-                [
-                    "result",
-                    "launch_campaign",
-                    "campaign",
-                    "target",
-                    "target_origin",
-                    "target_artifact",
-                    "dataset",
-                    "compound_count",
-                    "created_at",
-                ]
-            ],
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "result": st.column_config.LinkColumn(
-                    "Result", display_text="Open"
+    if overview_tab.open:
+        with overview_tab:
+            summary_columns = st.columns(4)
+            summary_columns[0].metric("Engine runs", len(selected_jobs))
+            summary_columns[1].metric(
+                "Engines", selected_jobs["engine"].nunique()
+            )
+            summary_columns[2].metric(
+                (
+                    "Prepared targets"
+                    if target_ligand_comparison
+                    else "Compounds"
                 ),
-                "created_at": st.column_config.DatetimeColumn(
-                    "Created", format="YYYY-MM-DD HH:mm"
+                (
+                    selected_jobs["target_run_id"].nunique()
+                    if target_ligand_comparison
+                    else selected_metrics["candidate_id"].nunique()
                 ),
-            },
-        )
-
-    with native_tab:
-        st.markdown("## Native engine metrics")
-        selected_engine_names = set(
-            selected_metrics["engine"].astype(str).unique()
-        )
-        preferred_order = (
-            *STRUCTURE_ENGINE_ORDER,
-            "Nesso-1",
-            "GNINA rescoring",
-            "Boltzina rescoring",
-        )
-        engine_options = [
-            engine
-            for engine in preferred_order
-            if engine in selected_engine_names
-        ] + sorted(selected_engine_names.difference(preferred_order))
-        st.caption(
-            "All selected engines are shown below. Each plot defaults to the "
-            "engine's primary scientific ranking output; use its selector to "
-            "inspect any other emitted score without hiding the other engines."
-        )
-        compound_names = selected_metrics.get(
-            "compound_name",
-            pd.Series("", index=selected_metrics.index),
-        ).fillna("").astype(str).str.strip()
-        named_compound_ids = set(
-            selected_metrics.loc[
-                ~compound_names.str.casefold().isin(
-                    {"", "nan", "none", "<na>"}
-                ),
-                "candidate_id",
-            ].astype(str)
-        )
-        total_compound_ids = selected_metrics["candidate_id"].astype(
-            str
-        ).nunique()
-        compound_label_mode = st.segmented_control(
-            "Compound labels in plots",
-            (
-                ("Compound IDs", "Compound names", "Names + IDs")
-                if named_compound_ids
-                else ("Compound IDs",)
-            ),
-            default="Compound IDs",
-            key="campaign_native_compound_label_mode_v2",
-            help=(
-                "Names come from preserved columns in the imported compound "
-                "dataset. Names + IDs writes the ID on a second line in "
-                "parentheses. Missing names display the ID alone."
-            ),
-        ) or "Compound IDs"
-        if named_compound_ids:
-            source_rows = selected_metrics.loc[
-                selected_metrics["compound_name_source_column"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .ne(""),
-                ["dataset", "compound_name_source_column"],
-            ].drop_duplicates()
-            mappings = "; ".join(
-                f"{row.dataset} → {row.compound_name_source_column}"
-                for row in source_rows.itertuples(index=False)
             )
-            st.caption(
-                f"Names available for {len(named_compound_ids)} of "
-                f"{total_compound_ids} compounds"
-                + (f". Source mapping: {mappings}." if mappings else ".")
+            summary_columns[3].metric(
+                "Metric rows", len(selected_metrics)
             )
-        else:
-            st.caption(
-                "The selected imported dataset has no separate compound-name "
-                "column; bar plots therefore use compound IDs."
-            )
-        compound_label_layout = st.segmented_control(
-            "Label visibility and plot layout",
-            ("Automatic", "Show all labels", "Compact"),
-            default="Automatic",
-            key="campaign_native_compound_label_layout",
-            help=(
-                "Automatic uses a vertical plot for up to 18 compounds and a "
-                "taller horizontal plot above that threshold. Show all labels "
-                "always uses the horizontal layout. Compact retains a vertical "
-                "plot and lets Altair thin overlapping labels."
-            ),
-        ) or "Automatic"
-        repetition_mode = st.segmented_control(
-            "Repetitions included",
-            (
-                "Best repetitions",
-                "Representative repetition",
-                "All repetitions",
-            ),
-            default="Best repetitions",
-            key="campaign_native_repetition_mode",
-            help=(
-                "Best repetitions retains the requested number of most "
-                "favorable independent attempts for each compound and logical "
-                "campaign. Representative repetition retains the attempt "
-                "closest to that group's median. All repetitions preserves "
-                "the complete replicate distribution."
-            ),
-        )
-        best_repetition_count = 1
-        if repetition_mode == "Best repetitions":
-            best_repetition_count = int(
-                st.number_input(
-                    "Best repetitions per compound and campaign",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key="campaign_native_best_repetitions",
-                    help=(
-                        "The scientific direction of each selected metric is "
-                        "used automatically. The default retains only its best "
-                        "attempt."
-                    ),
-                )
-            )
-            st.caption(
-                "Best-attempt summaries are useful for inspecting achievable "
-                "poses but are optimistically selected. Use Representative "
-                "repetition or All repetitions to assess typical behavior and "
-                "replicate variability."
-            )
-        native_plot_exports: list[dict[str, object]] = []
-        for engine_index, engine in enumerate(engine_options):
-            definitions = ENGINE_METRICS.get(engine, ())
-            engine_rows = selected_metrics.loc[
-                selected_metrics["engine"].eq(engine)
-            ]
-            available_metrics = [
-                definition
-                for definition in definitions
-                if definition[0] in selected_metrics
-                and pd.to_numeric(
-                    engine_rows[definition[0]],
-                    errors="coerce",
-                ).notna().any()
-            ]
-            if not available_metrics:
-                continue
-            if engine_index:
-                st.divider()
-            st.markdown(f"### {engine}")
-            metric_groups: list[
-                tuple[str, str, list[tuple[str, str, bool]]]
-            ]
-            if engine == "GNINA":
-                metric_groups = [
-                    (
-                        "CNN-ranked pose",
-                        "GNINA · CNN-ranked",
-                        [
-                            definition
-                            for definition in available_metrics
-                            if definition[0].startswith("cnn_ranked_")
-                        ],
-                    ),
-                    (
-                        "Vina-ranked pose",
-                        "GNINA · Vina-ranked",
-                        [
-                            definition
-                            for definition in available_metrics
-                            if definition[0].startswith("empirical_ranked_")
-                        ],
-                    ),
-                ]
-            else:
-                metric_groups = [("", engine, available_metrics)]
-
-            for group_label, plot_engine, group_metrics in metric_groups:
-                if not group_metrics:
-                    continue
-                if group_label:
-                    st.markdown(f"#### {group_label}")
-                metric_lookup = {
-                    metric: (label, direction)
-                    for metric, label, direction in group_metrics
-                }
-                metric_options = list(metric_lookup)
-                primary_metric = PRIMARY_METRIC.get(plot_engine)
-                default_index = (
-                    metric_options.index(primary_metric)
-                    if primary_metric in metric_options
-                    else 0
-                )
-                metric = st.selectbox(
-                    f"{group_label or engine} score",
-                    metric_options,
-                    index=default_index,
-                    format_func=lambda value, lookup=metric_lookup: lookup[value][0],
-                    key=(
-                        "campaign_native_metric_"
-                        + plot_engine.lower()
-                        .replace(" ", "_")
-                        .replace("-", "_")
-                        .replace("·", "_")
-                    ),
-                )
-                metric_label, higher_is_better = metric_lookup[metric]
-                reference_semantics = METRIC_REFERENCE_REGISTRY.get(metric)
-                st.caption(
-                    f"{metric_label}: "
-                    + (
-                        "higher values rank better."
-                        if higher_is_better
-                        else "lower values rank better."
-                    )
-                    + " Error bars show mean ± sample SD across available "
-                    "independent attempts."
-                    + (
-                        f" Reference: {reference_semantics['reference']}. "
-                        f"{reference_semantics['meaning']}"
-                        if reference_semantics
-                        else ""
-                    )
-                )
-                selected_attempt_rows = select_metric_attempts(
-                    engine_rows,
-                    metric,
-                    mode=str(repetition_mode),
-                    best_count=best_repetition_count,
-                    higher_is_better=higher_is_better,
-                )
-                native_summary = summarize_metric(
-                    selected_attempt_rows,
-                    metric,
-                )
-                native_plot_exports.append(
-                    {
-                        "engine": plot_engine,
-                        "metric": metric,
-                        "metric_label": metric_label,
-                        "higher_is_better": higher_is_better,
-                        "compare_targets": target_ligand_comparison,
-                        "compound_label_mode": compound_label_mode,
-                        "compound_label_layout": compound_label_layout,
-                        "summary": native_summary,
-                    }
-                )
-                st.altair_chart(
-                    _metric_chart(
-                        native_summary,
-                        metric_label,
-                        higher_is_better=higher_is_better,
-                        compare_targets=target_ligand_comparison,
-                        compound_label_mode=compound_label_mode,
-                        compound_label_layout=compound_label_layout,
-                    ),
-                    width="stretch",
-                )
-                with st.expander(f"{plot_engine} summarized values"):
-                    st.dataframe(
-                        native_summary.sort_values(
-                            "Mean",
-                            ascending=not higher_is_better,
-                        ),
-                        hide_index=True,
-                        width="stretch",
-                    )
-
-        if native_plot_exports:
-            with st.expander("Download selected graphs"):
-                st.caption(
-                    "Choose from the engine graphs currently visible above. "
-                    "The ZIP contains one 220-DPI Matplotlib PNG per graph and "
-                    "a manifest. Numerical data are exported separately in the "
-                    "normalized CSV bundle below."
-                )
-                export_engines = [
-                    str(plot["engine"]) for plot in native_plot_exports
-                ]
-                selected_plot_engines = st.multiselect(
-                    "Graphs to include",
-                    export_engines,
-                    default=export_engines,
-                    key="campaign_native_plot_exports",
-                )
-                selected_plot_exports = [
-                    plot
-                    for plot in native_plot_exports
-                    if str(plot["engine"]) in selected_plot_engines
-                ]
-                plot_signature = json.dumps(
-                    {
-                        "repetition_mode": repetition_mode,
-                        "best_count": best_repetition_count,
-                        "compound_label_mode": compound_label_mode,
-                        "compound_label_layout": compound_label_layout,
-                        "plots": [
-                            {
-                                "engine": plot["engine"],
-                                "metric": plot["metric"],
-                                "summary": plot["summary"].to_json(
-                                    orient="split", date_format="iso"
-                                ),
-                            }
-                            for plot in selected_plot_exports
-                        ],
-                    },
-                    sort_keys=True,
-                )
-                native_zip_key = "campaign_native_plot_zip"
-                if st.button(
-                    "Prepare PNG ZIP",
-                    disabled=not selected_plot_exports,
-                    key="prepare_campaign_native_plot_zip",
-                ):
-                    with st.spinner("Rendering selected graphs…"):
-                        st.session_state[native_zip_key] = {
-                            "signature": plot_signature,
-                            "data": _native_metric_plots_zip(
-                                selected_plot_exports,
-                                repetition_mode=str(repetition_mode),
-                            ),
-                        }
-                prepared_plot_zip = st.session_state.get(native_zip_key)
-                if (
-                    isinstance(prepared_plot_zip, dict)
-                    and prepared_plot_zip.get("signature") == plot_signature
-                    and isinstance(prepared_plot_zip.get("data"), bytes)
-                ):
-                    st.download_button(
-                        "Download selected graphs (.zip)",
-                        data=prepared_plot_zip["data"],
-                        file_name="native-engine-metric-plots.zip",
-                        mime="application/zip",
-                        key="download_campaign_native_plot_zip",
-                    )
-
-        database_export_signature = _campaign_workbook_signature(
-            export_jobs,
-            data_metrics,
-        )
-        metric_csv_state_key = "campaign_comparison_metric_csv_export"
-        database_export_state_key = "campaign_comparison_csv_bundle_export"
-        with st.expander(
-            "Download database-ready data (CSV)", expanded=True
-        ):
-            st.caption(
-                "The ZIP uses a normalized relational layout suitable for "
-                "PostgreSQL, SQLite, DuckDB, pandas, R, and similar systems. "
-                "Its primary metric_observations.csv file has one numeric "
-                "observation per row and the same fixed columns for every "
-                "engine. Engine-specific outputs are values of metric_name, "
-                "not separate columns. Additional CSV relations preserve "
-                "campaign, pose-validation, and interaction evidence. Every "
-                "selected repetition is exported, independent of the plot "
-                "display mode. A calculation-ready wide view is also offered "
-                "with adjacent repeat_1, repeat_2, repeat_3, … columns. "
-                "Boltz-2 and AlphaFold 3 use one engine-ranked representative "
-                "structure per independent repeat. Geometry diagnostics are "
-                "excluded; selection fields are used only for engines such as "
-                "GNINA that have multiple ranking tracks."
-            )
-            if st.button(
-                "Prepare metric observations CSV",
-                key="prepare_campaign_metric_csv",
-            ):
-                with st.spinner("Serializing normalized metric observations…"):
-                    try:
-                        metric_rows = _campaign_database_metric_rows(
-                            data_metrics
-                        )
-                        repeat_matrix = _campaign_database_repeat_matrix(
-                            data_metrics
-                        )
-                        st.session_state[metric_csv_state_key] = {
-                            "signature": database_export_signature,
-                            "data": _csv_bytes(metric_rows),
-                            "repeat_data": _csv_bytes(repeat_matrix),
-                        }
-                    except Exception as exc:
-                        st.session_state.pop(metric_csv_state_key, None)
-                        st.error(f"Metric CSV export failed: {exc}")
-            prepared_metric_csv = st.session_state.get(metric_csv_state_key)
-            if (
-                isinstance(prepared_metric_csv, dict)
-                and prepared_metric_csv.get("signature")
-                == database_export_signature
-                and isinstance(prepared_metric_csv.get("data"), bytes)
-            ):
-                st.download_button(
-                    "Download serial metric observations (.csv)",
-                    data=prepared_metric_csv["data"],
-                    file_name="campaign-metric-observations.csv",
-                    mime="text/csv",
-                    key="download_campaign_metric_csv",
-                )
-                if isinstance(
-                    prepared_metric_csv.get("repeat_data"), bytes
-                ):
-                    st.download_button(
-                        "Download repeat columns for calculations (.csv)",
-                        data=prepared_metric_csv["repeat_data"],
-                        file_name="campaign-metric-repeats-wide.csv",
-                        mime="text/csv",
-                        key="download_campaign_metric_repeats_csv",
-                    )
-            st.caption(
-                "For linked pose-validation and interaction tables, prepare "
-                "the complete multi-table archive below."
-            )
-            if st.button(
-                "Prepare complete CSV bundle with linked evidence",
-                key="prepare_campaign_comparison_csv_bundle",
-            ):
-                with st.spinner(
-                    "Normalizing all repetitions and collecting linked pose "
-                    "validity and interaction relations…"
-                ):
-                    try:
-                        csv_bundle = _collect_campaign_results_csv_bundle(
-                            run_root,
-                            export_jobs,
-                            data_metrics,
-                        )
-                        st.session_state[database_export_state_key] = {
-                            "signature": database_export_signature,
-                            "data": csv_bundle,
-                        }
-                    except Exception as exc:
-                        st.session_state.pop(database_export_state_key, None)
-                        st.error(f"CSV export failed: {exc}")
-            prepared_database_export = st.session_state.get(
-                database_export_state_key
-            )
-            if (
-                isinstance(prepared_database_export, dict)
-                and prepared_database_export.get("signature")
-                == database_export_signature
-                and isinstance(prepared_database_export.get("data"), bytes)
-            ):
-                st.download_button(
-                    "Download normalized campaign data (.zip)",
-                    data=prepared_database_export["data"],
-                    file_name="campaign-database-csv-export.zip",
-                    mime="application/zip",
-                    key="download_campaign_comparison_csv",
-                )
-
-    with correlation_tab:
-        st.markdown("## Cross-engine correlations")
-        if target_ligand_comparison:
-            _render_target_correlations(selected_metrics)
-        else:
-            st.caption(
-                "Correlations compare compounds, not raw replicate rows. Use "
-                "them to identify agreement or disagreement between scoring "
-                "systems; they do not establish experimental validity."
-            )
-            _render_correlations(selected_metrics)
-
-    with rescoring_tab:
-        st.markdown("## Rescoring")
-        _render_rescoring_comparison(linked_rescoring_metrics)
-
-    with consensus_tab:
-        st.markdown("## Consensus ranking")
-        st.caption(
-            (
-                "Prepared targets are ranked independently within each selected "
-                "native engine metric, then direction-aware percentiles are "
-                "combined. Independent attempts contribute mean and sample SD, "
-                "not additional target observations."
-            )
-            if target_ligand_comparison
-            else (
-                "Raw docking scores, Rosetta energy units, AF3 confidence and "
-                "learned affinity values are not pooled. Each campaign is first "
-                "converted to a within-campaign percentile (1 = best), then "
-                "percentiles are summarized across selected engines and "
-                "campaigns. To avoid inflating a compound through a tiny "
-                "selected subset, consensus includes only campaigns covering at "
-                "least 80% of the best-covered selected campaign and at least "
-                "two compounds. Subset rescoring remains available in Native "
-                "metrics and Data. This is a prioritization aid, not a "
-                "calibrated binding score."
-            )
-        )
-        if not target_ligand_comparison:
-            st.caption(
-                f"Compound labels: {compound_label_mode}. Layout: "
-                f"{compound_label_layout}. Change these controls in Native "
-                "metrics; the same settings apply to consensus plots."
-            )
-        if target_ligand_comparison:
-            _render_target_consensus(selected_metrics)
-        consensus = (
-            pd.DataFrame()
-            if target_ligand_comparison
-            else consensus_percentiles(selected_metrics)
-        )
-        if consensus.empty:
-            if not target_ligand_comparison:
-                st.info(
-                    "No primary metrics are available for consensus ranking."
-                )
-        else:
-            combined = (
-                consensus.groupby("candidate_id")[
-                    "Within-campaign percentile"
-                ]
-                .agg(["mean", "std", "count"])
-                .reset_index()
-                .rename(
-                    columns={
-                        "mean": "Mean percentile",
-                        "std": "Sample SD",
-                        "count": "Contributing campaigns",
-                    }
-                )
-                .sort_values("Mean percentile", ascending=False)
-            )
-            combined["Sample SD"] = combined["Sample SD"].fillna(0.0)
-            compound_name_lookup = (
-                consensus[["candidate_id", "compound_name"]]
-                .drop_duplicates("candidate_id")
-                .set_index("candidate_id")["compound_name"]
-                if "compound_name" in consensus
-                else pd.Series(dtype=str)
-            )
-            combined["compound_name"] = combined["candidate_id"].map(
-                compound_name_lookup
-            ).fillna("")
-            combined_plot = _with_compound_plot_labels(
-                combined,
-                label_mode=compound_label_mode,
-            )
-            compound_order = combined_plot["_compound_plot_label"].tolist()
-            consensus_horizontal = (
-                compound_label_layout == "Show all labels"
-                or (
-                    compound_label_layout == "Automatic"
-                    and len(combined_plot) > 18
-                )
-            )
-            consensus_axis_options: dict[str, object] = {
-                "labelLimit": 420 if consensus_horizontal else 220,
-                "labelOverlap": (
-                    "greedy"
-                    if compound_label_layout == "Compact"
-                    else False
-                ),
-            }
-            consensus_label_expression = _compound_axis_label_expression(
-                compound_label_mode
-            )
-            if consensus_label_expression:
-                consensus_axis_options["labelExpr"] = (
-                    consensus_label_expression
-                )
-            consensus_tooltips = [
-                alt.Tooltip("candidate_id:N", title="Compound ID"),
-                alt.Tooltip("compound_name:N", title="Compound name"),
-                alt.Tooltip("Mean percentile:Q", format=".3f"),
-                alt.Tooltip("Sample SD:Q", format=".3f"),
-                "Contributing campaigns:Q",
-            ]
-            if consensus_horizontal:
-                chart = (
-                    alt.Chart(combined_plot)
-                    .mark_bar(color="#7c3aed")
-                    .encode(
-                        y=alt.Y(
-                            "_compound_plot_label:N",
-                            sort=compound_order,
-                            title="Compound",
-                            axis=alt.Axis(**consensus_axis_options),
-                        ),
-                        x=alt.X(
-                            "Mean percentile:Q",
-                            scale=alt.Scale(domain=[0, 1]),
-                            title="Mean within-campaign percentile",
-                        ),
-                        tooltip=consensus_tooltips,
-                    )
-                    .properties(height=max(390, 30 * len(combined_plot)))
-                )
-            else:
-                consensus_axis_options["labelAngle"] = -45
-                chart = (
-                    alt.Chart(combined_plot)
-                    .mark_bar(color="#7c3aed")
-                    .encode(
-                        x=alt.X(
-                            "_compound_plot_label:N",
-                            sort=compound_order,
-                            title="Compound",
-                            axis=alt.Axis(**consensus_axis_options),
-                        ),
-                        y=alt.Y(
-                            "Mean percentile:Q",
-                            scale=alt.Scale(domain=[0, 1]),
-                            title="Mean within-campaign percentile",
-                        ),
-                        tooltip=consensus_tooltips,
-                    )
-                    .properties(height=390)
-                )
-            st.altair_chart(chart, width="stretch")
-            by_target = (
-                consensus.groupby(["candidate_id", "target"])[
-                    "Within-campaign percentile"
-                ]
-                .agg(["mean", "count"])
-                .reset_index()
-                .rename(
-                    columns={
-                        "mean": "Mean percentile",
-                        "count": "Contributing campaigns",
-                    }
-                )
-            )
-            by_target["compound_name"] = by_target["candidate_id"].map(
-                compound_name_lookup
-            ).fillna("")
-            by_target = _with_compound_plot_labels(
-                by_target,
-                label_mode=compound_label_mode,
-            )
-            if by_target["target"].nunique() > 1:
-                st.markdown("#### Target-by-compound profile")
-                st.caption(
-                    "This matrix keeps targets separate. A compound that ranks "
-                    "high for one target and low for another may be a useful "
-                    "selectivity signal, subject to experimental validation."
-                )
-                target_heatmap = (
-                    alt.Chart(by_target)
-                    .mark_rect()
-                    .encode(
-                        x=alt.X(
-                            "target:N",
-                            title="Target",
-                            axis=alt.Axis(labelAngle=-25, labelLimit=240),
-                        ),
-                        y=alt.Y(
-                            "_compound_plot_label:N",
-                            title="Compound",
-                            sort=compound_order,
-                            axis=alt.Axis(
-                                labelLimit=420,
-                                labelOverlap=False,
-                                **(
-                                    {
-                                        "labelExpr": consensus_label_expression
-                                    }
-                                    if consensus_label_expression
-                                    else {}
-                                ),
-                            ),
-                        ),
-                        color=alt.Color(
-                            "Mean percentile:Q",
-                            title="Mean percentile",
-                            scale=alt.Scale(
-                                domain=[0, 1],
-                                scheme="viridis",
-                            ),
-                        ),
-                        tooltip=[
-                            alt.Tooltip(
-                                "candidate_id:N", title="Compound ID"
-                            ),
-                            alt.Tooltip(
-                                "compound_name:N", title="Compound name"
-                            ),
-                            alt.Tooltip("target:N", title="Target"),
-                            alt.Tooltip(
-                                "Mean percentile:Q", format=".3f"
-                            ),
-                            "Contributing campaigns:Q",
-                        ],
-                    )
-                    .properties(height=max(260, 28 * len(combined)))
-                )
-                st.altair_chart(target_heatmap, width="stretch")
-                st.dataframe(
-                    by_target.pivot(
-                        index=["candidate_id", "compound_name"],
-                        columns="target",
-                        values="Mean percentile",
-                    ).reset_index(),
-                    hide_index=True,
-                    width="stretch",
-                )
-            engine_matrix = (
-                consensus.groupby(["candidate_id", "engine"])[
-                    "Within-campaign percentile"
-                ]
-                .mean()
-                .unstack("engine")
-                .reset_index()
-            )
-            by_engine = (
-                consensus.groupby(["candidate_id", "engine"])[
-                    "Within-campaign percentile"
-                ]
-                .agg(["mean", "count"])
-                .reset_index()
-                .rename(
-                    columns={
-                        "mean": "Mean percentile",
-                        "count": "Contributing campaigns",
-                    }
-                )
-            )
-            by_engine["compound_name"] = by_engine["candidate_id"].map(
-                compound_name_lookup
-            ).fillna("")
-            by_engine = _with_compound_plot_labels(
-                by_engine,
-                label_mode=compound_label_mode,
-            )
-            if by_engine["engine"].nunique() > 1:
-                st.markdown("#### Engine-by-compound profile")
-                st.caption(
-                    "Agreement across engines strengthens prioritization; large "
-                    "differences identify model-dependent predictions worth "
-                    "reviewing rather than averaging away."
-                )
-                engine_heatmap = (
-                    alt.Chart(by_engine)
-                    .mark_rect()
-                    .encode(
-                        x=alt.X("engine:N", title="Engine"),
-                        y=alt.Y(
-                            "_compound_plot_label:N",
-                            title="Compound",
-                            sort=compound_order,
-                            axis=alt.Axis(
-                                labelLimit=420,
-                                labelOverlap=False,
-                                **(
-                                    {
-                                        "labelExpr": consensus_label_expression
-                                    }
-                                    if consensus_label_expression
-                                    else {}
-                                ),
-                            ),
-                        ),
-                        color=alt.Color(
-                            "Mean percentile:Q",
-                            title="Mean percentile",
-                            scale=alt.Scale(
-                                domain=[0, 1],
-                                scheme="viridis",
-                            ),
-                        ),
-                        tooltip=[
-                            alt.Tooltip(
-                                "candidate_id:N", title="Compound ID"
-                            ),
-                            alt.Tooltip(
-                                "compound_name:N", title="Compound name"
-                            ),
-                            alt.Tooltip("engine:N", title="Engine"),
-                            alt.Tooltip(
-                                "Mean percentile:Q", format=".3f"
-                            ),
-                            "Contributing campaigns:Q",
-                        ],
-                    )
-                    .properties(height=max(260, 28 * len(combined)))
-                )
-                st.altair_chart(engine_heatmap, width="stretch")
+            coverage_index = "target" if target_ligand_comparison else "candidate_id"
+            coverage_source = selected_jobs if target_ligand_comparison else selected_metrics
+            coverage = pd.crosstab(
+                coverage_source[coverage_index],
+                coverage_source["engine"],
+            ).reset_index()
+            st.markdown("#### Result coverage")
             st.dataframe(
-                combined.merge(engine_matrix, on="candidate_id"),
+                coverage,
                 hide_index=True,
                 width="stretch",
             )
-
-    with pose_validation_tab:
-        st.markdown("## Pose validity")
-        if target_ligand_comparison:
-            _render_target_pose_validation(run_root, selected_jobs)
-        else:
-            _render_pose_validation_summary(
-                run_root,
-                selected_jobs,
-                selected_metrics,
+            if target_ligand_comparison:
+                _render_target_engine_coverage(selected_jobs)
+            st.markdown("#### Included campaigns")
+            st.dataframe(
+                selected_jobs[
+                    [
+                        "result",
+                        "launch_campaign",
+                        "campaign",
+                        "target",
+                        "target_origin",
+                        "target_artifact",
+                        "dataset",
+                        "compound_count",
+                        "created_at",
+                    ]
+                ],
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "result": st.column_config.LinkColumn(
+                        "Result", display_text="Open"
+                    ),
+                    "created_at": st.column_config.DatetimeColumn(
+                        "Created", format="YYYY-MM-DD HH:mm"
+                    ),
+                },
             )
 
-    with interaction_analysis_tab:
-        st.markdown("## Protein–ligand interactions")
-        _render_interaction_analysis_summary(
-            run_root,
-            selected_jobs,
-            selected_metrics,
-        )
-
-    with viewer_tab:
-        if target_ligand_comparison:
-            _render_target_structural_explorer(selected_metrics)
-        else:
-            explorer_view = st.segmented_control(
-                "Explore selected results",
-                explorer_options,
-                default="Target × compound matrix",
-                key="campaign_explorer_view",
+    if scores_tab.open and native_tab.open:
+        with native_tab:
+            st.markdown("## Native engine metrics")
+            selected_engine_names = set(
+                selected_metrics["engine"].astype(str).unique()
             )
-            if explorer_view == "Target × compound matrix":
-                _render_target_compound_explorer(selected_metrics)
-            elif explorer_view == "RMSD & pose agreement":
-                st.markdown("## RMSD and pose agreement")
-                _render_rmsd_analysis(selected_metrics)
-            elif explorer_view == "3D structures":
-                st.markdown("## 3D structures")
-                _render_structure_comparison(selected_metrics)
+            preferred_order = (
+                *STRUCTURE_ENGINE_ORDER,
+                "Nesso-1",
+                "GNINA rescoring",
+                "Boltzina rescoring",
+            )
+            engine_options = [
+                engine
+                for engine in preferred_order
+                if engine in selected_engine_names
+            ] + sorted(selected_engine_names.difference(preferred_order))
+            st.caption(
+                "All selected engines are shown below. Each plot defaults to the "
+                "engine's primary scientific ranking output; use its selector to "
+                "inspect any other emitted score without hiding the other engines."
+            )
+            compound_names = selected_metrics.get(
+                "compound_name",
+                pd.Series("", index=selected_metrics.index),
+            ).fillna("").astype(str).str.strip()
+            named_compound_ids = set(
+                selected_metrics.loc[
+                    ~compound_names.str.casefold().isin(
+                        {"", "nan", "none", "<na>"}
+                    ),
+                    "candidate_id",
+                ].astype(str)
+            )
+            total_compound_ids = selected_metrics["candidate_id"].astype(
+                str
+            ).nunique()
+            compound_label_mode = st.segmented_control(
+                "Compound labels in plots",
+                (
+                    ("Compound IDs", "Compound names", "Names + IDs")
+                    if named_compound_ids
+                    else ("Compound IDs",)
+                ),
+                default="Compound IDs",
+                key="campaign_native_compound_label_mode_v2",
+                help=(
+                    "Names come from preserved columns in the imported compound "
+                    "dataset. Names + IDs writes the ID on a second line in "
+                    "parentheses. Missing names display the ID alone."
+                ),
+            ) or "Compound IDs"
+            if named_compound_ids:
+                source_rows = selected_metrics.loc[
+                    selected_metrics["compound_name_source_column"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .ne(""),
+                    ["dataset", "compound_name_source_column"],
+                ].drop_duplicates()
+                mappings = "; ".join(
+                    f"{row.dataset} → {row.compound_name_source_column}"
+                    for row in source_rows.itertuples(index=False)
+                )
+                st.caption(
+                    f"Names available for {len(named_compound_ids)} of "
+                    f"{total_compound_ids} compounds"
+                    + (f". Source mapping: {mappings}." if mappings else ".")
+                )
             else:
-                _render_md_candidate_selection(
+                st.caption(
+                    "The selected imported dataset has no separate compound-name "
+                    "column; bar plots therefore use compound IDs."
+                )
+            compound_label_layout = st.segmented_control(
+                "Label visibility and plot layout",
+                ("Automatic", "Show all labels", "Compact"),
+                default="Automatic",
+                key="campaign_native_compound_label_layout",
+                help=(
+                    "Automatic uses a vertical plot for up to 18 compounds and a "
+                    "taller horizontal plot above that threshold. Show all labels "
+                    "always uses the horizontal layout. Compact retains a vertical "
+                    "plot and lets Altair thin overlapping labels."
+                ),
+            ) or "Automatic"
+            repetition_mode = st.segmented_control(
+                "Repetitions included",
+                (
+                    "Best repetitions",
+                    "Representative repetition",
+                    "All repetitions",
+                ),
+                default="Best repetitions",
+                key="campaign_native_repetition_mode",
+                help=(
+                    "Best repetitions retains the requested number of most "
+                    "favorable independent attempts for each compound and logical "
+                    "campaign. Representative repetition retains the attempt "
+                    "closest to that group's median. All repetitions preserves "
+                    "the complete replicate distribution."
+                ),
+            )
+            best_repetition_count = 1
+            if repetition_mode == "Best repetitions":
+                best_repetition_count = int(
+                    st.number_input(
+                        "Best repetitions per compound and campaign",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                        key="campaign_native_best_repetitions",
+                        help=(
+                            "The scientific direction of each selected metric is "
+                            "used automatically. The default retains only its best "
+                            "attempt."
+                        ),
+                    )
+                )
+                st.caption(
+                    "Best-attempt summaries are useful for inspecting achievable "
+                    "poses but are optimistically selected. Use Representative "
+                    "repetition or All repetitions to assess typical behavior and "
+                    "replicate variability."
+                )
+            native_plot_exports: list[dict[str, object]] = []
+            for engine_index, engine in enumerate(engine_options):
+                definitions = ENGINE_METRICS.get(engine, ())
+                engine_rows = selected_metrics.loc[
+                    selected_metrics["engine"].eq(engine)
+                ]
+                available_metrics = [
+                    definition
+                    for definition in definitions
+                    if definition[0] in selected_metrics
+                    and pd.to_numeric(
+                        engine_rows[definition[0]],
+                        errors="coerce",
+                    ).notna().any()
+                ]
+                if not available_metrics:
+                    continue
+                if engine_index:
+                    st.divider()
+                st.markdown(f"### {engine}")
+                metric_groups: list[
+                    tuple[str, str, list[tuple[str, str, bool]]]
+                ]
+                if engine == "GNINA":
+                    metric_groups = [
+                        (
+                            "CNN-ranked pose",
+                            "GNINA · CNN-ranked",
+                            [
+                                definition
+                                for definition in available_metrics
+                                if definition[0].startswith("cnn_ranked_")
+                            ],
+                        ),
+                        (
+                            "Vina-ranked pose",
+                            "GNINA · Vina-ranked",
+                            [
+                                definition
+                                for definition in available_metrics
+                                if definition[0].startswith("empirical_ranked_")
+                            ],
+                        ),
+                    ]
+                else:
+                    metric_groups = [("", engine, available_metrics)]
+
+                for group_label, plot_engine, group_metrics in metric_groups:
+                    if not group_metrics:
+                        continue
+                    if group_label:
+                        st.markdown(f"#### {group_label}")
+                    metric_lookup = {
+                        metric: (label, direction)
+                        for metric, label, direction in group_metrics
+                    }
+                    metric_options = list(metric_lookup)
+                    primary_metric = PRIMARY_METRIC.get(plot_engine)
+                    default_index = (
+                        metric_options.index(primary_metric)
+                        if primary_metric in metric_options
+                        else 0
+                    )
+                    metric = st.selectbox(
+                        f"{group_label or engine} score",
+                        metric_options,
+                        index=default_index,
+                        format_func=lambda value, lookup=metric_lookup: lookup[value][0],
+                        key=(
+                            "campaign_native_metric_"
+                            + plot_engine.lower()
+                            .replace(" ", "_")
+                            .replace("-", "_")
+                            .replace("·", "_")
+                        ),
+                    )
+                    metric_label, higher_is_better = metric_lookup[metric]
+                    reference_semantics = METRIC_REFERENCE_REGISTRY.get(metric)
+                    st.caption(
+                        f"{metric_label}: "
+                        + (
+                            "higher values rank better."
+                            if higher_is_better
+                            else "lower values rank better."
+                        )
+                        + " Error bars show mean ± sample SD across available "
+                        "independent attempts."
+                        + (
+                            f" Reference: {reference_semantics['reference']}. "
+                            f"{reference_semantics['meaning']}"
+                            if reference_semantics
+                            else ""
+                        )
+                    )
+                    selected_attempt_rows = select_metric_attempts(
+                        engine_rows,
+                        metric,
+                        mode=str(repetition_mode),
+                        best_count=best_repetition_count,
+                        higher_is_better=higher_is_better,
+                    )
+                    native_summary = summarize_metric(
+                        selected_attempt_rows,
+                        metric,
+                    )
+                    native_plot_exports.append(
+                        {
+                            "engine": plot_engine,
+                            "metric": metric,
+                            "metric_label": metric_label,
+                            "higher_is_better": higher_is_better,
+                            "compare_targets": target_ligand_comparison,
+                            "compound_label_mode": compound_label_mode,
+                            "compound_label_layout": compound_label_layout,
+                            "summary": native_summary,
+                        }
+                    )
+                    st.altair_chart(
+                        _metric_chart(
+                            native_summary,
+                            metric_label,
+                            higher_is_better=higher_is_better,
+                            compare_targets=target_ligand_comparison,
+                            compound_label_mode=compound_label_mode,
+                            compound_label_layout=compound_label_layout,
+                        ),
+                        width="stretch",
+                    )
+                    with st.expander(f"{plot_engine} summarized values"):
+                        st.dataframe(
+                            native_summary.sort_values(
+                                "Mean",
+                                ascending=not higher_is_better,
+                            ),
+                            hide_index=True,
+                            width="stretch",
+                        )
+
+            if native_plot_exports:
+                with st.expander("Download selected graphs"):
+                    st.caption(
+                        "Choose from the engine graphs currently visible above. "
+                        "The ZIP contains one 220-DPI Matplotlib PNG per graph and "
+                        "a manifest. Numerical data are exported separately in the "
+                        "normalized CSV bundle below."
+                    )
+                    export_engines = [
+                        str(plot["engine"]) for plot in native_plot_exports
+                    ]
+                    selected_plot_engines = st.multiselect(
+                        "Graphs to include",
+                        export_engines,
+                        default=export_engines,
+                        key="campaign_native_plot_exports",
+                    )
+                    selected_plot_exports = [
+                        plot
+                        for plot in native_plot_exports
+                        if str(plot["engine"]) in selected_plot_engines
+                    ]
+                    plot_signature = json.dumps(
+                        {
+                            "repetition_mode": repetition_mode,
+                            "best_count": best_repetition_count,
+                            "compound_label_mode": compound_label_mode,
+                            "compound_label_layout": compound_label_layout,
+                            "plots": [
+                                {
+                                    "engine": plot["engine"],
+                                    "metric": plot["metric"],
+                                    "summary": plot["summary"].to_json(
+                                        orient="split", date_format="iso"
+                                    ),
+                                }
+                                for plot in selected_plot_exports
+                            ],
+                        },
+                        sort_keys=True,
+                    )
+                    native_zip_key = "campaign_native_plot_zip"
+                    if st.button(
+                        "Prepare PNG ZIP",
+                        disabled=not selected_plot_exports,
+                        key="prepare_campaign_native_plot_zip",
+                    ):
+                        with st.spinner("Rendering selected graphs…"):
+                            st.session_state[native_zip_key] = {
+                                "signature": plot_signature,
+                                "data": _native_metric_plots_zip(
+                                    selected_plot_exports,
+                                    repetition_mode=str(repetition_mode),
+                                ),
+                            }
+                    prepared_plot_zip = st.session_state.get(native_zip_key)
+                    if (
+                        isinstance(prepared_plot_zip, dict)
+                        and prepared_plot_zip.get("signature") == plot_signature
+                        and isinstance(prepared_plot_zip.get("data"), bytes)
+                    ):
+                        st.download_button(
+                            "Download selected graphs (.zip)",
+                            data=prepared_plot_zip["data"],
+                            file_name="native-engine-metric-plots.zip",
+                            mime="application/zip",
+                            key="download_campaign_native_plot_zip",
+                        )
+
+            database_export_signature = _campaign_workbook_signature(
+                export_jobs,
+                data_metrics,
+            )
+            metric_csv_state_key = "campaign_comparison_metric_csv_export"
+            database_export_state_key = "campaign_comparison_csv_bundle_export"
+            with st.expander(
+                "Download database-ready data (CSV)", expanded=True
+            ):
+                st.caption(
+                    "The ZIP uses a normalized relational layout suitable for "
+                    "PostgreSQL, SQLite, DuckDB, pandas, R, and similar systems. "
+                    "Its primary metric_observations.csv file has one numeric "
+                    "observation per row and the same fixed columns for every "
+                    "engine. Engine-specific outputs are values of metric_name, "
+                    "not separate columns. Additional CSV relations preserve "
+                    "campaign, pose-validation, and interaction evidence. Every "
+                    "selected repetition is exported, independent of the plot "
+                    "display mode. A calculation-ready wide view is also offered "
+                    "with adjacent repeat_1, repeat_2, repeat_3, … columns. "
+                    "Boltz-2 and AlphaFold 3 use one engine-ranked representative "
+                    "structure per independent repeat. Geometry diagnostics are "
+                    "excluded; selection fields are used only for engines such as "
+                    "GNINA that have multiple ranking tracks."
+                )
+                if st.button(
+                    "Prepare metric observations CSV",
+                    key="prepare_campaign_metric_csv",
+                ):
+                    with st.spinner("Serializing normalized metric observations…"):
+                        try:
+                            metric_rows = _campaign_database_metric_rows(
+                                data_metrics
+                            )
+                            repeat_matrix = _campaign_database_repeat_matrix(
+                                data_metrics
+                            )
+                            st.session_state[metric_csv_state_key] = {
+                                "signature": database_export_signature,
+                                "data": _csv_bytes(metric_rows),
+                                "repeat_data": _csv_bytes(repeat_matrix),
+                            }
+                        except Exception as exc:
+                            st.session_state.pop(metric_csv_state_key, None)
+                            st.error(f"Metric CSV export failed: {exc}")
+                prepared_metric_csv = st.session_state.get(metric_csv_state_key)
+                if (
+                    isinstance(prepared_metric_csv, dict)
+                    and prepared_metric_csv.get("signature")
+                    == database_export_signature
+                    and isinstance(prepared_metric_csv.get("data"), bytes)
+                ):
+                    st.download_button(
+                        "Download serial metric observations (.csv)",
+                        data=prepared_metric_csv["data"],
+                        file_name="campaign-metric-observations.csv",
+                        mime="text/csv",
+                        key="download_campaign_metric_csv",
+                    )
+                    if isinstance(
+                        prepared_metric_csv.get("repeat_data"), bytes
+                    ):
+                        st.download_button(
+                            "Download repeat columns for calculations (.csv)",
+                            data=prepared_metric_csv["repeat_data"],
+                            file_name="campaign-metric-repeats-wide.csv",
+                            mime="text/csv",
+                            key="download_campaign_metric_repeats_csv",
+                        )
+                st.caption(
+                    "For linked pose-validation and interaction tables, prepare "
+                    "the complete multi-table archive below."
+                )
+                if st.button(
+                    "Prepare complete CSV bundle with linked evidence",
+                    key="prepare_campaign_comparison_csv_bundle",
+                ):
+                    with st.spinner(
+                        "Normalizing all repetitions and collecting linked pose "
+                        "validity and interaction relations…"
+                    ):
+                        try:
+                            csv_bundle = _collect_campaign_results_csv_bundle(
+                                run_root,
+                                export_jobs,
+                                data_metrics,
+                            )
+                            st.session_state[database_export_state_key] = {
+                                "signature": database_export_signature,
+                                "data": csv_bundle,
+                            }
+                        except Exception as exc:
+                            st.session_state.pop(database_export_state_key, None)
+                            st.error(f"CSV export failed: {exc}")
+                prepared_database_export = st.session_state.get(
+                    database_export_state_key
+                )
+                if (
+                    isinstance(prepared_database_export, dict)
+                    and prepared_database_export.get("signature")
+                    == database_export_signature
+                    and isinstance(prepared_database_export.get("data"), bytes)
+                ):
+                    st.download_button(
+                        "Download normalized campaign data (.zip)",
+                        data=prepared_database_export["data"],
+                        file_name="campaign-database-csv-export.zip",
+                        mime="application/zip",
+                        key="download_campaign_comparison_csv",
+                    )
+
+    if scores_tab.open and correlation_tab.open:
+        with correlation_tab:
+            st.markdown("## Cross-engine correlations")
+            if target_ligand_comparison:
+                _render_target_correlations(selected_metrics)
+            else:
+                st.caption(
+                    "Correlations compare compounds, not raw replicate rows. Use "
+                    "them to identify agreement or disagreement between scoring "
+                    "systems; they do not establish experimental validity."
+                )
+                _render_correlations(selected_metrics)
+
+    if scores_tab.open and rescoring_tab.open:
+        with rescoring_tab:
+            st.markdown("## Rescoring")
+            _render_rescoring_comparison(linked_rescoring_metrics)
+
+    if scores_tab.open and consensus_tab.open:
+        with consensus_tab:
+            st.markdown("## Consensus ranking")
+            st.caption(
+                (
+                    "Prepared targets are ranked independently within each selected "
+                    "native engine metric, then direction-aware percentiles are "
+                    "combined. Independent attempts contribute mean and sample SD, "
+                    "not additional target observations."
+                )
+                if target_ligand_comparison
+                else (
+                    "Raw docking scores, Rosetta energy units, AF3 confidence and "
+                    "learned affinity values are not pooled. Each campaign is first "
+                    "converted to a within-campaign percentile (1 = best), then "
+                    "percentiles are summarized across selected engines and "
+                    "campaigns. To avoid inflating a compound through a tiny "
+                    "selected subset, consensus includes only campaigns covering at "
+                    "least 80% of the best-covered selected campaign and at least "
+                    "two compounds. Subset rescoring remains available in Native "
+                    "metrics and Data. This is a prioritization aid, not a "
+                    "calibrated binding score."
+                )
+            )
+            if not target_ligand_comparison:
+                st.caption(
+                    f"Compound labels: {compound_label_mode}. Layout: "
+                    f"{compound_label_layout}. Change these controls in Native "
+                    "metrics; the same settings apply to consensus plots."
+                )
+            if target_ligand_comparison:
+                _render_target_consensus(selected_metrics)
+            consensus = (
+                pd.DataFrame()
+                if target_ligand_comparison
+                else consensus_percentiles(selected_metrics)
+            )
+            if consensus.empty:
+                if not target_ligand_comparison:
+                    st.info(
+                        "No primary metrics are available for consensus ranking."
+                    )
+            else:
+                combined = (
+                    consensus.groupby("candidate_id")[
+                        "Within-campaign percentile"
+                    ]
+                    .agg(["mean", "std", "count"])
+                    .reset_index()
+                    .rename(
+                        columns={
+                            "mean": "Mean percentile",
+                            "std": "Sample SD",
+                            "count": "Contributing campaigns",
+                        }
+                    )
+                    .sort_values("Mean percentile", ascending=False)
+                )
+                combined["Sample SD"] = combined["Sample SD"].fillna(0.0)
+                compound_name_lookup = (
+                    consensus[["candidate_id", "compound_name"]]
+                    .drop_duplicates("candidate_id")
+                    .set_index("candidate_id")["compound_name"]
+                    if "compound_name" in consensus
+                    else pd.Series(dtype=str)
+                )
+                combined["compound_name"] = combined["candidate_id"].map(
+                    compound_name_lookup
+                ).fillna("")
+                combined_plot = _with_compound_plot_labels(
+                    combined,
+                    label_mode=compound_label_mode,
+                )
+                compound_order = combined_plot["_compound_plot_label"].tolist()
+                consensus_horizontal = (
+                    compound_label_layout == "Show all labels"
+                    or (
+                        compound_label_layout == "Automatic"
+                        and len(combined_plot) > 18
+                    )
+                )
+                consensus_axis_options: dict[str, object] = {
+                    "labelLimit": 420 if consensus_horizontal else 220,
+                    "labelOverlap": (
+                        "greedy"
+                        if compound_label_layout == "Compact"
+                        else False
+                    ),
+                }
+                consensus_label_expression = _compound_axis_label_expression(
+                    compound_label_mode
+                )
+                if consensus_label_expression:
+                    consensus_axis_options["labelExpr"] = (
+                        consensus_label_expression
+                    )
+                consensus_tooltips = [
+                    alt.Tooltip("candidate_id:N", title="Compound ID"),
+                    alt.Tooltip("compound_name:N", title="Compound name"),
+                    alt.Tooltip("Mean percentile:Q", format=".3f"),
+                    alt.Tooltip("Sample SD:Q", format=".3f"),
+                    "Contributing campaigns:Q",
+                ]
+                if consensus_horizontal:
+                    chart = (
+                        alt.Chart(combined_plot)
+                        .mark_bar(color="#7c3aed")
+                        .encode(
+                            y=alt.Y(
+                                "_compound_plot_label:N",
+                                sort=compound_order,
+                                title="Compound",
+                                axis=alt.Axis(**consensus_axis_options),
+                            ),
+                            x=alt.X(
+                                "Mean percentile:Q",
+                                scale=alt.Scale(domain=[0, 1]),
+                                title="Mean within-campaign percentile",
+                            ),
+                            tooltip=consensus_tooltips,
+                        )
+                        .properties(height=max(390, 30 * len(combined_plot)))
+                    )
+                else:
+                    consensus_axis_options["labelAngle"] = -45
+                    chart = (
+                        alt.Chart(combined_plot)
+                        .mark_bar(color="#7c3aed")
+                        .encode(
+                            x=alt.X(
+                                "_compound_plot_label:N",
+                                sort=compound_order,
+                                title="Compound",
+                                axis=alt.Axis(**consensus_axis_options),
+                            ),
+                            y=alt.Y(
+                                "Mean percentile:Q",
+                                scale=alt.Scale(domain=[0, 1]),
+                                title="Mean within-campaign percentile",
+                            ),
+                            tooltip=consensus_tooltips,
+                        )
+                        .properties(height=390)
+                    )
+                st.altair_chart(chart, width="stretch")
+                by_target = (
+                    consensus.groupby(["candidate_id", "target"])[
+                        "Within-campaign percentile"
+                    ]
+                    .agg(["mean", "count"])
+                    .reset_index()
+                    .rename(
+                        columns={
+                            "mean": "Mean percentile",
+                            "count": "Contributing campaigns",
+                        }
+                    )
+                )
+                by_target["compound_name"] = by_target["candidate_id"].map(
+                    compound_name_lookup
+                ).fillna("")
+                by_target = _with_compound_plot_labels(
+                    by_target,
+                    label_mode=compound_label_mode,
+                )
+                if by_target["target"].nunique() > 1:
+                    st.markdown("#### Target-by-compound profile")
+                    st.caption(
+                        "This matrix keeps targets separate. A compound that ranks "
+                        "high for one target and low for another may be a useful "
+                        "selectivity signal, subject to experimental validation."
+                    )
+                    target_heatmap = (
+                        alt.Chart(by_target)
+                        .mark_rect()
+                        .encode(
+                            x=alt.X(
+                                "target:N",
+                                title="Target",
+                                axis=alt.Axis(labelAngle=-25, labelLimit=240),
+                            ),
+                            y=alt.Y(
+                                "_compound_plot_label:N",
+                                title="Compound",
+                                sort=compound_order,
+                                axis=alt.Axis(
+                                    labelLimit=420,
+                                    labelOverlap=False,
+                                    **(
+                                        {
+                                            "labelExpr": consensus_label_expression
+                                        }
+                                        if consensus_label_expression
+                                        else {}
+                                    ),
+                                ),
+                            ),
+                            color=alt.Color(
+                                "Mean percentile:Q",
+                                title="Mean percentile",
+                                scale=alt.Scale(
+                                    domain=[0, 1],
+                                    scheme="viridis",
+                                ),
+                            ),
+                            tooltip=[
+                                alt.Tooltip(
+                                    "candidate_id:N", title="Compound ID"
+                                ),
+                                alt.Tooltip(
+                                    "compound_name:N", title="Compound name"
+                                ),
+                                alt.Tooltip("target:N", title="Target"),
+                                alt.Tooltip(
+                                    "Mean percentile:Q", format=".3f"
+                                ),
+                                "Contributing campaigns:Q",
+                            ],
+                        )
+                        .properties(height=max(260, 28 * len(combined)))
+                    )
+                    st.altair_chart(target_heatmap, width="stretch")
+                    st.dataframe(
+                        by_target.pivot(
+                            index=["candidate_id", "compound_name"],
+                            columns="target",
+                            values="Mean percentile",
+                        ).reset_index(),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                engine_matrix = (
+                    consensus.groupby(["candidate_id", "engine"])[
+                        "Within-campaign percentile"
+                    ]
+                    .mean()
+                    .unstack("engine")
+                    .reset_index()
+                )
+                by_engine = (
+                    consensus.groupby(["candidate_id", "engine"])[
+                        "Within-campaign percentile"
+                    ]
+                    .agg(["mean", "count"])
+                    .reset_index()
+                    .rename(
+                        columns={
+                            "mean": "Mean percentile",
+                            "count": "Contributing campaigns",
+                        }
+                    )
+                )
+                by_engine["compound_name"] = by_engine["candidate_id"].map(
+                    compound_name_lookup
+                ).fillna("")
+                by_engine = _with_compound_plot_labels(
+                    by_engine,
+                    label_mode=compound_label_mode,
+                )
+                if by_engine["engine"].nunique() > 1:
+                    st.markdown("#### Engine-by-compound profile")
+                    st.caption(
+                        "Agreement across engines strengthens prioritization; large "
+                        "differences identify model-dependent predictions worth "
+                        "reviewing rather than averaging away."
+                    )
+                    engine_heatmap = (
+                        alt.Chart(by_engine)
+                        .mark_rect()
+                        .encode(
+                            x=alt.X("engine:N", title="Engine"),
+                            y=alt.Y(
+                                "_compound_plot_label:N",
+                                title="Compound",
+                                sort=compound_order,
+                                axis=alt.Axis(
+                                    labelLimit=420,
+                                    labelOverlap=False,
+                                    **(
+                                        {
+                                            "labelExpr": consensus_label_expression
+                                        }
+                                        if consensus_label_expression
+                                        else {}
+                                    ),
+                                ),
+                            ),
+                            color=alt.Color(
+                                "Mean percentile:Q",
+                                title="Mean percentile",
+                                scale=alt.Scale(
+                                    domain=[0, 1],
+                                    scheme="viridis",
+                                ),
+                            ),
+                            tooltip=[
+                                alt.Tooltip(
+                                    "candidate_id:N", title="Compound ID"
+                                ),
+                                alt.Tooltip(
+                                    "compound_name:N", title="Compound name"
+                                ),
+                                alt.Tooltip("engine:N", title="Engine"),
+                                alt.Tooltip(
+                                    "Mean percentile:Q", format=".3f"
+                                ),
+                                "Contributing campaigns:Q",
+                            ],
+                        )
+                        .properties(height=max(260, 28 * len(combined)))
+                    )
+                    st.altair_chart(engine_heatmap, width="stretch")
+                st.dataframe(
+                    combined.merge(engine_matrix, on="candidate_id"),
+                    hide_index=True,
+                    width="stretch",
+                )
+
+    if structural_tab.open and pose_validation_tab.open:
+        with pose_validation_tab:
+            st.markdown("## Pose validity")
+            if target_ligand_comparison:
+                _render_target_pose_validation(run_root, selected_jobs)
+            else:
+                _render_pose_validation_summary(
                     run_root,
                     selected_jobs,
                     selected_metrics,
                 )
 
-    with data_tab:
-        st.markdown("## Result data")
-        st.caption(
-            "The tables below preview the same repetition-level values included "
-            "in the normalized CSV export under Native metrics."
-        )
-        public_metrics = _campaign_database_metric_rows(data_metrics)
-        _, metric_wide = _campaign_metric_export_tables(data_metrics)
-        replicate_columns = [
-            column
-            for column in metric_wide
-            if str(column).startswith("Replicate ")
-        ]
-        compact_columns = [
-            column
-            for column in (
-                "Target",
-                "Compound ID",
-                "Compound name",
-                "Engine",
-                "Parameter label",
+    if structural_tab.open and interaction_analysis_tab.open:
+        with interaction_analysis_tab:
+            st.markdown("## Protein–ligand interactions")
+            _render_interaction_analysis_summary(
+                run_root,
+                selected_jobs,
+                selected_metrics,
             )
-            if column in metric_wide
-        ] + replicate_columns
-        if metric_wide.empty:
-            st.info("No numeric scientific result parameters are available.")
-        else:
-            st.dataframe(
-                metric_wide[compact_columns],
-                hide_index=True,
-                width="stretch",
-            )
-        with st.expander("Serial metric observations and provenance"):
-            st.caption(
-                "Every displayed value has a unique observation ID and an "
-                "explicit repeat number. Boltz-2 and AlphaFold 3 contribute "
-                "one engine-ranked representative structure per repeat."
-            )
-            st.dataframe(public_metrics, hide_index=True, width="stretch")
-        st.info(
-            "Use Download database-ready data (CSV) in Native metrics for the "
-            "complete relational export. Plot PNG files are downloaded "
-            "separately."
-        )
 
-    with collections_tab:
-        st.markdown("## Analysis Sets")
-        current_rescoring_runs = st.session_state.get(
-            "campaign_compare_rescoring_runs",
-            linked_rescoring_jobs["campaign_id"].tolist(),
-        )
-        _render_saved_collections(
-            runs_root(),
-            selection={
-                "schema_version": ANALYSIS_SET_SCHEMA_VERSION,
-                "selection_type": "campaign_analysis_set",
-                "dataset_run_id": selected_dataset,
-                "dataset": dataset_labels.get(
-                    selected_dataset, selected_dataset
-                ),
-                "target_run_ids": list(selected_targets),
-                "launch_campaign_ids": list(selected_launches),
-                "target_launch_pairs": (
-                    list(selected_target_launch_pairs)
-                    if target_ligand_comparison
-                    else []
-                ),
-                "engines": list(selected_engines),
-                "engine_run_ids": list(selected_campaigns),
-                "rescoring_run_ids": [
-                    str(value) for value in current_rescoring_runs
-                ],
-            },
-        )
+    if explorer_tab.open:
+        with viewer_tab:
+            if target_ligand_comparison:
+                _render_target_structural_explorer(selected_metrics)
+            else:
+                explorer_view = st.segmented_control(
+                    "Explore selected results",
+                    explorer_options,
+                    default="Target × compound matrix",
+                    key="campaign_explorer_view",
+                )
+                if explorer_view == "Target × compound matrix":
+                    _render_target_compound_explorer(selected_metrics)
+                elif explorer_view == "RMSD & pose agreement":
+                    st.markdown("## RMSD and pose agreement")
+                    _render_rmsd_analysis(selected_metrics)
+                elif explorer_view == "3D structures":
+                    st.markdown("## 3D structures")
+                    _render_structure_comparison(selected_metrics)
+                else:
+                    _render_md_candidate_selection(
+                        run_root,
+                        selected_jobs,
+                        selected_metrics,
+                    )
+
+    if workspace_tab.open and data_tab.open:
+        with data_tab:
+            st.markdown("## Result data")
+            st.caption(
+                "The tables below preview the same repetition-level values included "
+                "in the normalized CSV export under Native metrics."
+            )
+            public_metrics = _campaign_database_metric_rows(data_metrics)
+            _, metric_wide = _campaign_metric_export_tables(data_metrics)
+            replicate_columns = [
+                column
+                for column in metric_wide
+                if str(column).startswith("Replicate ")
+            ]
+            compact_columns = [
+                column
+                for column in (
+                    "Target",
+                    "Compound ID",
+                    "Compound name",
+                    "Engine",
+                    "Parameter label",
+                )
+                if column in metric_wide
+            ] + replicate_columns
+            if metric_wide.empty:
+                st.info("No numeric scientific result parameters are available.")
+            else:
+                st.dataframe(
+                    metric_wide[compact_columns],
+                    hide_index=True,
+                    width="stretch",
+                )
+            with st.expander("Serial metric observations and provenance"):
+                st.caption(
+                    "Every displayed value has a unique observation ID and an "
+                    "explicit repeat number. Boltz-2 and AlphaFold 3 contribute "
+                    "one engine-ranked representative structure per repeat."
+                )
+                st.dataframe(public_metrics, hide_index=True, width="stretch")
+            st.info(
+                "Use Download database-ready data (CSV) in Native metrics for the "
+                "complete relational export. Plot PNG files are downloaded "
+                "separately."
+            )
+
+    if workspace_tab.open and collections_tab.open:
+        with collections_tab:
+            st.markdown("## Analysis Sets")
+            current_rescoring_runs = st.session_state.get(
+                "campaign_compare_rescoring_runs",
+                linked_rescoring_jobs["campaign_id"].tolist(),
+            )
+            _render_saved_collections(
+                runs_root(),
+                selection={
+                    "schema_version": ANALYSIS_SET_SCHEMA_VERSION,
+                    "selection_type": "campaign_analysis_set",
+                    "dataset_run_id": selected_dataset,
+                    "dataset": dataset_labels.get(
+                        selected_dataset, selected_dataset
+                    ),
+                    "target_run_ids": list(selected_targets),
+                    "launch_campaign_ids": list(selected_launches),
+                    "target_launch_pairs": (
+                        list(selected_target_launch_pairs)
+                        if target_ligand_comparison
+                        else []
+                    ),
+                    "engines": list(selected_engines),
+                    "engine_run_ids": list(selected_campaigns),
+                    "rescoring_run_ids": [
+                        str(value) for value in current_rescoring_runs
+                    ],
+                },
+            )
 
 
 if os.environ.get("MN_LIGAND_POSE_SIMILARITY_WORKER") != "1":

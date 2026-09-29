@@ -30,6 +30,7 @@ from mn_ligand.workflows.generative_design import (
     pharmacophore_required_contacts,
     queue_generation_job,
 )
+from mn_ligand.workflows.lddm import LDDM_CHECKPOINTS
 from mn_ligand.workflows.pharmacophore import load_pharmacophore
 
 
@@ -55,6 +56,7 @@ _SEED_SECONDS_PER_ATTEMPT = {
     "pfm": 5.0,
     "pocketflow": 30.0,
     "pgmg": 25.0,
+    "lddm": 60.0,
 }
 _PAOPT_SECONDS_PER_DIFFUSION_PASS = 75.0
 
@@ -67,6 +69,7 @@ _ENGINE_PARAMETER_WIDGET_PREFIXES = (
     "generation_conditar_",
     "generation_paopt_",
     "generation_drugrpg_",
+    "generation_lddm_",
     "generation_count_",
     "generation_batch_",
     "generation_seed_",
@@ -131,6 +134,12 @@ _ENGINE_PARAMETER_GUIDANCE = {
         "PGMG is directed by the selected pharmacophore graph, not a temperature "
         "or guidance scale. Feature types, positions, tolerances, required/optional "
         "status, and the eight-point limit are therefore its meaningful design controls."
+    ),
+    "lddm": (
+        "LDDM uses the reference ligand to define the pocket. The shared design "
+        "workflow supports de novo design and fragment growing, with a choice "
+        "between the MIT CD+BB and CC-BY-NC 4.0 CD+BB+BN checkpoints. The "
+        "integration exposes the native ODE step count, sampler, noise, and size controls."
     ),
 }
 
@@ -252,6 +261,7 @@ def _engine_pass_multiplier(
         "flowr_root": ("integration_steps", 100),
         "conditar": ("diffusion_steps", 1000),
         "paopt": ("diffusion_steps", 1000),
+        "lddm": ("n_steps", 100),
     }.get(engine_id)
     if step_key_and_default:
         key, default = step_key_and_default
@@ -924,7 +934,13 @@ def render() -> None:
                             "Local permission required. This group deployment is "
                             "authorized; do not redistribute its source, image, or weights."
                         )
-                    if spec.adapter_ready:
+                    if spec.engine_id == "lddm":
+                        st.caption(
+                            "Adapter status: initial experimental integration. "
+                            "The image, upstream inference, and target-specific "
+                            "scientific behavior still need local validation."
+                        )
+                    elif spec.adapter_ready:
                         st.caption(
                             "Adapter status: native container inference, normalized "
                             "artifacts, typed results, and compound-set handoff validated; "
@@ -952,9 +968,21 @@ def render() -> None:
                             and spec.supports("interaction_profile")
                         ):
                             available_modes.append("Detect interactions from the reference complex")
-                        if pocket is not None and spec.supports("pocket"):
+                        if (
+                            pocket is not None
+                            and spec.supports("pocket")
+                            and spec.engine_id != "lddm"
+                        ):
                             available_modes.append("Use pocket geometry only")
-                        if reference_ligand is not None and spec.supports("reference_ligand"):
+                        if spec.engine_id == "lddm":
+                            if reference_ligand is not None:
+                                available_modes.extend(
+                                    [
+                                        "Generate de novo in the reference pocket",
+                                        "Grow or link from the reference ligand",
+                                    ]
+                                )
+                        elif reference_ligand is not None and spec.supports("reference_ligand"):
                             available_modes.append(design_mode)
                         if not available_modes:
                             available_modes.append("No compatible conditioning is selected")
@@ -963,7 +991,78 @@ def render() -> None:
                             list(dict.fromkeys(available_modes)),
                             key=f"generation_engine_mode_{spec.engine_id}",
                         )
-                        if spec.engine_id == "omtra":
+                        if spec.engine_id == "lddm":
+                            st.markdown("##### LDDM sampling controls")
+                            checkpoint_label = st.selectbox(
+                                "LDDM checkpoint",
+                                tuple(LDDM_CHECKPOINTS),
+                                key="generation_lddm_checkpoint",
+                                help=(
+                                    "CD+BB is MIT licensed. CD+BB+BN is licensed "
+                                    "CC-BY-NC 4.0 and is limited to non-commercial use."
+                                ),
+                            )
+                            checkpoint_path = LDDM_CHECKPOINTS[checkpoint_label]
+                            st.caption(
+                                f"Selected weights: `{checkpoint_path}`. "
+                                + (
+                                    "Commercial use is allowed under MIT."
+                                    if checkpoint_path.endswith("lddm_CDBB.ckpt")
+                                    else "CC-BY-NC 4.0: non-commercial use only."
+                                )
+                            )
+                            lddm_columns = st.columns(3)
+                            n_steps = lddm_columns[0].number_input(
+                                "ODE integration steps",
+                                min_value=10,
+                                max_value=1000,
+                                value=100,
+                                step=10,
+                                key="generation_lddm_n_steps",
+                            )
+                            sampler = lddm_columns[1].selectbox(
+                                "ODE sampler",
+                                ("ForwardEuler", "HeunSampler"),
+                                key="generation_lddm_sampler",
+                            )
+                            sampling_noise = lddm_columns[2].number_input(
+                                "Sampling noise",
+                                min_value=0.0,
+                                max_value=20.0,
+                                value=5.0,
+                                step=0.5,
+                                key="generation_lddm_noise",
+                                help="Native default: 5.0.",
+                            )
+                            molecule_size = st.text_input(
+                                "Target molecule size (optional)",
+                                value="",
+                                key="generation_lddm_molecule_size",
+                                help=(
+                                    "Leave blank to use the learned size prior. "
+                                    "Enter an integer or a range such as uniform_5_10."
+                                ),
+                            ).strip()
+                            valid_size = molecule_size.isdigit() or (
+                                molecule_size.startswith("uniform_")
+                                and len(molecule_size.split("_")) == 3
+                                and all(
+                                    part.isdigit()
+                                    for part in molecule_size.split("_")[1:]
+                                )
+                            )
+                            if molecule_size and not valid_size:
+                                st.warning(
+                                    "Use an integer, uniform_<low>_<high>, or leave this blank."
+                                )
+                            engine_settings["lddm"] = {
+                                "checkpoint_path": checkpoint_path,
+                                "n_steps": int(n_steps),
+                                "sampler": str(sampler),
+                                "sampling_noise": float(sampling_noise),
+                                "molecule_size": molecule_size,
+                            }
+                        elif spec.engine_id == "omtra":
                             st.markdown("##### OMTRA sampling controls")
                             integration_steps = st.number_input(
                                 "Integration steps",
@@ -1597,9 +1696,17 @@ def render() -> None:
         readiness_rows = []
         ref_root = reference_root()
         for spec in selected_specs:
+            reference_paths = spec.reference_paths
+            if spec.engine_id == "lddm":
+                reference_paths = (
+                    str(
+                        engine_settings.get("lddm", {}).get("checkpoint_path")
+                        or spec.reference_paths[0]
+                    ),
+                )
             missing = [
                 relative
-                for relative in spec.reference_paths
+                for relative in reference_paths
                 if not (ref_root / relative).is_file()
             ]
             if missing:
@@ -1616,6 +1723,26 @@ def render() -> None:
                 blockers.append("PGMG requires a saved compatible pharmacophore.")
             if spec.engine_id == "pocketflow" and pocket is None:
                 blockers.append("PocketFlow requires a coordinate pocket.")
+            if spec.engine_id == "lddm":
+                if reference_ligand is None:
+                    blockers.append(
+                        "LDDM requires a reference ligand to identify the binding pocket."
+                    )
+                size = str(
+                    engine_settings.get("lddm", {}).get("molecule_size") or ""
+                ).strip()
+                size_parts = size.split("_")
+                valid_size = size.isdigit() or (
+                    len(size_parts) == 3
+                    and size_parts[0] == "uniform"
+                    and size_parts[1].isdigit()
+                    and size_parts[2].isdigit()
+                    and int(size_parts[1]) < int(size_parts[2])
+                )
+                if size and not valid_size:
+                    blockers.append(
+                        "LDDM molecule size must be an integer or uniform_<low>_<high> with low < high."
+                    )
             if spec.engine_id == "paopt":
                 if reference_ligand is None:
                     blockers.append(
@@ -1635,9 +1762,13 @@ def render() -> None:
                     "Image": spec.image,
                     "References": "Ready" if not missing else "Missing: " + ", ".join(missing),
                     "Adapter": (
-                        "Implemented; focused native validation completed"
-                        if spec.adapter_ready
-                        else "Configuration adapter pending"
+                        "Initial experimental integration; local validation pending"
+                        if spec.engine_id == "lddm"
+                        else (
+                            "Implemented; focused native validation completed"
+                            if spec.adapter_ready
+                            else "Configuration adapter pending"
+                        )
                     ),
                     "Required-contact handling": (
                         "Native pharmacophore + downstream validation"
@@ -1670,7 +1801,7 @@ def render() -> None:
                 "and therefore always uses pharmacophore contacts downstream."
             )
         acknowledge_experimental = st.checkbox(
-            "I understand focused native execution is validated, while "
+            "I understand generation adapters are experimental and "
             "target-specific scientific validation remains required",
             value=False,
             key="generation_acknowledge_experimental",

@@ -278,6 +278,7 @@ def _render_atom_selector(
     selection_heading: str = "Select the part to replace",
     selection_name: str = "Replace",
     selected_description: str = "replacement region",
+    viewer_key: str | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
     atom_count = molecule.GetNumAtoms()
     selection_key = f"{key_prefix}_atom_indices"
@@ -411,7 +412,7 @@ def _render_atom_selector(
         )
     component_value = molstar_custom_component(
         structures=structures,
-        key=f"{key_prefix}_atom_viewer",
+        key=viewer_key or f"{key_prefix}_atom_viewer",
         height=650,
         width="100%",
         show_controls=True,

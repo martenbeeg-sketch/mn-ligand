@@ -386,10 +386,14 @@ def _preparation(
     return "; ".join(dict.fromkeys(steps)) or "Imported"
 
 
-@st.cache_data(show_spinner=False, ttl=15)
+@st.cache_data(show_spinner=False, ttl=600)
 def _cached_job_records(runs_dir_text: str) -> list[JobRecord]:
-    """Load the filesystem job inventory once for one burst of UI reruns."""
-    return iter_job_records(Path(runs_dir_text))
+    """Cache the lightweight job and artifact index used by input selectors."""
+    return iter_job_records(
+        Path(runs_dir_text),
+        load_result=False,
+        validate_artifacts=False,
+    )
 
 
 def job_records_snapshot(runs_dir_text: str | None = None) -> list[JobRecord]:
@@ -398,7 +402,7 @@ def job_records_snapshot(runs_dir_text: str | None = None) -> list[JobRecord]:
     )
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@st.cache_data(show_spinner=False, ttl=600)
 def _cached_target_inventory(
     artifact_types: tuple[str, ...] = ("prepared_target", "prepared_receptor"),
     *,
@@ -528,6 +532,37 @@ def target_inventory(
     )
 
 
+def _clear_input_inventory_caches() -> None:
+    _cached_job_records.clear()
+    _cached_target_inventory.clear()
+    _cached_artifact_options.clear()
+
+
+def _prefer_target_artifact_per_job(
+    entries: list[TargetInventoryEntry],
+    artifact_types: tuple[str, ...],
+) -> list[TargetInventoryEntry]:
+    """Show one best compatible target artifact for each preparation job."""
+    priority = {artifact_type: index for index, artifact_type in enumerate(artifact_types)}
+    best_entry: dict[str, tuple[int, str]] = {}
+    for entry in entries:
+        run_id = entry.choice.job.run_id
+        rank = priority.get(entry.choice.artifact.artifact_type, len(priority))
+        artifact_id = entry.choice.artifact.artifact_id
+        current = best_entry.get(run_id)
+        if current is None or (rank, artifact_id) < current:
+            best_entry[run_id] = (rank, artifact_id)
+    selected = {
+        (run_id, artifact_id)
+        for run_id, (_rank, artifact_id) in best_entry.items()
+    }
+    return [
+        entry
+        for entry in entries
+        if (entry.choice.job.run_id, entry.choice.artifact.artifact_id) in selected
+    ]
+
+
 def _matches_word_query(
     query: str, values: tuple[object, ...], *, require_all: bool
 ) -> bool:
@@ -619,7 +654,15 @@ def select_target_artifact(
     row_annotations: dict[str, dict[str, Any]] | None = None,
     row_annotation_defaults: dict[str, Any] | None = None,
 ) -> ArtifactChoice | None:
-    entries = target_inventory(artifact_types)
+    st.button(
+        "Refresh available targets",
+        key=f"{key}_refresh_target_inventory",
+        help="Rescan completed jobs for newly prepared targets.",
+        on_click=_clear_input_inventory_caches,
+    )
+    entries = _prefer_target_artifact_per_job(
+        target_inventory(artifact_types), artifact_types
+    )
     if allowed_run_ids is not None:
         entries = [entry for entry in entries if entry.choice.job.run_id in allowed_run_ids]
     if excluded_run_ids:
@@ -754,7 +797,15 @@ def select_target_artifacts(
     allowed_run_ids: set[str] | None = None,
     requested_run_ids: set[str] | None = None,
 ) -> tuple[ArtifactChoice, ...]:
-    entries = target_inventory(artifact_types)
+    st.button(
+        "Refresh available targets",
+        key=f"{key}_refresh_target_inventory",
+        help="Rescan completed jobs for newly prepared targets.",
+        on_click=_clear_input_inventory_caches,
+    )
+    entries = _prefer_target_artifact_per_job(
+        target_inventory(artifact_types), artifact_types
+    )
     if allowed_run_ids is not None:
         entries = [entry for entry in entries if entry.choice.job.run_id in allowed_run_ids]
     show_previous_versions = st.checkbox(
@@ -1182,7 +1233,7 @@ def render_target_viewer(
     )
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@st.cache_data(show_spinner=False, ttl=600)
 def _cached_artifact_options(
     artifact_types: tuple[str, ...],
     *,
@@ -1278,6 +1329,12 @@ def select_artifact(
     required: bool = True,
     source_run_id: str = "",
 ) -> ArtifactChoice | None:
+    st.button(
+        "Refresh available inputs",
+        key=f"{key}_refresh_artifact_inventory",
+        help="Rescan completed jobs for newly available inputs.",
+        on_click=_clear_input_inventory_caches,
+    )
     options = artifact_options(artifact_types, source_run_id=source_run_id)
     labels = list(options)
     if not required:
@@ -1296,6 +1353,12 @@ def select_artifacts(
     key: str,
     required: bool = True,
 ) -> tuple[ArtifactChoice, ...]:
+    st.button(
+        "Refresh available inputs",
+        key=f"{key}_refresh_artifact_inventory",
+        help="Rescan completed jobs for newly available inputs.",
+        on_click=_clear_input_inventory_caches,
+    )
     options = artifact_options(artifact_types)
     if not options:
         st.multiselect(label, ["No compatible prepared artifact"], disabled=True, key=f"{key}_missing")
@@ -1331,106 +1394,121 @@ def render_discover_job(
 ) -> None:
     st.title(title)
     input_tab, tool_tab, run_tab, results_tab = st.tabs(
-        ["Target / Input", "Tool / Engine", "Run", "Results"]
+        ["Target / Input", "Tool / Engine", "Run", "Results"],
+        key=f"{task_key}_workflow_tabs",
+        on_change="rerun",
     )
-    selected: dict[str, ArtifactChoice] = {}
-    missing: list[str] = []
+    tool_key = f"{task_key}_tool"
+    if tool_tab.open:
+        with tool_tab:
+            st.selectbox("Tool", tools, key=tool_key)
+            st.caption(
+                "Tool-specific protocol controls will appear here when the typed adapter is enabled."
+            )
+    tool = str(st.session_state.get(tool_key, tools[0]))
 
-    with tool_tab:
-        tool = st.selectbox("Tool", tools, key=f"{task_key}_tool")
-        st.caption(
-            "Tool-specific protocol controls will appear here when the typed adapter is enabled."
-        )
-
-    with input_tab:
-        pocket_choice: ArtifactChoice | None = None
-        target_choice: ArtifactChoice | None = None
-        for spec in inputs:
-            if spec.artifact_types and all(
-                artifact_type in {"prepared_target", "prepared_receptor", "prepared_complex"}
-                for artifact_type in spec.artifact_types
-            ):
-                target_choice = select_target_artifact(
-                    spec.label,
+    input_state_key = f"{task_key}_input_selection"
+    if input_tab.open:
+        selected: dict[str, ArtifactChoice] = {}
+        missing: list[str] = []
+        with input_tab:
+            pocket_choice: ArtifactChoice | None = None
+            target_choice: ArtifactChoice | None = None
+            for spec in inputs:
+                if spec.artifact_types and all(
+                    artifact_type in {"prepared_target", "prepared_receptor", "prepared_complex"}
+                    for artifact_type in spec.artifact_types
+                ):
+                    target_choice = select_target_artifact(
+                        spec.label,
+                        spec.artifact_types,
+                        key=f"{task_key}_target_inventory",
+                        show_viewer=False,
+                    )
+                    if target_choice is None and spec.required:
+                        missing.append(spec.label)
+                    elif target_choice is not None:
+                        selected[spec.label] = target_choice
+                    continue
+                options = artifact_options(
                     spec.artifact_types,
-                    key=f"{task_key}_target_inventory",
-                    show_viewer=False,
+                    source_run_id=target_choice.job.run_id
+                    if target_choice is not None and "pocket" in spec.artifact_types
+                    else "",
                 )
-                if target_choice is None and spec.required:
+                labels = list(options)
+                if not spec.required:
+                    labels = ["None", *labels]
+                if not options and spec.required:
+                    st.selectbox(
+                        spec.label,
+                        ["No compatible prepared artifact"],
+                        disabled=True,
+                    )
                     missing.append(spec.label)
-                elif target_choice is not None:
-                    selected[spec.label] = target_choice
-                continue
-            options = artifact_options(
-                spec.artifact_types,
-                source_run_id=target_choice.job.run_id
-                if target_choice is not None and "pocket" in spec.artifact_types
-                else "",
-            )
-            labels = list(options)
-            if not spec.required:
-                labels = ["None", *labels]
-            if not options and spec.required:
-                st.selectbox(spec.label, ["No compatible prepared artifact"], disabled=True)
-                missing.append(spec.label)
-                continue
-            selected_label = st.selectbox(
-                spec.label,
-                labels,
-                key=f"{task_key}_{spec.label.lower().replace(' ', '_')}",
-            )
-            if selected_label != "None":
-                selected[spec.label] = options[selected_label]
-                if "pocket" in spec.artifact_types:
-                    pocket_choice = options[selected_label]
+                    continue
+                selected_label = st.selectbox(
+                    spec.label,
+                    labels,
+                    key=f"{task_key}_{spec.label.lower().replace(' ', '_')}",
+                )
+                if selected_label != "None":
+                    selected[spec.label] = options[selected_label]
+                    if "pocket" in spec.artifact_types:
+                        pocket_choice = options[selected_label]
 
-        if target_choice is not None:
-            render_target_viewer(
-                target_choice,
-                viewer_path=target_viewer_path(target_choice),
-                box=artifact_box(pocket_choice),
-                key=f"{task_key}_target_viewer",
-            )
+            if target_choice is not None:
+                render_target_viewer(
+                    target_choice,
+                    viewer_path=target_viewer_path(target_choice),
+                    box=artifact_box(pocket_choice),
+                    key=f"{task_key}_target_viewer",
+                )
+        st.session_state[input_state_key] = (selected, missing)
+    else:
+        selected, missing = st.session_state.get(input_state_key, ({}, []))
 
-    with run_tab:
-        render_run_resources(
-            requires_gpu=tool not in {"Vina campaign", "RosettaLigand campaign"},
-            selected_gpu="Automatic",
-            key=task_key,
-        )
-        if selected:
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "input": label,
-                            "type": choice.artifact.artifact_type,
-                            "job": display_job_code(
-                                choice.job.metadata.get("job_code"), choice.job.run_id
-                            ),
-                            "artifact": choice.artifact.label or choice.artifact.path,
-                        }
-                        for label, choice in selected.items()
-                    ]
+    if run_tab.open:
+        with run_tab:
+            render_run_resources(
+                requires_gpu=tool not in {"Vina campaign", "RosettaLigand campaign"},
+                selected_gpu="Automatic",
+                key=task_key,
+            )
+            if selected:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "input": label,
+                                "type": choice.artifact.artifact_type,
+                                "job": display_job_code(
+                                    choice.job.metadata.get("job_code"), choice.job.run_id
+                                ),
+                                "artifact": choice.artifact.label or choice.artifact.path,
+                            }
+                            for label, choice in selected.items()
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+            if missing:
+                st.info("Prepare the required inputs before running this workflow.")
+                st.link_button(
+                    "Open Structure Import", "./workspace-structure-preparation"
+                )
+            st.button(
+                f"Run {tool}",
+                type="primary",
+                disabled=True,
+                help=(
+                    "This route is artifact-only. Execution will be enabled when its "
+                    "typed Docker adapter is migrated."
                 ),
-                hide_index=True,
-                width="stretch",
+                key=f"{task_key}_run",
             )
-        if missing:
-            st.info("Prepare the required inputs before running this workflow.")
-            st.link_button(
-                "Open Structure Import", "./workspace-structure-preparation"
-            )
-        st.button(
-            f"Run {tool}",
-            type="primary",
-            disabled=True,
-            help=(
-                "This route is artifact-only. Execution will be enabled when its "
-                "typed Docker adapter is migrated."
-            ),
-            key=f"{task_key}_run",
-        )
 
-    with results_tab:
-        st.info("No typed runs are available for this adapter yet.")
+    if results_tab.open:
+        with results_tab:
+            st.info("No typed runs are available for this adapter yet.")

@@ -189,6 +189,18 @@ def main() -> None:
     evaluation_pages = [
         _make_page(
             package_root,
+            "mn_ligand.app.pages.rescoring",
+            "Rescoring",
+            "evaluate-rescoring",
+        ),
+        _make_page(
+            package_root,
+            "mn_ligand.app.pages.lddm_evaluation",
+            "LDDM Pose Agreement",
+            "evaluate-lddm-pose-agreement",
+        ),
+        _make_page(
+            package_root,
             "mn_ligand.app.pages.pose_validation",
             "Pose Validation",
             "evaluate-pose-validation",
@@ -270,7 +282,6 @@ def main() -> None:
             "Redocking / Refolding",
             "discover-refolding",
         ),
-        ("mn_ligand.app.pages.rescoring", "Rescoring", "discover-rescoring"),
         ("mn_ligand.app.pages.virtual_screening", "Virtual Screening", "discover-screening"),
     )
     discover_pages = [

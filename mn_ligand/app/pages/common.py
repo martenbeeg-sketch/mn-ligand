@@ -30,7 +30,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "structure_container",
         "gpu": False,
         "defaults": {
-            "structure_container": "ovolig-structure:latest",
+            "structure_container": "mn-structure:latest",
         },
         "files": {
             "structure_file": ["pdb", "cif", "mmcif", "sdf", "mol2"],
@@ -44,7 +44,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "docking_container",
         "gpu": False,
         "defaults": {
-            "docking_container": "ovolig-docking:latest",
+            "docking_container": "mn-docking:latest",
         },
         "files": {
             "protein_pdb": ["pdb"],
@@ -65,7 +65,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "docking_container",
         "gpu": False,
         "defaults": {
-            "docking_container": "ovolig-docking:latest",
+            "docking_container": "mn-docking:latest",
         },
         "files": {
             "protein_pdb": ["pdb"],
@@ -86,7 +86,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "md_container",
         "gpu": True,
         "defaults": {
-            "md_container": "ovolig-md-cu128:latest",
+            "md_container": "mn-md:cu128",
         },
         "files": {
             "complex_pdb": ["pdb"],
@@ -102,7 +102,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "admet_container",
         "gpu": False,
         "defaults": {
-            "admet_container": "ovolig-admet:latest",
+            "admet_container": "mn-admet:latest",
         },
         "files": {
             "smiles_file": ["smi", "txt", "csv"],
@@ -114,7 +114,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "boltz2_container",
         "gpu": True,
         "defaults": {
-            "boltz2_container": "ovoex-boltz2:latest",
+            "boltz2_container": "mn-boltz2:cu128",
         },
         "files": {
             "input_yaml": ["yaml", "yml"],
@@ -128,7 +128,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "qc_container",
         "gpu": False,
         "defaults": {
-            "qc_container": "ovolig-qc:latest",
+            "qc_container": "mn-qc:latest",
         },
         "files": {
             "molecule_file": ["sdf", "mol", "xyz"],
@@ -144,7 +144,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "abfe_container",
         "gpu": True,
         "defaults": {
-            "abfe_container": "ovolig-md-cu128:latest",
+            "abfe_container": "mn-md:cu128",
         },
         "files": {
             "protein_pdb": ["pdb"],
@@ -159,7 +159,7 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
         "container_param": "rbfe_container",
         "gpu": True,
         "defaults": {
-            "rbfe_container": "ovolig-md-cu128:latest",
+            "rbfe_container": "mn-md:cu128",
         },
         "files": {
             "protein_pdb": ["pdb"],
@@ -799,7 +799,9 @@ def render_workflow_page(
         st.write(intro_text)
 
     input_tab, tool_tab, run_tab, results_tab = st.tabs(
-        ["Target / Input", "Tool / Engine", "Run", "Results"]
+        ["Target / Input", "Tool / Engine", "Run", "Results"],
+        key=f"{workflow_key}_workflow_tabs",
+        on_change="rerun",
     )
     params: dict[str, Any] = {}
 

@@ -24,6 +24,7 @@ from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, short_job_code
 from mn_ligand.core.portable_paths import portable_path, resolve_stored_path
 from mn_ligand.runtime import runs_root
 from mn_ligand.workflows.docking import DEFAULT_DOCKING_IMAGE
+from mn_ligand.workflows.lddm import mean_coordinate_uncertainty
 
 
 RESCORING_TASK_GROUP = "rescoring"
@@ -111,6 +112,72 @@ def source_pose_rows(source_job: JobRecord) -> list[dict[str, Any]]:
     """Inventory every native pose model in a completed docking result."""
     rows: list[dict[str, Any]] = []
     results_root = source_job.run_dir / "results"
+    engine = str(
+        source_job.tool or source_job.metadata.get("engine") or ""
+    ).strip().lower()
+    if source_job.workflow == "docking_campaign" and engine == "lddm":
+        for path in sorted(results_root.glob("**/*_out.sdf")):
+            relative = path.relative_to(source_job.run_dir)
+            replicate_match = next(
+                (
+                    re.fullmatch(r"replicate_(\d+)", part)
+                    for part in relative.parts
+                    if part.startswith("replicate_")
+                ),
+                None,
+            )
+            replicate = int(replicate_match.group(1)) if replicate_match else 1
+            fallback_id = path.name.removesuffix("_out.sdf")
+            samples: list[dict[str, Any]] = []
+            try:
+                supplier = Chem.SDMolSupplier(
+                    str(path), removeHs=False, sanitize=False
+                )
+                for sample_index, molecule in enumerate(supplier, start=1):
+                    if molecule is None or not molecule.GetNumConformers():
+                        continue
+                    samples.append(
+                        {
+                            "compound_id": (
+                                molecule.GetProp("compound_id")
+                                if molecule.HasProp("compound_id")
+                                else fallback_id
+                            ),
+                            "sample_index": sample_index,
+                            "mean_uncertainty": mean_coordinate_uncertainty(
+                                molecule
+                            ),
+                        }
+                    )
+            except (OSError, ValueError):
+                continue
+            samples.sort(
+                key=lambda row: (
+                    row["mean_uncertainty"]
+                    if row["mean_uncertainty"] is not None
+                    else float("inf"),
+                    int(row["sample_index"]),
+                )
+            )
+            for rank, sample in enumerate(samples, start=1):
+                rows.append(
+                    {
+                        "compound_id": sample["compound_id"],
+                        "replicate": replicate,
+                        "source_pose_rank": rank,
+                        "source_pose_index": sample["sample_index"],
+                        "source_score_kcal_mol": None,
+                        "source_cnn_score": None,
+                        "source_cnn_affinity": None,
+                        "source_lddm_mean_uncertainty": sample[
+                            "mean_uncertainty"
+                        ],
+                        "source_pose_file": relative.as_posix(),
+                        "_sdf_index": int(sample["sample_index"]) - 1,
+                    }
+                )
+        return rows
+
     for path in sorted(results_root.glob("**/*_out.pdbqt")):
         relative = path.relative_to(source_job.run_dir)
         replicate_match = next(
@@ -211,8 +278,16 @@ def create_pose_selection_job(
             ),
             f"pose_{index:07d}",
         )
-        pose_path = pose_dir / f"{pose_id}.pdbqt"
-        pose_path.write_text(str(source["_model_text"]))
+        is_lddm = (
+            source_job.workflow == "docking_campaign"
+            and str(
+                source_job.tool or source_job.metadata.get("engine") or ""
+            ).strip().lower()
+            == "lddm"
+        )
+        pose_path = pose_dir / f"{pose_id}.{'sdf' if is_lddm else 'pdbqt'}"
+        if not is_lddm:
+            pose_path.write_text(str(source["_model_text"]))
         source_sdf = (
             source_job.run_dir
             / Path(str(source["source_pose_file"])).with_suffix(".sdf")
@@ -229,7 +304,13 @@ def create_pose_selection_job(
                             ),
                             start=1,
                         )
-                        if item_index == int(source["source_pose_rank"])
+                        if item_index
+                        == int(
+                            source.get("_sdf_index")
+                            if source.get("_sdf_index") is not None
+                            else int(source["source_pose_rank"]) - 1
+                        )
+                        + 1
                         and item is not None
                     ),
                     None,
@@ -243,8 +324,16 @@ def create_pose_selection_job(
                 molecule.SetIntProp(
                     "source_pose_rank", int(source["source_pose_rank"])
                 )
+                if is_lddm:
+                    pose_writer = Chem.SDWriter(str(pose_path))
+                    pose_writer.write(molecule)
+                    pose_writer.close()
                 sdf_writer.write(molecule)
                 sdf_pose_file = selected_sdf.relative_to(run_dir).as_posix()
+            elif is_lddm:
+                raise ValueError(
+                    f"Selected LDDM pose {pose_id} could not be read from its SDF"
+                )
         row = {
             key: value for key, value in source.items() if not key.startswith("_")
         }
@@ -722,7 +811,7 @@ def run_boltzina_rescoring_job(
     *,
     selection_job: JobRecord,
     boltz_work_dir: Path,
-    image: str = "ovolig-boltzina-cu128:latest",
+    image: str = "mn-boltzina:cu128",
     cache_dir: Path | None = None,
     gpu_device: str = "all",
     batch_size: int = 1,

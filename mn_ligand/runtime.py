@@ -179,6 +179,20 @@ def cpu_process_limit() -> int:
     return configured if configured > 0 else max(1, int(os.cpu_count() or 1))
 
 
+def alphafold3_cpu_msa_fallback_enabled() -> bool:
+    """Whether GPU MSA failures may automatically enqueue the CPU fallback.
+
+    Missing values default to enabled so existing installations retain their
+    current behavior; each install can opt out in its machine-local settings.
+    """
+    value = load_runtime_settings().get("alphafold3_cpu_msa_fallback_enabled", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
 def unidock_pro_max_compounds() -> int:
     configured = os.getenv(UNIDOCK_PRO_MAX_COMPOUNDS_ENV)
     if configured is None:
@@ -297,6 +311,7 @@ def save_runtime_settings(
     input_dir: str | Path | None = None,
     tmp_dir: str | Path | None = None,
     cpu_process_limit: int | None = None,
+    cpu_msa_fallback_enabled: bool | None = None,
     unidock_pro_batch_limit: int | None = None,
     vina_compound_timeout: int | None = None,
     apply_to_process: bool = True,
@@ -310,6 +325,11 @@ def save_runtime_settings(
         cpu_process_limit_setting()
         if cpu_process_limit is None
         else max(0, int(cpu_process_limit))
+    )
+    msa_fallback_enabled = (
+        alphafold3_cpu_msa_fallback_enabled()
+        if cpu_msa_fallback_enabled is None
+        else bool(cpu_msa_fallback_enabled)
     )
     unidock_limit = (
         unidock_pro_max_compounds()
@@ -338,6 +358,7 @@ def save_runtime_settings(
         "input_dir": str(resolved_input),
         "tmp_dir": str(resolved_tmp),
         "cpu_process_limit": process_limit,
+        "alphafold3_cpu_msa_fallback_enabled": msa_fallback_enabled,
         "unidock_pro_max_compounds": unidock_limit,
         "vina_compound_timeout_minutes": vina_timeout,
     }

@@ -490,7 +490,7 @@ def test_cleaning_consumes_import_and_publishes_prepared_target(tmp_path: Path) 
     assert not (cleaned.run_dir / "artifacts" / "imported").exists()
     command_record = json.loads((cleaned.run_dir / "command.json").read_text())
     assert command_record["tool_id"] == "protein_cleaning"
-    assert command_record["image"] == "ovolig-md-cu128:latest"
+    assert command_record["image"] == "mn-md:cu128"
 
 
 def test_cleaning_records_failed_job_when_container_cannot_start(tmp_path: Path) -> None:

@@ -36,9 +36,9 @@ from mn_ligand.workflows.rescoring import source_pose_rows
 
 
 POSE_VALIDATION_TASK_GROUP = "pose-validation"
-DEFAULT_POSEBUSTERS_IMAGE = "ovolig-posebusters:latest"
-POSE_VALIDATION_INVENTORY_SCHEMA_VERSION = 2
-POSE_VALIDATION_SELECTION_POLICY = "best-scientific-poses-v1"
+DEFAULT_POSEBUSTERS_IMAGE = "mn-posebusters:1a5f26a"
+POSE_VALIDATION_INVENTORY_SCHEMA_VERSION = 3
+POSE_VALIDATION_SELECTION_POLICY = "scientific-pose-inventory-v2"
 COMPATIBLE_WORKFLOWS = frozenset(
     {
         "docking_campaign",
@@ -186,7 +186,7 @@ def _source_smiles(source_job: JobRecord) -> dict[str, str]:
         or payload.get("compound_artifacts")
         or []
     )
-    if not isinstance(artifact_payloads, list):
+    if not isinstance(artifact_payloads, list) or not artifact_payloads:
         return native_inputs
     jobs = {job.run_id: job for job in iter_job_records(runs_root())}
     records: dict[str, str] = {}
@@ -233,7 +233,27 @@ def pose_validation_candidates(source_job: JobRecord) -> list[dict[str, Any]]:
         ]
         selected: list[tuple[dict[str, Any], str]] = []
         for _, group_rows in _group_pose_rows(rows).items():
-            if engine.strip().lower() == "gnina":
+            if engine.strip().lower() == "lddm":
+                selected.extend(
+                    (
+                        row,
+                        (
+                            "LDDM sampled pose"
+                            + (
+                                "; mean coordinate uncertainty "
+                                f"{float(row['source_lddm_mean_uncertainty']):.3f}"
+                                if row.get("source_lddm_mean_uncertainty")
+                                is not None
+                                else ""
+                            )
+                        ),
+                    )
+                    for row in sorted(
+                        group_rows,
+                        key=lambda item: int(item["source_pose_rank"]),
+                    )
+                )
+            elif engine.strip().lower() == "gnina":
                 cnn_rows = [
                     row
                     for row in group_rows
@@ -307,11 +327,19 @@ def pose_validation_candidates(source_job: JobRecord) -> list[dict[str, Any]]:
                     "prediction": f"pose {rank}",
                     "pose_rank": rank,
                     "source_engine": engine,
-                    "source_kind": "docked pose",
+                    "source_kind": (
+                        "LDDM sampled pose"
+                        if engine.strip().lower() == "lddm"
+                        else "docked pose"
+                    ),
                     "representative": True,
                     "selection_criterion": criterion,
                     "_source_path": source_sdf,
-                    "_sdf_index": rank - 1,
+                    "_sdf_index": int(
+                        row.get("_sdf_index")
+                        if row.get("_sdf_index") is not None
+                        else rank - 1
+                    ),
                 }
             )
         return candidates

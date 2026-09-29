@@ -207,7 +207,7 @@ def test_boltzina_queue_uses_pose_scoring_runner_and_processed_context(
     assert queued.parent_run_id == selection.run_id
     command = queued.metadata["queued_command"]
     assert command[command.index("--gpus") + 1] == "device=0"
-    assert "ovolig-boltzina-cu128:latest" in command
+    assert "mn-boltzina:cu128" in command
     assert "/boltz-context" in command
     assert "/workspace/boltz_work" in command
     assert "--poses" in command

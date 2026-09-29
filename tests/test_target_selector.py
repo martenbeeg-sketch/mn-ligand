@@ -144,11 +144,13 @@ def test_target_inventory_combines_origin_preparation_and_source_complex(
         "PDB → MODELLER residue repair → MODELLER gap modeling → "
         "PDBFixer cleaning → OpenMM minimization"
     )
-    assert list(entries[0].row)[:14] == [
+    assert list(entries[0].row)[:15] == [
+        "Target key",
+        "Target",
+        "Target run ID",
         "Job",
         "Docking / cofolding",
         "Redocking / refolding",
-        "Target",
         "Receptor",
         "Ligands",
         "Tool",
@@ -158,7 +160,6 @@ def test_target_inventory_combines_origin_preparation_and_source_complex(
         "Organism",
         "UniProt",
         "Kind",
-        "Compound",
     ]
     assert entries[0].row["Job"].endswith(
         "task_group=protein-cleaning&run_id=clean-1&label=CLN01"

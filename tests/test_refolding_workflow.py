@@ -19,6 +19,7 @@ from mn_ligand.workflows.refolding import (
     build_boltz2_command,
     build_nesso_command,
     build_alphafast_commands,
+    finalize_alphafold3_msa_job,
     limit_compounds,
     ligand_bound_protein_sequence,
     nesso_input_yaml,
@@ -84,6 +85,46 @@ def test_boltz2_input_contains_typed_protein_ligand_and_affinity() -> None:
     assert "affinity:" in payload
 
 
+def test_gpu_msa_oom_does_not_queue_cpu_fallback_when_disabled(
+    tmp_path: Path,
+) -> None:
+    _target, target_ref, _compounds, _compound_ref = _typed_refolding_inputs(tmp_path)
+    run_dir = tmp_path / "runs" / "refolding" / "gpu-msa-job"
+    run_dir.mkdir(parents=True)
+    repository = tmp_path / "msa-repository"
+    repository.mkdir()
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "run_id": "gpu-msa-job",
+                "status": "running",
+                "use_gpu": True,
+                "protein_sequences": ["ACDEFGHIK"],
+                "msa_repository_dir": str(repository),
+            }
+        )
+    )
+    (run_dir / "input.json").write_text(json.dumps({"target": target_ref.to_dict()}))
+    (run_dir / "stderr.log").write_text("CUDA out of memory")
+
+    with (
+        patch(
+            "mn_ligand.workflows.refolding.alphafold3_cpu_msa_fallback_enabled",
+            return_value=False,
+        ),
+        patch(
+            "mn_ligand.workflows.refolding.queue_alphafold3_msa_job",
+            side_effect=AssertionError("CPU fallback must not be queued"),
+        ),
+    ):
+        finalized = finalize_alphafold3_msa_job(run_dir, returncode=1)
+
+    assert finalized.status == "failed"
+    assert "fallback is disabled" in finalized.metadata["error"]
+    assert finalized.metadata.get("cpu_fallback_run_id") is None
+    assert list((tmp_path / "runs" / "refolding").iterdir()) == [run_dir]
+
+
 def test_boltz2_input_accepts_explicit_offline_msa() -> None:
     payload = boltz2_input_yaml(
         [("A", "ACD")], "CCO", protein_msa_paths=("/work/msa/protein_chain_1.csv",)
@@ -99,7 +140,7 @@ def test_boltz2_command_allocates_shared_memory_and_can_run_offline(tmp_path: Pa
     cache_dir.mkdir()
 
     command = build_boltz2_command(
-        image="ovoex-boltz2:latest", run_dir=run_dir, cache_dir=cache_dir,
+        image="mn-boltz2:cu128", run_dir=run_dir, cache_dir=cache_dir,
         use_msa_server=False,
     )
 
@@ -107,7 +148,7 @@ def test_boltz2_command_allocates_shared_memory_and_can_run_offline(tmp_path: Pa
     assert "--use_msa_server" not in command
 
     repeated = build_boltz2_command(
-        image="ovoex-boltz2:latest", run_dir=run_dir, cache_dir=cache_dir,
+        image="mn-boltz2:cu128", run_dir=run_dir, cache_dir=cache_dir,
         output_dir="/work/output/replicate_002", seed=1002,
     )
     assert repeated[repeated.index("--out_dir") + 1] == "/work/output/replicate_002"
@@ -148,7 +189,7 @@ def test_nesso_readiness_and_command_reuse_esm_cache_read_only(tmp_path: Path) -
 
     readiness = nesso_readiness(checkpoint, ccd, esm_cache)
     command = build_nesso_command(
-        image="ovolig-nesso-cu128:latest", run_dir=run_dir,
+        image="mn-nesso:1.0.0-cu128", run_dir=run_dir,
         checkpoint_dir=checkpoint, ccd_path=ccd, esm_cache_dir=esm_cache,
         gpu_device="1",
     )
@@ -238,7 +279,7 @@ def test_alphafast_commands_mount_configured_paths_and_gpu(tmp_path: Path) -> No
     db_dir = tmp_path / "db"
     weights_dir = tmp_path / "weights"
     commands = build_alphafast_commands(
-        image="alphafast:latest", run_dir=run_dir, db_dir=db_dir,
+        image="mn-alphafast:cu128", run_dir=run_dir, db_dir=db_dir,
         weights_dir=weights_dir, gpu_device="1", batch_size=4, num_recycles=7,
     )
     assert len(commands) == 2
@@ -273,7 +314,7 @@ def test_persisted_command_record_contains_no_absolute_run_or_reference_paths(tm
     db_dir = tmp_path / "references" / "alignment"
     weights_dir = tmp_path / "references" / "alphafold3"
     commands = build_alphafast_commands(
-        image="alphafast:latest", run_dir=run_dir, db_dir=db_dir, weights_dir=weights_dir
+        image="mn-alphafast:cu128", run_dir=run_dir, db_dir=db_dir, weights_dir=weights_dir
     )
     record = portable_command_record(
         commands, run_dir=run_dir, db_dir=db_dir, weights_dir=weights_dir

@@ -51,12 +51,12 @@ INTERACTION_ENGINES = {
     },
     "PLIP": {
         "tool_id": "plip",
-        "image": "ovolig-plip:latest",
+        "image": "mn-plip:latest",
         "workflow": "plip_interactions",
     },
     "PandaMap": {
         "tool_id": "pandamap",
-        "image": "ovolig-pandamap:latest",
+        "image": "mn-pandamap:0007347",
         "workflow": "pandamap_interactions",
     },
 }

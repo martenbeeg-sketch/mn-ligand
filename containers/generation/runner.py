@@ -4,12 +4,14 @@ import argparse
 import csv
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+from csv import DictReader, writer as CsvWriter
 
 from rdkit import Chem
 from rdkit.Chem import rdDepictor
@@ -25,6 +27,7 @@ ENGINE_IMPORTS = {
     "pfm": "egnn",
     "pocketflow": "pocket_flow",
     "pgmg": "model.pgmg",
+    "lddm": "lddm",
 }
 
 
@@ -139,6 +142,53 @@ def selected_atom_fragment(
 def native_command(args: argparse.Namespace) -> list[str]:
     engine = os.environ.get("ENGINE", "").strip()
     common_output = str(args.output.resolve())
+    if engine == "lddm":
+        if args.target is None or args.reference_ligand is None:
+            raise ValueError(
+                "LDDM requires both a prepared target and a reference ligand"
+            )
+        command = [
+            sys.executable,
+            "scripts/sample.py",
+            "design",
+            "--protein",
+            str(args.target),
+            "--ref_ligand",
+            str(args.reference_ligand),
+            "--checkpoint",
+            str(args.checkpoint),
+            "--output",
+            str(args.output.resolve() / "generated.sdf"),
+            "--n_samples",
+            str(args.count),
+            "--batch_size",
+            str(args.batch_size),
+            "--n_steps",
+            str(args.n_steps),
+            "--sampler",
+            str(args.sampler),
+            "--sampling_noise",
+            str(args.sampling_noise),
+            "--device",
+            "cuda:0",
+            "--seed",
+            str(args.seed),
+        ]
+        if args.molecule_size:
+            command.extend(["--molecule_size", str(args.molecule_size)])
+        if args.fragment_ligand is not None:
+            fragment_path = args.fragment_ligand
+            if (
+                args.redesign_mode == "fragment_growing"
+                and args.preserve_atom_index
+            ):
+                fragment_path, _ = selected_atom_fragment(
+                    args.fragment_ligand,
+                    args.preserve_atom_index,
+                    args.output.resolve() / "selected_fragment.sdf",
+                )
+            command.extend(["--ligand", str(fragment_path)])
+        return command
     if engine == "omtra":
         command = [
             "omtra",
@@ -853,14 +903,152 @@ def normalize_outputs(
     return report
 
 
+def run_lddm_docking_campaign(args: argparse.Namespace) -> int:
+    """Sample fixed-topology LDDM poses for each row in a docking campaign."""
+    from functools import partial
+    from torch.utils.data import DataLoader
+    from rdkit.Chem import AllChem
+
+    from lddm import utils
+    from lddm.data.data_utils import TensorDict
+    from lddm.data.dataset import ProcessedDataset
+    from lddm.inference.utils import load_model, prepare_input
+
+    if args.target is None or args.reference_ligand is None:
+        raise ValueError("LDDM docking requires a prepared protein and reference ligand")
+    if args.checkpoint is None or args.docking_compounds is None:
+        raise ValueError("LDDM docking requires a checkpoint and compounds TSV")
+    if not args.docking_compounds.is_file():
+        raise FileNotFoundError(args.docking_compounds)
+
+    args.mode = "dock"
+    args.protein = str(args.target)
+    args.ref_ligand = str(args.reference_ligand)
+    args.n_samples = int(args.count)
+    args.batch_size = max(1, int(args.batch_size))
+    args.device = "cuda:0"
+    model = load_model(args)
+    model.virtual_nodes = None
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    failed_path = args.output.parent / "failed_attempts.tsv"
+    failed_path.parent.mkdir(parents=True, exist_ok=True)
+    with failed_path.open("w", newline="") as failed_handle:
+        failures = CsvWriter(failed_handle, delimiter="\t", lineterminator="\n")
+        failures.writerow(["compound_id", "replicate", "reason"])
+        with args.docking_compounds.open(newline="", errors="replace") as handle:
+            records = list(DictReader(handle, delimiter="\t"))
+        if not records:
+            raise ValueError("No compounds were provided to LDDM docking")
+
+        for replicate in range(1, max(1, int(args.replicates)) + 1):
+            replicate_dir = args.output / f"replicate_{replicate:03d}"
+            replicate_dir.mkdir(parents=True, exist_ok=True)
+            for row_index, record in enumerate(records):
+                compound_id = str(record.get("compound_id") or "").strip()
+                smiles = str(record.get("smiles") or "").strip()
+                if not compound_id or not smiles:
+                    continue
+                safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", compound_id).strip("._")
+                safe_id = f"{row_index + 1:06d}_{safe_id or 'compound'}"
+                output_path = replicate_dir / f"{safe_id}_out.sdf"
+                ligand_path = args.output / "input_ligands" / f"{safe_id}.sdf"
+                ligand_path.parent.mkdir(parents=True, exist_ok=True)
+                sampling_seed = (
+                    int(args.seed) + row_index * 1009 + replicate * 1000003
+                ) % 2147483646 + 1
+                try:
+                    molecule = Chem.MolFromSmiles(smiles)
+                    if molecule is None:
+                        raise ValueError("RDKit could not parse the input SMILES")
+                    molecule = Chem.AddHs(molecule)
+                    embed = AllChem.ETKDGv3()
+                    embed.randomSeed = sampling_seed
+                    if AllChem.EmbedMolecule(molecule, embed) != 0:
+                        embed.useRandomCoords = True
+                        if AllChem.EmbedMolecule(molecule, embed) != 0:
+                            raise ValueError("RDKit ETKDGv3 could not embed this molecule")
+                    try:
+                        if AllChem.MMFFHasAllMoleculeParams(molecule):
+                            AllChem.MMFFOptimizeMolecule(molecule, maxIters=200)
+                        else:
+                            AllChem.UFFOptimizeMolecule(molecule, maxIters=200)
+                    except (RuntimeError, ValueError):
+                        pass
+                    conformer = molecule.GetConformer()
+                    if any(
+                        not math.isfinite(float(value))
+                        for atom_index in range(molecule.GetNumAtoms())
+                        for value in tuple(conformer.GetAtomPosition(atom_index))
+                    ):
+                        raise ValueError("RDKit generated non-finite coordinates")
+                    molecule = Chem.RemoveHs(molecule)
+                    molecule.SetProp("_Name", compound_id)
+                    ligand_path.parent.mkdir(parents=True, exist_ok=True)
+                    ligand_writer = Chem.SDWriter(str(ligand_path))
+                    ligand_writer.write(molecule)
+                    ligand_writer.close()
+
+                    utils.set_deterministic(seed=sampling_seed)
+                    args.ligand = str(ligand_path)
+                    ligand, pocket = prepare_input(args, model)
+                    dataset = [
+                        {"ligand": ligand, "pocket": pocket}
+                        for _ in range(args.n_samples)
+                    ]
+                    dataloader = DataLoader(
+                        dataset=dataset,
+                        batch_size=args.batch_size,
+                        collate_fn=partial(
+                            ProcessedDataset.collate_fn,
+                            ligand_transform=None,
+                        ),
+                        pin_memory=True,
+                    )
+                    samples = []
+                    for batch in dataloader:
+                        model_input = {
+                            "ligand": TensorDict(**batch["ligand"]).to(args.device),
+                            "pocket": TensorDict(**batch["pocket"]).to(args.device),
+                        }
+                        molecules, _, _ = model.sample(
+                            model_input,
+                            n_samples=1,
+                            num_nodes="ground_truth",
+                        )
+                        for generated in molecules:
+                            generated.SetProp("compound_id", compound_id)
+                            generated.SetProp("replicate", str(replicate))
+                            samples.append(generated)
+                    if not samples:
+                        raise ValueError("LDDM returned no readable pose")
+                    utils.write_sdf_file(
+                        str(output_path),
+                        samples,
+                        add_atomprops_as_molprops=True,
+                    )
+                except Exception as exc:
+                    failures.writerow([compound_id, replicate, str(exc)])
+                    if output_path.exists():
+                        output_path.unlink()
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description="mn-ligand standardized molecular-generation image entrypoint"
     )
     value.add_argument("--healthcheck", action="store_true")
+    value.add_argument(
+        "--operation",
+        choices=("generate", "lddm-docking-campaign"),
+        default="generate",
+    )
     value.add_argument("--target", type=Path)
     value.add_argument("--pocket-structure", type=Path)
     value.add_argument("--reference-ligand", type=Path)
+    value.add_argument("--docking-compounds", type=Path)
+    value.add_argument("--replicates", type=int, default=1)
     value.add_argument("--pharmacophore", type=Path)
     value.add_argument("--checkpoint", type=Path)
     value.add_argument("--secondary-reference", type=Path)
@@ -907,6 +1095,13 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--focus-threshold", type=float, default=0.5)
     value.add_argument("--min-protein-distance", type=float, default=3.0)
     value.add_argument("--pocket-radius", type=float, default=10.0)
+    value.add_argument("--n-steps", type=int, default=100)
+    value.add_argument(
+        "--sampler", choices=("ForwardEuler", "HeunSampler"), default="ForwardEuler"
+    )
+    value.add_argument("--sampling-noise", type=float, default=5.0)
+    value.add_argument("--molecule-size", default="")
+    value.add_argument("--fragment-ligand", type=Path)
     value.add_argument("--perturbation-size", type=float, default=0.03)
     value.add_argument("--optimization-strength", type=float, default=0.5)
     value.add_argument("--grow-size", type=int, default=10)
@@ -956,6 +1151,8 @@ def main() -> int:
     if args.healthcheck:
         return healthcheck()
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.operation == "lddm-docking-campaign":
+        return run_lddm_docking_campaign(args)
     command = native_command(args)
     (args.output / "native_command.json").write_text(
         json.dumps({"argv": command}, indent=2) + "\n"

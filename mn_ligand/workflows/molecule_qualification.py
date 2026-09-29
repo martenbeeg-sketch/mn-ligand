@@ -26,7 +26,7 @@ from mn_ligand.runtime import cpu_process_limit, runs_root
 
 MOLECULE_QUALIFICATION_TASK_GROUP = "molecule-qualification"
 QUALIFICATION_POLICY_VERSION = 2
-DEFAULT_IMAGE = "ovolig-posebusters:latest"
+DEFAULT_IMAGE = "mn-posebusters:1a5f26a"
 DEFAULT_POLICY: dict[str, int | float] = {
     "conformer_count": 20,
     "max_workers": 16,

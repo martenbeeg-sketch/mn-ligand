@@ -18,16 +18,19 @@ from mn_ligand.core.resources import (
     AdmissionRequest,
     CPULease,
     FileLease,
+    MemoryLease,
     ResourceSnapshot,
     acquire_cpu_lease,
     acquire_first_gpu_lease,
     acquire_job_claim,
+    acquire_memory_lease,
     assess_resource_admission,
     capture_resource_snapshot,
     cpu_pool_capacity,
     discover_gpu_ids,
     gpu_ids_from_command,
     select_gpu_in_command,
+    shared_state_dir,
 )
 from mn_ligand.core.portability import PortabilityError, assert_job_portable
 from mn_ligand.runtime import runs_root
@@ -366,7 +369,7 @@ def _block_dependency_job(job: QueuedJob, failed_dependencies: tuple[str, ...]) 
 
 def _claim_runnable_job(
     config: WorkerConfig,
-) -> tuple[QueuedJob, FileLease, CPULease, int | None, FileLease | None] | None:
+) -> tuple[QueuedJob, FileLease, CPULease, int | None, FileLease | None, MemoryLease] | None:
     queued_jobs = iter_queued_jobs(config.runs_dir)
     if not queued_jobs:
         return None
@@ -485,12 +488,34 @@ def _claim_runnable_job(
         )
         if claim is None:
             continue
+        memory_lease, memory_decision = acquire_memory_lease(
+            request,
+            snapshot,
+            run_id=job.run_id,
+            owner_id=config.worker_id,
+            app_id="mn-ligand",
+            state_root=shared_state_dir(),
+            scratch_path=config.runs_dir,
+            stale_after_seconds=config.stale_after_seconds,
+        )
+        if memory_lease is None:
+            _record_admission(
+                job,
+                request=request,
+                snapshot=snapshot,
+                decision=memory_decision,
+                status="rejected" if memory_decision.permanent else "waiting",
+            )
+            claim.release()
+            continue
         cpu_lease = acquire_cpu_lease(
             requested_cpu_threads,
             run_id=job.run_id,
             worker_id=config.worker_id,
             workflow=job.workflow,
+            app_id="mn-ligand",
             runs_dir=config.runs_dir,
+            state_root=shared_state_dir(),
             capacity=shared_cpu_capacity,
             stale_after_seconds=config.stale_after_seconds,
         )
@@ -508,6 +533,7 @@ def _claim_runnable_job(
                 ),
                 status="waiting",
             )
+            memory_lease.release()
             claim.release()
             continue
         if not request.gpu:
@@ -518,7 +544,7 @@ def _claim_runnable_job(
                 decision=decision,
                 status="admitted",
             )
-            return job, claim, cpu_lease, None, None
+            return job, claim, cpu_lease, None, None, memory_lease
         if (config.runs_dir / ".gpu_job.lock").exists():
             _record_admission(
                 job,
@@ -528,6 +554,7 @@ def _claim_runnable_job(
                 status="waiting",
             )
             cpu_lease.release()
+            memory_lease.release()
             claim.release()
             continue
         selected = acquire_first_gpu_lease(
@@ -535,7 +562,9 @@ def _claim_runnable_job(
             run_id=job.run_id,
             worker_id=config.worker_id,
             workflow=job.workflow,
+            app_id="mn-ligand",
             runs_dir=config.runs_dir,
+            state_root=shared_state_dir(),
             stale_after_seconds=config.stale_after_seconds,
         )
         if selected is None:
@@ -547,6 +576,7 @@ def _claim_runnable_job(
                 status="waiting",
             )
             cpu_lease.release()
+            memory_lease.release()
             claim.release()
             continue
         gpu_id, gpu_lease = selected
@@ -557,7 +587,7 @@ def _claim_runnable_job(
             decision=decision,
             status="admitted",
         )
-        return job, claim, cpu_lease, gpu_id, gpu_lease
+        return job, claim, cpu_lease, gpu_id, gpu_lease, memory_lease
     return None
 
 
@@ -673,6 +703,13 @@ def _run_finalizer(run_dir: Path, metadata: dict[str, Any], returncode: int) -> 
 
         finalize_pose_validation_job(run_dir, returncode=returncode)
         return
+    if finalizer == "lddm_pose_agreement":
+        from mn_ligand.workflows.lddm_evaluation import (
+            finalize_lddm_pose_agreement_job,
+        )
+
+        finalize_lddm_pose_agreement_job(run_dir, returncode=returncode)
+        return
     if finalizer == "pose_similarity":
         from mn_ligand.workflows.pose_similarity import finalize_pose_similarity_job
 
@@ -723,6 +760,7 @@ def execute_job(
     cpu_lease: CPULease,
     gpu_id: int | None,
     gpu_lease: FileLease | None,
+    memory_lease: MemoryLease,
     popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
@@ -743,6 +781,7 @@ def execute_job(
             if gpu_lease is not None:
                 gpu_lease.release()
             cpu_lease.release()
+            memory_lease.release()
             claim.release()
             now = _utc_now_iso()
             metadata = _read_json(metadata_path) or dict(job.metadata)
@@ -778,6 +817,7 @@ def execute_job(
         if gpu_lease is not None:
             gpu_lease.release()
         cpu_lease.release()
+        memory_lease.release()
         claim.release()
         now = _utc_now_iso()
         metadata.update(
@@ -812,6 +852,12 @@ def execute_job(
             "executed_command": commands[0],
             "executed_commands": commands,
         }
+    )
+    memory_lease.update_allocation(
+        cpu_threads=cpu_lease.threads,
+        cpu_slots=list(cpu_lease.slot_ids),
+        gpu_devices=[gpu_id] if gpu_id is not None else [],
+        run_dir=str(job.run_dir),
     )
     try:
         max_runtime_seconds = max(
@@ -866,6 +912,12 @@ def execute_job(
                         text=True,
                         start_new_session=True,
                     )
+                    process_pid = getattr(process, "pid", None)
+                    if process_pid:
+                        cpu_lease.set_owner_pid(int(process_pid))
+                        if gpu_lease is not None:
+                            gpu_lease.set_owner_pid(int(process_pid))
+                        memory_lease.set_owner_pid(int(process_pid))
                 except OSError as exc:
                     error = str(exc)
                     stderr_handle.write(error + "\n")
@@ -877,6 +929,7 @@ def execute_job(
                     cpu_lease.heartbeat()
                     if gpu_lease is not None:
                         gpu_lease.heartbeat()
+                    memory_lease.heartbeat()
                     latest = _read_json(metadata_path)
                     if str(latest.get("status") or "") == "cancelled" or bool(
                         latest.get("cancellation_requested")
@@ -961,6 +1014,7 @@ def execute_job(
         if gpu_lease is not None:
             gpu_lease.release()
         cpu_lease.release()
+        memory_lease.release()
         claim.release()
 
     metadata = _read_json(metadata_path) or metadata
@@ -1070,7 +1124,7 @@ def run_worker_once(
     claimed = _claim_runnable_job(config)
     if claimed is None:
         return None
-    job, claim, cpu_lease, gpu_id, gpu_lease = claimed
+    job, claim, cpu_lease, gpu_id, gpu_lease, memory_lease = claimed
     return execute_job(
         job,
         config=config,
@@ -1078,6 +1132,7 @@ def run_worker_once(
         cpu_lease=cpu_lease,
         gpu_id=gpu_id,
         gpu_lease=gpu_lease,
+        memory_lease=memory_lease,
         popen=popen,
         sleep=sleep,
     )

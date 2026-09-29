@@ -222,13 +222,66 @@ generation/drugrpg/
 generation/pfm/
 generation/pocketflow/
 generation/pgmg/
+generation/lddm/
 ```
+
+LDDM appears in the shared De Novo Design and Fragment Growing workflows, and
+as an independent pose-agreement evaluation for completed docking campaigns.
+The Evaluation tool samples LDDM poses for the source campaign's ligand
+identities, ranks those samples by coordinate uncertainty, and compares them
+with the source poses by symmetry-aware heavy-atom RMSD in the fixed receptor
+frame. This measures model agreement and confidence; it is not binding-energy
+scoring. Its `lddm_CDBB.ckpt` CD+BB
+checkpoint is MIT licensed. The alternate `lddm.ckpt` CD+BB+BN checkpoint is
+CC-BY-NC 4.0. The app lets you choose either checkpoint and labels the license
+before queueing. LDDM does not estimate binding affinity.
+Store the checkpoints in the shared reference root (on this workstation,
+`/mnt/db/reference_files`):
+
+```bash
+mkdir -p /mnt/db/reference_files/generation/lddm
+curl -L https://zenodo.org/records/22754501/files/lddm_CDBB.ckpt \
+  -o /mnt/db/reference_files/generation/lddm/lddm_CDBB.ckpt
+curl -L https://zenodo.org/records/22754501/files/lddm.ckpt \
+  -o /mnt/db/reference_files/generation/lddm/lddm.ckpt
+```
+
+Build the CUDA 12.8 / Blackwell-ready LDDM image with the app's Compose setup:
+
+```bash
+docker compose build lddm
+docker compose run --rm --no-deps lddm --healthcheck
+```
+
+The upstream KRAS example can be smoke-tested through the same Compose image:
+
+```bash
+mkdir -p /tmp/lddm-samples
+docker compose run --rm --no-deps \
+  -v /mnt/db/reference_files:/references:ro \
+  -v /tmp/lddm-samples:/samples \
+  --entrypoint python lddm scripts/sample.py design \
+  --protein examples/kras.pdb \
+  --ref_ligand examples/kras_ref_ligand.sdf \
+  --checkpoint /references/generation/lddm/lddm_CDBB.ckpt \
+  --output /samples/generated.sdf \
+  --n_samples 10 --batch_size 10 --device cuda:0
+```
+
+The shared app exposes LDDM de novo design, fragment growing, and pose-agreement
+evaluation.
+Programmable and synthesizable design are not enabled yet: they also need the
+upstream 3D-validity reference at `generation/lddm/validity3d/ligands.sdf`,
+Reduce/GNINA runtime tools, and (for synthesizable design) the SynSpace
+reaction and building-block files. Enamine REAL chemical-space data require a
+separate license. These assets are separate from the model checkpoints and
+are not staged in the reference directory.
 
 paOPT uses the permissioned `generation/conditar/Diff.pt` and `PocketAE.pt`
 references rather than duplicating them. Separate CUDA 12.8/
 Blackwell-compatible images and experimental queue, native-command,
 normalization, Results display, and typed compound-set handoff are present for
-all nine engines. The Engine tab exposes documented native quality, diversity,
+all ten engines. The Engine tab exposes documented native quality, diversity,
 size, and steering controls where supported. The Run tab adds per-engine
 attempts, batch, seed, runtime limits, empirical runtime estimates, and
 time-to-attempt plus expected-unique-output suggestions.
@@ -242,12 +295,21 @@ the vendored Ligand-X-derived modules under `mn_ligand/ligandx`.
 
 ## Install With Conda
 
+For a complete new-workstation installation and LAN migration procedure,
+including a portable data export, resumable `rsync`, Docker image transfer,
+destination verification, and rollback, see
+[`INSTALL_AND_MIGRATION.md`](INSTALL_AND_MIGRATION.md).
+
+Clone `mn-compute-scheduler` beside this repository first. The protein design
+and ligand apps use the same shared CPU, GPU, RAM, and scratch reservations.
+
 ```bash
 git clone <repo-url>
 cd mn-ligand
 
 conda env create -f environment.yml
 conda activate mn-ligand
+pip install -e ../mn-compute-scheduler
 pip install -e .
 ```
 
@@ -256,6 +318,7 @@ If the environment already exists:
 ```bash
 conda activate mn-ligand
 conda env update -f environment.yml --prune
+pip install -e ../mn-compute-scheduler
 pip install -e .
 ```
 
@@ -309,10 +372,11 @@ reports MODELLER readiness on the terminal-repair page.
 
 ## Build Containers
 
-If the Docker images are not already available locally:
+Dockerfile recipes live in the sibling `mn-tool-containers` repository. Build
+the shared images and this app's configured images from that repository:
 
 ```bash
-docker compose build
+../mn-tool-containers/build.sh mn-ligand
 ```
 
 Build one image:
@@ -326,17 +390,17 @@ docker compose build pesto
 
 Local image tags:
 
-- `ovolig-structure:latest`
-- `ovolig-docking:latest`
-- `ovolig-fpocket:latest`
-- `ovolig-p2rank:latest`
-- `mnprot-pesto-cu128:latest`
-- `ovolig-md-cu128:latest`
-- `ovolig-admet:latest`
-- `ovoex-boltz2:latest` for Boltz2 by default
-- `ovolig-qc:latest`
-- `ovolig-abfe-cu128:latest`
-- `ovolig-rbfe-cu128:latest`
+- `mn-structure:latest`
+- `mn-docking:latest`
+- `mn-fpocket:4bb0d84`
+- `mn-p2rank:d8c8e0d`
+- `mn-pesto:cu128`
+- `mn-md:cu128`
+- `mn-admet:latest`
+- `mn-boltz2:cu128` for Boltz2 by default
+- `mn-qc:latest`
+- `mn-abfe:cu128`
+- `mn-rbfe:cu128`
 
 These tags are installation-managed. Scientific workflow pages do not ask users
 to edit Docker image names; every submitted job still records the selected
@@ -531,7 +595,7 @@ mn-ligand app --server.address 127.0.0.1 --server.port 8501
 ## Installation Diagnostics
 
 The bundled tool registry records 16 app workflow/tool roles across the Docker
-image families already used by mn-ligand plus `openvs:local`. It records typed
+image families already used by mn-ligand plus `mn-openvs:local`. It records typed
 inputs and outputs, resource requests, reference files, license status, health
 checks, and scientific integration status. Other locally installed
 protein-design images are intentionally outside this ligand-app registry.
@@ -937,7 +1001,7 @@ metals can be retained explicitly. RDKit plus a CCD reference remains
 responsible for ligand graph chemistry, bond orders, canonical SMILES, SDF
 output, and sanitization. Open Babel is limited to narrow ligand-format
 interoperability paths such as PDBQT/MOL2 conversion. The installation-managed
-`ovolig-md-cu128:latest` image contains the complete Gemmi/PDBFixer/OpenMM/
+`mn-md:cu128` image contains the complete Gemmi/PDBFixer/OpenMM/
 OpenFF/RDKit repair runtime and runs on CPU by default or the RTX 5090 when
 selected.
 
@@ -1096,10 +1160,10 @@ root.
 ## AlphaFold 3 / AlphaFast, Boltz-2, and Nesso-1
 
 The optional ligand-refolding adapter uses the externally supplied
-`alphafast:latest` image:
+`mn-alphafast:cu128` image:
 
 ```bash
-export MN_AF3_IMAGE=alphafast:latest
+export MN_AF3_IMAGE=mn-alphafast:cu128
 ```
 
 The database directory must contain `mmseqs/`; the weights directory must
@@ -1110,7 +1174,7 @@ jobs; no remote MSA server is used. Structure Import exposes AF3 recycling,
 native model-seed range, and local-MSA batch controls. AlphaFold 3 code and
 parameters remain subject to their upstream license and model terms.
 
-Boltz-2 uses `ovoex-boltz2:latest` and expects `boltz2_conf.ckpt` plus
+Boltz-2 uses `mn-boltz2:cu128` and expects `boltz2_conf.ckpt` plus
 `boltz2_aff.ckpt` beneath `${MN_LIGAND_REFERENCE_DIR}/boltz_models` (or
 `MN_BOLTZ_CACHE_DIR`). The typed refolding adapter publishes predicted CIF,
 confidence, affinity, and metrics artifacts. One to 100 independently seeded
@@ -1119,7 +1183,7 @@ multi-run campaigns publish mean/sample-SD affinity, binder-probability, and
 confidence statistics. Structure Import disables the Boltz MSA server and
 requires a matching MSA from the shared local sequence-hashed repository.
 
-Nesso-1 uses `ovolig-nesso-cu128:latest`, built from the pinned local source in
+Nesso-1 uses `mn-nesso:1.0.0-cu128`, built from the pinned local source in
 `tools_to_implement/nesso`. It expects `nesso/v1.0.0/model.safetensors`,
 `nesso/v1.0.0/hparams.json`, and the publisher-trusted `nesso/ccd.pkl` under the
 shared reference root. The adapter reuses the existing
@@ -1228,14 +1292,14 @@ Example:
 docker run --rm \
   -v "$PWD/examples:/input:ro" \
   -v "$PWD/output:/output" \
-  ovolig-docking:latest \
+  mn-docking:latest \
   /bin/bash -lc 'cp /input/example-protein.pdb /output/protein.pdb'
 ```
 
 For the OpenMM/OpenFE images, validate CUDA at runtime on the target machine:
 
 ```bash
-docker run --rm --gpus all ovolig-md-cu128:latest \
+docker run --rm --gpus all mn-md:cu128 \
   python -m openmm.testInstallation
 ```
 

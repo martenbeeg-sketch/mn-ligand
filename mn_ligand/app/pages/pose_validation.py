@@ -517,8 +517,9 @@ def render() -> None:
                 "will be generated when validation is submitted."
             )
         st.caption(
-            "Selection is per source job. Counts contain only the focused "
-            "scientific poses: best classical/Rosetta pose per repetition, "
+            "Selection is per source job. Counts contain all LDDM samples and "
+            "the focused scientific poses from other engines: best "
+            "classical/Rosetta pose per repetition, "
             "AF3 sample 0, Boltz-2 model 0, and GNINA's CNN- and "
             "Vina-ranked poses (deduplicated when identical)."
         )

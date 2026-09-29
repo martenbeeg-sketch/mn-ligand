@@ -6,8 +6,12 @@ from mn_ligand.core.resources import GPUCapacity, ResourceSnapshot
 
 
 @pytest.fixture(autouse=True)
-def deterministic_worker_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
+def deterministic_worker_capacity(monkeypatch: pytest.MonkeyPatch, tmp_path_factory) -> None:
     """Keep worker tests independent of the workstation's live free space/load."""
+    monkeypatch.setenv(
+        "MN_COMPUTE_SCHEDULER_STATE_DIR",
+        str(tmp_path_factory.mktemp("shared-scheduler-state")),
+    )
     snapshot = ResourceSnapshot(
         cpu_threads_total=64,
         ram_available_gb=256,

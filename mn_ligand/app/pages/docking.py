@@ -21,7 +21,6 @@ from mn_ligand.app.pages.run_resources import render_run_resources
 from mn_ligand.core.jobs import display_job_code, iter_job_records
 from mn_ligand.core.provenance import is_benchmark_job, target_lineage_summary
 from mn_ligand.runtime import (
-    cpu_process_limit,
     runs_root,
     unidock_pro_max_compounds,
 )
@@ -294,9 +293,7 @@ def render(
         openvs_padding = 4.0
         openvs_conformers = 20
         openvs_minimization_steps = 2000
-        openvs_cpu_workers = min(
-            cpu_process_limit(), max(1, os.cpu_count() or 1)
-        )
+        openvs_cpu_workers = max(1, os.cpu_count() or 1)
         docking_replicates = 1
         docking_seed_start = 1001
         openvs_cluster_threshold = 2.0
@@ -568,9 +565,7 @@ def render(
                 openvs_cpu_workers = int(columns[0].number_input(
                     "Parallel CPU workers", min_value=1,
                     max_value=max(1, os.cpu_count() or 1),
-                    value=min(
-                        cpu_process_limit(), max(1, os.cpu_count() or 1)
-                    ),
+                    value=max(1, os.cpu_count() or 1),
                     step=1, key="openvs_cpu_workers",
                     help=(
                         "Runs independent ligand/seed tasks concurrently. Each Rosetta process "
@@ -693,6 +688,8 @@ def render(
             operation == "Docking"
             and engine == "RosettaLigand"
             and openvs_reference_mode == "reference_guided"
+            and target is not None
+            and bool(compounds)
             and reference is None
         ):
             can_run_docking = False

@@ -26,41 +26,42 @@ def test_bundled_registry_declares_current_migrated_tools() -> None:
 
     assert registry.schema_version == 1
     assert {tool.image for tool in registry.tools} == {
-        "ovolig-structure:latest",
-        "ovolig-docking:latest",
-        "ovolig-fpocket:latest",
-        "ovolig-p2rank:latest",
-        "mnprot-pesto-cu128:latest",
-        "avgu-docking-suite-cuda:latest",
-        "alphafast:latest",
-        "ovoex-boltz2:latest",
-        "ovolig-boltzina-cu128:latest",
-        "ovolig-nesso-cu128:latest",
-        "ovolig-posebusters:latest",
-        "ovolig-plip:latest",
-        "ovolig-pandamap:latest",
-        "ovolig-md-cu128:latest",
-        "ovolig-gromacs-cu128:latest",
-        "ovolig-admet:latest",
-        "ovolig-qc:latest",
-        "openvs:local",
-        "ovolig-omtra-cu128:latest",
-        "ovolig-pocketxmol-cu128:latest",
-        "ovolig-flowr-root-cu128:latest",
-        "ovolig-conditar-cu128:latest",
-        "ovolig-paopt-cu128:latest",
-        "ovolig-drugrpg-cu128:latest",
-        "ovolig-pfm-cu128:latest",
-        "ovolig-pocketflow-cu128:latest",
-        "ovolig-pgmg-cu128:latest",
+        "mn-structure:latest",
+        "mn-docking:latest",
+        "mn-fpocket:4bb0d84",
+        "mn-p2rank:d8c8e0d",
+        "mn-pesto:cu128",
+        "mn-docking-suite:cu128",
+        "mn-alphafast:cu128",
+        "mn-boltz2:cu128",
+        "mn-boltzina:cu128",
+        "mn-nesso:1.0.0-cu128",
+        "mn-posebusters:1a5f26a",
+        "mn-plip:latest",
+        "mn-pandamap:0007347",
+        "mn-md:cu128",
+        "mn-gromacs:2026.3-cu128",
+        "mn-admet:latest",
+        "mn-qc:latest",
+        "mn-openvs:local",
+        "mn-omtra:cu128-745127d",
+        "mn-pocketxmol:cu128-65488cf",
+        "mn-flowr-root:cu128-b2263e2",
+        "mn-conditar:cu128-4294d286",
+        "mn-paopt:cu128-4294d286",
+        "mn-drugrpg:cu128-6fa0e41",
+        "mn-pfm:cu128-33be6c1",
+        "mn-pocketflow:cu128-a31a5a0",
+        "mn-pgmg:cu128-85fb712",
+        "mn-lddm:cu128-f254fb4",
     }
     assert registry.get("fpocket").resources.gpu is False
     assert registry.get("p2rank").resources.gpu is False
     assert registry.get("p2rank").code_license == "MIT"
     assert registry.get("pesto_ligand_interface").resources.cuda_min == "12.8"
     assert registry.get("unidock_pro").produced_artifact_types == ("pose_set", "docking_scores")
-    assert registry.get("openmm_md").image == "ovolig-md-cu128:latest"
-    assert registry.get("gromacs_md").image == "ovolig-gromacs-cu128:latest"
+    assert registry.get("openmm_md").image == "mn-md:cu128"
+    assert registry.get("gromacs_md").image == "mn-gromacs:2026.3-cu128"
     assert registry.get("gromacs_md").integration_status == "validated"
     assert registry.get("plip").integration_status == "validated"
     assert registry.get("pandamap").integration_status == "validated"

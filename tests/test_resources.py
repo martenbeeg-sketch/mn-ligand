@@ -13,10 +13,20 @@ from mn_ligand.core.resources import (
     ResourceSnapshot,
     acquire_cpu_lease,
     acquire_gpu_lease,
+    cpu_pool_capacity,
     assess_resource_admission,
     gpu_ids_from_command,
     select_gpu_in_command,
 )
+
+
+def test_default_worker_capacity_uses_the_shared_scheduler_default(monkeypatch) -> None:
+    monkeypatch.delenv("MN_COMPUTE_SCHEDULER_CPU_SLOTS", raising=False)
+    monkeypatch.delenv("MN_PROTEIN_DESIGN_WORKER_CPU_SLOTS", raising=False)
+    monkeypatch.delenv("MN_LIGAND_CPU_PROCESS_LIMIT", raising=False)
+    monkeypatch.setattr("mn_compute_scheduler.resources.os.sched_getaffinity", lambda _pid: set(range(8)))
+
+    assert cpu_pool_capacity() == 7
 
 
 def test_gpu_command_parsing_and_selection() -> None:

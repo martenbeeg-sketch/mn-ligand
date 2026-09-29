@@ -23,6 +23,19 @@ from mn_ligand.workflows.docking import (
 )
 
 
+def _pdbqt_result(*remarks: str) -> str:
+    """Minimal coordinate-bearing PDBQT output for docking fixtures."""
+    return "\n".join(
+        (
+            *remarks,
+            "ATOM      1  C   UNL A   1       1.000   2.000   3.000  1.00  0.00     0.000 C",
+            "ENDROOT",
+            "TORSDOF 0",
+            "",
+        )
+    )
+
+
 def test_vina_timeout_is_provenanced_and_reused_within_campaign(
     tmp_path: Path,
 ) -> None:
@@ -298,9 +311,13 @@ def test_docking_campaign_publishes_typed_batch_results(tmp_path: Path) -> None:
         mount = command[command.index("-v") + 1]
         run_dir = Path(mount.removesuffix(":/workspace"))
         results = run_dir / "results"
-        (results / "ethanol_out.pdbqt").write_text("REMARK VINA RESULT: -7.5 0.0 0.0\n")
+        (results / "ethanol_out.pdbqt").write_text(
+            _pdbqt_result("REMARK VINA RESULT: -7.5 0.0 0.0")
+        )
         (results / "ethanol_out.sdf").write_text("ethanol\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n$$$$\n")
-        (results / "ethylamine_out.pdbqt").write_text("REMARK VINA RESULT: -6.5 0.0 0.0\n")
+        (results / "ethylamine_out.pdbqt").write_text(
+            _pdbqt_result("REMARK VINA RESULT: -6.5 0.0 0.0")
+        )
         (results / "ethylamine_out.sdf").write_text("ethylamine\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n$$$$\n")
         return subprocess.CompletedProcess(command, 0, stdout="completed", stderr="")
 
@@ -348,7 +365,9 @@ def test_docking_campaign_quarantines_one_bad_compound_and_completes(
         mount = command[command.index("-v") + 1]
         run_dir = Path(mount.removesuffix(":/workspace"))
         results = run_dir / "results"
-        (results / "good_out.pdbqt").write_text("REMARK VINA RESULT: -7.5 0.0 0.0\n")
+        (results / "good_out.pdbqt").write_text(
+            _pdbqt_result("REMARK VINA RESULT: -7.5 0.0 0.0")
+        )
         (results / "good_out.sdf").write_text(
             "good\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n$$$$\n"
         )
@@ -411,7 +430,7 @@ def test_docking_partial_outputs_complete_with_failed_compound_manifest(
             engine="vina",
         )
     (queued.run_dir / "results" / "good_out.pdbqt").write_text(
-        "REMARK VINA RESULT: -7.5 0.0 0.0\n"
+        _pdbqt_result("REMARK VINA RESULT: -7.5 0.0 0.0")
     )
     (queued.run_dir / "results" / "good_out.sdf").write_text(
         "good\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n$$$$\n"
@@ -449,7 +468,7 @@ def test_docking_campaign_tags_scrub_bypass_without_excluding_compound(
         run_dir = Path(mount.removesuffix(":/workspace"))
         results = run_dir / "results"
         (results / "exception_out.pdbqt").write_text(
-            "REMARK VINA RESULT: -7.5 0.0 0.0\n"
+            _pdbqt_result("REMARK VINA RESULT: -7.5 0.0 0.0")
         )
         (results / "exception_out.sdf").write_text(
             "exception\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n$$$$\n"
@@ -504,7 +523,7 @@ def test_docking_campaign_repeats_with_explicit_seeds_and_summary(
             results = run_dir / "results" / f"replicate_{replicate:03d}"
             results.mkdir()
             (results / "ethanol_out.pdbqt").write_text(
-                f"REMARK VINA RESULT: {score} 0.0 0.0\n"
+                _pdbqt_result(f"REMARK VINA RESULT: {score} 0.0 0.0")
             )
             (results / "ethanol_out.sdf").write_text(
                 "ethanol\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\n"
@@ -570,9 +589,11 @@ def test_gnina_minimized_affinity_is_normalized_as_docking_score(tmp_path: Path)
     results = tmp_path / "results"
     results.mkdir()
     (results / "t3_out.pdbqt").write_text(
-        "REMARK minimizedAffinity -9.67446518\n"
-        "REMARK CNNscore 0.985242605\n"
-        "REMARK CNNaffinity 8.57378483\n"
+        _pdbqt_result(
+            "REMARK minimizedAffinity -9.67446518",
+            "REMARK CNNscore 0.985242605",
+            "REMARK CNNaffinity 8.57378483",
+        )
     )
 
     from mn_ligand.workflows.docking import _score_rows
@@ -603,15 +624,18 @@ def test_gnina_can_select_cnn_or_empirical_ranked_pose(tmp_path: Path) -> None:
     output = tmp_path / "compound_out.pdbqt"
     output.write_text(
         "MODEL 1\n"
-        "REMARK minimizedAffinity -9.0\n"
-        "REMARK CNNscore 0.90\n"
-        "REMARK CNNaffinity 7.0\n"
-        "ENDMDL\n"
-        "MODEL 2\n"
-        "REMARK minimizedAffinity -11.0\n"
-        "REMARK CNNscore 0.60\n"
-        "REMARK CNNaffinity 8.0\n"
-        "ENDMDL\n"
+        + _pdbqt_result(
+            "REMARK minimizedAffinity -9.0",
+            "REMARK CNNscore 0.90",
+            "REMARK CNNaffinity 7.0",
+        )
+        + "ENDMDL\nMODEL 2\n"
+        + _pdbqt_result(
+            "REMARK minimizedAffinity -11.0",
+            "REMARK CNNscore 0.60",
+            "REMARK CNNaffinity 8.0",
+        )
+        + "ENDMDL\n"
     )
 
     from mn_ligand.workflows.docking import select_gnina_pose
@@ -658,7 +682,7 @@ def test_worker_executes_queued_vina_campaign_and_finalizes_artifacts(tmp_path: 
         mount = command[command.index("-v") + 1]
         run_dir = Path(mount.removesuffix(":/workspace"))
         (run_dir / "results" / "ethanol_out.pdbqt").write_text(
-            "REMARK VINA RESULT: -7.5 0.0 0.0\n"
+            _pdbqt_result("REMARK VINA RESULT: -7.5 0.0 0.0")
         )
         (run_dir / "results" / "ethanol_out.sdf").write_text(
             "ethanol\n  test\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n$$$$\n"

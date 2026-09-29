@@ -1309,7 +1309,7 @@ def _completed_production(runs_dir: Path) -> JobRecord:
             "schema_version": 1,
             "run_id": run_dir.name,
             "status": "completed",
-            "docker_image": "ovolig-md-cu128:latest",
+            "docker_image": "mn-md:cu128",
             "use_gpu": False,
         },
     )

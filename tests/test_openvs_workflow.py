@@ -115,7 +115,7 @@ def test_openvs_queue_is_cpu_only_and_stages_rosetta_protocol(tmp_path: Path) ->
     assert queued.metadata["resources"]["cpu_threads"] == 2
     assert queued.metadata["gpu_queued"] is False
     assert "--gpus" not in queued.metadata["queued_command"]
-    assert "openvs:local" in queued.metadata["queued_command"]
+    assert "mn-openvs:local" in queued.metadata["queued_command"]
     xml = (queued.run_dir / "input" / "dock.xml").read_text()
     assert 'runmode="VSH"' in xml
     assert 'final_optH_mode="1"' in xml

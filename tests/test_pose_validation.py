@@ -332,7 +332,11 @@ def test_pose_validation_page_defaults_to_all_missing_and_batches_sources(
     ) == 2
 
 
-def test_cofolding_uses_exact_native_input_smiles(tmp_path: Path) -> None:
+def test_cofolding_uses_exact_native_input_smiles(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mn_ligand.workflows import pose_validation as pose_validation_workflow
+
     run_dir = tmp_path / "refolding" / "boltz-native-input"
     (run_dir / "inputs").mkdir(parents=True)
     (run_dir / "inputs" / "compound_0000001.yaml").write_text(
@@ -356,6 +360,13 @@ def test_cofolding_uses_exact_native_input_smiles(tmp_path: Path) -> None:
     (run_dir / "input.json").write_text("{}")
     (run_dir / "result.json").write_text("{}")
     job = JobRecord.load(run_dir, task_group="refolding")
+    monkeypatch.setattr(
+        pose_validation_workflow,
+        "iter_job_records",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("A source scan is unnecessary without artifact links")
+        ),
+    )
 
     assert _source_smiles(job) == {
         "compound_0000001": "N[C@@H](C)C(=O)O"

@@ -78,7 +78,12 @@ from mn_ligand.workflows.target_orientation import (
 )
 
 
-CLASSICAL_ENGINES = ("Uni-Dock Pro", "AutoDock Vina", "GNINA", "RosettaLigand")
+CLASSICAL_ENGINES = (
+    "Uni-Dock Pro",
+    "AutoDock Vina",
+    "GNINA",
+    "RosettaLigand",
+)
 COFOLDING_ENGINES = ("Boltz-2", "AlphaFold 3", "Nesso-1")
 ALL_ENGINES = CLASSICAL_ENGINES + COFOLDING_ENGINES
 ENGINE_KEYS = {
@@ -1544,7 +1549,7 @@ def render(
             )
 
         with st.expander(
-            "AutoDock Vina and GNINA settings",
+            "Docking search controls",
             expanded=bool(
                 st.session_state.get(ENGINE_KEYS["AutoDock Vina"], False)
                 or st.session_state.get(ENGINE_KEYS["GNINA"], False)
@@ -1561,6 +1566,7 @@ def render(
                 vina[1].number_input(
                     "Poses per compound", min_value=1, max_value=100, value=10,
                     key="binding_poses",
+                    help="Maximum number of poses emitted by each docking engine.",
                 )
             )
             extra_args_text = vina[2].text_input(

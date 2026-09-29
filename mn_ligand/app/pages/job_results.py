@@ -255,6 +255,45 @@ def _aligned_structure_data(
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_file_text(
+    path_text: str,
+    modified_ns: int,
+    size_bytes: int,
+) -> str:
+    del modified_ns, size_bytes
+    return Path(path_text).read_text(errors="replace")
+
+
+def _read_cached_text(path: Path) -> str:
+    stat = path.stat()
+    return _cached_file_text(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_sdf_records(
+    path_text: str,
+    modified_ns: int,
+    size_bytes: int,
+) -> list[str]:
+    del modified_ns, size_bytes
+    return [
+        record.strip("\r\n")
+        for record in Path(path_text).read_text(errors="replace").split("$$$$")
+        if record.strip()
+    ]
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_csv(
+    path_text: str,
+    modified_ns: int,
+    size_bytes: int,
+) -> pd.DataFrame:
+    del modified_ns, size_bytes
+    return pd.read_csv(path_text).fillna("")
+
+
 def _sdf_record(path: Path, pose_index: int = 1) -> str:
     records = _sdf_records(path)
     selected = max(0, int(pose_index or 1) - 1)
@@ -263,17 +302,14 @@ def _sdf_record(path: Path, pose_index: int = 1) -> str:
         if selected < len(records)
         else records[0]
         if records
-        else path.read_text(errors="replace").rstrip()
+        else _read_cached_text(path).rstrip()
     )
     return record + "\n$$$$\n"
 
 
 def _sdf_records(path: Path) -> list[str]:
-    return [
-        record.strip("\r\n")
-        for record in path.read_text(errors="replace").split("$$$$")
-        if record.strip()
-    ]
+    stat = path.stat()
+    return _cached_sdf_records(str(path), stat.st_mtime_ns, stat.st_size)
 
 
 def _sdf_properties(record: str) -> dict[str, str]:
@@ -301,7 +337,7 @@ def _first_sdf_record(path: Path) -> str:
     # reference ligands.  `_sdf_records` intentionally trims delimiter newlines
     # for record navigation, but doing that to a blank-title molfile shifts its
     # three-line header and makes py3Dmol silently reject the model.
-    record, _, _ = path.read_text(errors="replace").partition("$$$$")
+    record, _, _ = _read_cached_text(path).partition("$$$$")
     return record.rstrip("\r\n") + "\n$$$$\n"
 
 
@@ -380,7 +416,12 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
     if not scores_path.is_file() or receptor_path is None:
         return False
     try:
-        scores = pd.read_csv(scores_path).fillna("")
+        scores_stat = scores_path.stat()
+        scores = _cached_csv(
+            str(scores_path),
+            scores_stat.st_mtime_ns,
+            scores_stat.st_size,
+        )
     except (OSError, ValueError):
         return False
     if not {"compound_id", "replicate", "pose_file"}.issubset(scores.columns):
@@ -388,6 +429,9 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
     is_gnina = str(
         job.metadata.get("engine") or job.metadata.get("tool") or ""
     ).strip().lower() == "gnina"
+    is_lddm = str(
+        job.metadata.get("engine") or job.metadata.get("tool") or ""
+    ).strip().lower() == "lddm"
     gnina_criterion = "cnn_score"
     if is_gnina:
         criterion_label = st.segmented_control(
@@ -431,20 +475,23 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
             scores = pd.DataFrame(updated_rows).fillna("")
         except (OSError, ValueError):
             pass
-    try:
-        from mn_ligand.workflows.docking import docking_pose_diagnostics
-
-        center_payload = dict(job.metadata.get("center") or {})
-        size_payload = dict(job.metadata.get("size") or {})
-        diagnostic_rows, diagnostic_summaries = docking_pose_diagnostics(
-            job.run_dir,
-            scores.to_dict("records"),
-            center=tuple(float(center_payload[axis]) for axis in "xyz"),
-            size=tuple(float(size_payload[axis]) for axis in "xyz"),
-        )
-        scores = pd.DataFrame(diagnostic_rows).fillna("")
-    except (KeyError, TypeError, ValueError):
+    if is_lddm:
         diagnostic_summaries = {}
+    else:
+        try:
+            from mn_ligand.workflows.docking import docking_pose_diagnostics
+
+            center_payload = dict(job.metadata.get("center") or {})
+            size_payload = dict(job.metadata.get("size") or {})
+            diagnostic_rows, diagnostic_summaries = docking_pose_diagnostics(
+                job.run_dir,
+                scores.to_dict("records"),
+                center=tuple(float(center_payload[axis]) for axis in "xyz"),
+                size=tuple(float(size_payload[axis]) for axis in "xyz"),
+            )
+            scores = pd.DataFrame(diagnostic_rows).fillna("")
+        except (KeyError, TypeError, ValueError):
+            diagnostic_summaries = {}
     rows: list[dict[str, Any]] = []
     for record in scores.to_dict("records"):
         relative = str(record.get("pose_file") or "")
@@ -454,25 +501,41 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
     if not rows:
         return False
 
-    compound_ids = sorted(
-        {str(row["compound_id"]) for row in rows},
-        key=lambda compound_id: min(
-            float(row["best_score_kcal_mol"])
-            for row in rows
-            if str(row["compound_id"]) == compound_id
-            and row.get("best_score_kcal_mol") not in ("", None)
-        ),
-    )
+    compound_ids = sorted({str(row["compound_id"]) for row in rows})
+    if not is_lddm:
+        compound_ids.sort(
+            key=lambda compound_id: min(
+                (
+                    float(row["best_score_kcal_mol"])
+                    for row in rows
+                    if str(row["compound_id"]) == compound_id
+                    and row.get("best_score_kcal_mol") not in ("", None)
+                ),
+                default=float("inf"),
+            )
+        )
     compound_id = st.selectbox(
         "Docked compound",
         compound_ids,
         index=_requested_compound_index(compound_ids),
         key=f"docking_viewer_compound_{job.run_id}",
-        help="Compounds are ordered by their best docking score; lower is more favorable.",
+        help=(
+            "LDDM generates poses without a binding-affinity score."
+            if is_lddm
+            else "Compounds are ordered by their best docking score; lower is more favorable."
+        ),
     )
     compound_rows = [
         row for row in rows if str(row["compound_id"]) == str(compound_id)
     ]
+    if is_lddm:
+        compound_rows.sort(
+            key=lambda row: (
+                float(row.get("lddm_mean_uncertainty"))
+                if row.get("lddm_mean_uncertainty") not in ("", None)
+                else float("inf")
+            )
+        )
     reference_path = (
         _input_artifact_path(job, "reference_ligand_artifact")
         or _sibling_input_artifact_path(
@@ -483,10 +546,14 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
     )
     viewer_controls = st.columns(2)
     show_all_replicates = viewer_controls[0].checkbox(
-        "Show all replicates together",
+        "Show all sampled poses together" if is_lddm else "Show all replicates together",
         value=False,
         key=f"docking_viewer_all_replicates_{job.run_id}_{compound_id}",
-        help="Overlay every independent pose for this compound in the same receptor frame.",
+        help=(
+            "Overlay all sampled poses for this compound in the same receptor frame."
+            if is_lddm
+            else "Overlay every independent pose for this compound in the same receptor frame."
+        ),
     )
     show_reference = viewer_controls[1].checkbox(
         "Show T3 reference",
@@ -505,9 +572,20 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
             "Replicate and pose",
             list(range(len(compound_rows))),
             format_func=lambda index: (
-                f"Replicate {int(compound_rows[index]['replicate'])} · "
-                f"seed {int(compound_rows[index]['seed'])} · "
-                f"{float(compound_rows[index]['best_score_kcal_mol']):.3f} kcal/mol"
+                (
+                    f"Replicate {int(compound_rows[index]['replicate'])} · "
+                    f"pose {int(compound_rows[index].get('pose_index') or 1)}"
+                    if is_lddm
+                    else (
+                        f"Replicate {int(compound_rows[index]['replicate'])} · "
+                        f"seed {int(compound_rows[index]['seed'])} · "
+                        + (
+                            f"{float(compound_rows[index]['best_score_kcal_mol']):.3f} kcal/mol"
+                            if compound_rows[index].get("best_score_kcal_mol") not in ("", None)
+                            else "pose score unavailable"
+                        )
+                    )
+                )
             ),
             key=f"docking_viewer_pose_{job.run_id}_{compound_id}",
         )
@@ -515,7 +593,33 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
         displayed_rows = [selected]
 
     score_columns = st.columns(3)
-    if show_all_replicates:
+    if is_lddm:
+        st.info(
+            "LDDM ranks sampled poses by predicted coordinate uncertainty. Lower "
+            "uncertainty means greater model confidence; it is not a binding "
+            "energy or affinity estimate. Use Pose Validation for independent "
+            "geometry and protein clash checks."
+        )
+        score_columns = st.columns(4)
+        score_columns[0].metric(
+            "Mean coordinate uncertainty",
+            (
+                f"{float(selected['lddm_mean_uncertainty']):.3f}"
+                if selected.get("lddm_mean_uncertainty") not in ("", None)
+                else "—"
+            ),
+            help=(
+                "Mean of positive per-atom sigma_x values, matching LDDM's "
+                "uncertainty summary. Lower values indicate greater model "
+                "confidence, not stronger predicted binding."
+            ),
+        )
+        score_columns[1].metric(
+            "Generated pose", int(selected.get("pose_index") or 1)
+        )
+        score_columns[2].metric("Replicate", int(selected["replicate"]))
+        score_columns[3].metric("Seed", int(selected["seed"]))
+    elif show_all_replicates:
         scores = pd.Series(
             [float(row["best_score_kcal_mol"]) for row in displayed_rows]
         )
@@ -611,7 +715,7 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
             if receptor_path.suffix.lower() in {".cif", ".mmcif"}
             else "pdb"
         )
-        viewer.addModel(receptor_path.read_text(errors="replace"), receptor_format)
+        viewer.addModel(_read_cached_text(receptor_path), receptor_format)
         viewer.setStyle(
             {"model": 0, "hetflag": False},
             {"cartoon": {"color": "#cbd5e1", "opacity": 0.9}},
@@ -626,7 +730,7 @@ def _render_docking_complex_viewer(job: JobRecord) -> bool:
             reference_data = (
                 _first_sdf_record(reference_path)
                 if reference_format == "sdf"
-                else reference_path.read_text(errors="replace")
+                else _read_cached_text(reference_path)
             )
             viewer.addModel(reference_data, reference_format)
             viewer.setStyle(
@@ -1314,6 +1418,9 @@ def _render_docking_scores(job: JobRecord) -> bool:
     is_gnina = str(
         job.metadata.get("engine") or job.metadata.get("tool") or ""
     ).strip().lower() == "gnina"
+    is_lddm = str(
+        job.metadata.get("engine") or job.metadata.get("tool") or ""
+    ).strip().lower() == "lddm"
     if is_gnina:
         try:
             import altair as alt
@@ -1406,7 +1513,7 @@ def _render_docking_scores(job: JobRecord) -> bool:
         except (OSError, ValueError) as exc:
             st.warning(f"Could not read {labels[role].lower()}: {exc}")
             continue
-        if role == "ranked_scores":
+        if role == "ranked_scores" and not is_lddm:
             try:
                 from mn_ligand.workflows.docking import docking_pose_diagnostics
 
@@ -2719,15 +2826,33 @@ def _render_generation_metrics(job: JobRecord) -> bool:
         "and PoseBusters molecule checks are performed by the derived "
         "qualification job before downstream handoff."
     )
-    qualification_jobs = sorted(
-        (
-            candidate
-            for candidate in iter_job_records(runs_root())
-            if candidate.workflow == "molecule_qualification"
-            and candidate.parent_run_id == job.run_id
-        ),
-        key=lambda candidate: str(candidate.created_at or ""),
+    qualification_run_id = str(
+        job.result.get("qualification_run_id")
+        or job.metadata.get("qualification_run_id")
+        or ""
     )
+    qualification_dir = (
+        _resolve_run_dir("molecule-qualification", qualification_run_id)
+        if qualification_run_id
+        else None
+    )
+    if qualification_dir is not None:
+        qualification_jobs = [
+            JobRecord.load(
+                qualification_dir,
+                task_group="molecule-qualification",
+            )
+        ]
+    else:
+        qualification_jobs = sorted(
+            (
+                candidate
+                for candidate in iter_job_records(runs_root())
+                if candidate.workflow == "molecule_qualification"
+                and candidate.parent_run_id == job.run_id
+            ),
+            key=lambda candidate: str(candidate.created_at or ""),
+        )
     if qualification_jobs:
         qualification = qualification_jobs[-1]
         count = int(
@@ -2767,7 +2892,7 @@ def _render_molecule_qualification_metrics(job: JobRecord) -> bool:
     try:
         report = json.loads(report_path.read_text()) if report_path.is_file() else {}
         table = (
-            pd.read_csv(table_path).fillna("")
+            pd.read_csv(table_path)
             if table_path.is_file()
             else pd.DataFrame()
         )
@@ -2804,7 +2929,7 @@ def _render_molecule_qualification_viewer(job: JobRecord) -> bool:
     table_path = job.run_dir / "qualified" / "qualification.csv"
     try:
         table = (
-            pd.read_csv(table_path).fillna("")
+            pd.read_csv(table_path)
             if table_path.is_file()
             else pd.DataFrame()
         )
@@ -2922,7 +3047,11 @@ def _render_molecule_qualification_viewer(job: JobRecord) -> bool:
             "heavy_atom_count",
             "selected_energy",
         )
-        if column in row and row.get(column) != ""
+        if (
+            column in row
+            and pd.notna(row.get(column))
+            and str(row.get(column)).strip() != ""
+        )
     ]
     if detail_columns:
         st.dataframe(
@@ -3326,13 +3455,8 @@ def _render_generation_compound_viewer(job: JobRecord) -> bool:
                 {
                     "stick": {
                         "colorscheme": "magentaCarbon",
-                        "radius": 0.30,
-                        "opacity": 1.0,
-                    },
-                    "sphere": {
-                        "colorscheme": "magentaCarbon",
-                        "scale": 0.27,
-                        "opacity": 0.58,
+                        "radius": 0.13,
+                        "opacity": 0.72,
                     },
                 },
             )
@@ -3361,7 +3485,7 @@ def _render_generation_compound_viewer(job: JobRecord) -> bool:
     if show_generated:
         legend.append("selected generated compound is cyan")
     if show_reference:
-        legend.append("reference ligand is magenta with translucent atom markers")
+        legend.append("reference ligand is shown as fine magenta sticks")
     if show_pocket:
         legend.append("pocket context is dark grey")
     if show_receptor:
@@ -8460,12 +8584,15 @@ def _render_md_plot_matrix(
         if figure is None:
             continue
         with columns[index % column_count]:
-            st.pyplot(
-                figure,
-                clear_figure=True,
-                use_container_width=True,
-                bbox_inches=None,
-            )
+            try:
+                st.pyplot(
+                    figure,
+                    clear_figure=True,
+                    use_container_width=True,
+                    bbox_inches=None,
+                )
+            finally:
+                plt.close(figure)
 
     st.markdown("##### Export current plot view")
     export_resolution_columns = st.columns(2)
@@ -8791,299 +8918,310 @@ def render() -> None:
 
     result_tab_label = "Dataset" if job.task_group == "compound-import" else "Viewer"
     overview_tab, artifacts_tab, metrics_tab, viewer_tab, lineage_tab, logs_tab = st.tabs(
-        ["Overview", "Artifacts", "Metrics", result_tab_label, "Lineage", "Logs"]
+        ["Overview", "Artifacts", "Metrics", result_tab_label, "Lineage", "Logs"],
+        key=f"job-results-tabs-{job.run_id}",
+        on_change="rerun",
     )
-    inventory = _file_inventory(run_dir)
-    rendered_mmgbsa = False
-
-    with overview_tab:
-        summary = [
-            {"field": "status", "value": job.status},
-            {"field": "task", "value": job.task_group},
-            {"field": "job type", "value": job.job_type},
-            {"field": "tool", "value": _display_tool_name(job.tool)},
-            {"field": "workflow", "value": job.workflow or "-"},
-            {"field": "workflow parent", "value": job.workflow_parent_run_id or "-"},
-            {"field": "created", "value": job.created_at or "-"},
-            {"field": "updated", "value": job.updated_at or "-"},
-            {"field": "completed", "value": job.completed_at or "-"},
-            {"field": "schema version", "value": str(job.schema_version)},
-        ]
-        st.dataframe(summary, hide_index=True, width="stretch")
-        for warning in job.warnings:
-            st.warning(warning)
-        rendered_mmgbsa = _render_mmgbsa_metrics(job)
-        workflow_children = job.result.get("children") if job.task_group == "workflows" else None
-        if isinstance(workflow_children, list):
-            progress = job.result.get("progress") if isinstance(job.result.get("progress"), dict) else {}
-            st.markdown("#### Workflow progress")
-            if progress:
-                st.progress(int(progress.get("percent") or 0) / 100)
-                st.caption(
-                    f"{int(progress.get('completed') or 0)} of {int(progress.get('total') or 0)} steps completed"
-                )
-            if workflow_children:
-                show_workflow_history = st.checkbox(
-                    "Show failed and superseded workflow history",
-                    value=False,
-                    key=f"workflow_show_failed_history_{job.run_id}",
-                    help=(
-                        "Historical attempts remain on disk and in lineage, "
-                        "but are hidden from this progress table by default."
-                    ),
-                )
-                child_rows = []
-                hidden_history_count = 0
-                for item in workflow_children:
-                    if not isinstance(item, dict):
-                        continue
-                    task_group = str(item.get("task_group") or "")
-                    run_id = str(item.get("run_id") or "")
-                    child_dir = _resolve_run_dir(task_group, run_id)
-                    child_job = (
-                        JobRecord.load(child_dir, task_group=task_group)
-                        if child_dir is not None
-                        else None
+    if overview_tab.open:
+        with overview_tab:
+            summary = [
+                {"field": "status", "value": job.status},
+                {"field": "task", "value": job.task_group},
+                {"field": "job type", "value": job.job_type},
+                {"field": "tool", "value": _display_tool_name(job.tool)},
+                {"field": "workflow", "value": job.workflow or "-"},
+                {"field": "workflow parent", "value": job.workflow_parent_run_id or "-"},
+                {"field": "created", "value": job.created_at or "-"},
+                {"field": "updated", "value": job.updated_at or "-"},
+                {"field": "completed", "value": job.completed_at or "-"},
+                {"field": "schema version", "value": str(job.schema_version)},
+            ]
+            st.dataframe(summary, hide_index=True, width="stretch")
+            for warning in job.warnings:
+                st.warning(warning)
+            workflow_children = job.result.get("children") if job.task_group == "workflows" else None
+            if isinstance(workflow_children, list):
+                progress = job.result.get("progress") if isinstance(job.result.get("progress"), dict) else {}
+                st.markdown("#### Workflow progress")
+                if progress:
+                    st.progress(int(progress.get("percent") or 0) / 100)
+                    st.caption(
+                        f"{int(progress.get('completed') or 0)} of {int(progress.get('total') or 0)} steps completed"
                     )
-                    superseded = bool(
-                        child_job is not None
-                        and child_job.metadata.get("superseded_by_run_id")
+                if workflow_children:
+                    show_workflow_history = st.checkbox(
+                        "Show failed and superseded workflow history",
+                        value=False,
+                        key=f"workflow_show_failed_history_{job.run_id}",
+                        help=(
+                            "Historical attempts remain on disk and in lineage, "
+                            "but are hidden from this progress table by default."
+                        ),
                     )
-                    optional_failure = bool(
-                        not item.get("required", True)
-                        and child_job is not None
-                        and child_job.status == "failed"
-                    )
-                    if (
-                        not show_workflow_history
-                        and (superseded or optional_failure)
-                    ):
-                        hidden_history_count += 1
-                        continue
-                    detailed_url = (
-                        _detailed_result_url(child_job)
-                        if child_job is not None
-                        else ""
-                    )
-                    if not detailed_url and child_job is not None:
-                        detailed_url = "./job-results?" + urlencode(
+                    child_rows = []
+                    hidden_history_count = 0
+                    for item in workflow_children:
+                        if not isinstance(item, dict):
+                            continue
+                        task_group = str(item.get("task_group") or "")
+                        run_id = str(item.get("run_id") or "")
+                        child_dir = _resolve_run_dir(task_group, run_id)
+                        child_job = (
+                            JobRecord.load(child_dir, task_group=task_group)
+                            if child_dir is not None
+                            else None
+                        )
+                        superseded = bool(
+                            child_job is not None
+                            and child_job.metadata.get("superseded_by_run_id")
+                        )
+                        optional_failure = bool(
+                            not item.get("required", True)
+                            and child_job is not None
+                            and child_job.status == "failed"
+                        )
+                        if (
+                            not show_workflow_history
+                            and (superseded or optional_failure)
+                        ):
+                            hidden_history_count += 1
+                            continue
+                        detailed_url = (
+                            _detailed_result_url(child_job)
+                            if child_job is not None
+                            else ""
+                        )
+                        if not detailed_url and child_job is not None:
+                            detailed_url = "./job-results?" + urlencode(
+                                {
+                                    "task_group": task_group,
+                                    "run_id": run_id,
+                                }
+                            )
+                        child_rows.append(
                             {
-                                "task_group": task_group,
-                                "run_id": run_id,
+                                "results": detailed_url,
+                                "step": item.get("step_id", ""),
+                                "status": (
+                                    "superseded"
+                                    if (
+                                        child_job is not None
+                                        and child_job.metadata.get(
+                                            "superseded_by_run_id"
+                                        )
+                                    )
+                                    else child_job.status
+                                    if child_job is not None
+                                    else item.get("status", "missing")
+                                ),
+                                "task": task_group,
+                                "required": bool(item.get("required", True)),
+                                "job": (
+                                    display_job_code(
+                                        child_job.metadata.get("job_code"),
+                                        child_job.run_id,
+                                    )
+                                    if child_job is not None
+                                    else run_id[:8]
+                                ),
+                                "depends_on": ", ".join(
+                                    item.get("depends_on") or []
+                                ),
                             }
                         )
-                    child_rows.append(
-                        {
-                            "results": detailed_url,
-                            "step": item.get("step_id", ""),
-                            "status": (
-                                "superseded"
-                                if (
-                                    child_job is not None
-                                    and child_job.metadata.get(
-                                        "superseded_by_run_id"
-                                    )
-                                )
-                                else child_job.status
-                                if child_job is not None
-                                else item.get("status", "missing")
+                    if hidden_history_count:
+                        st.caption(
+                            f"{hidden_history_count} failed/superseded historical "
+                            "attempt(s) hidden."
+                        )
+                    st.dataframe(
+                        child_rows,
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "results": st.column_config.LinkColumn(
+                                "Results", display_text="Open"
                             ),
-                            "task": task_group,
-                            "required": bool(item.get("required", True)),
-                            "job": (
-                                display_job_code(
-                                    child_job.metadata.get("job_code"),
-                                    child_job.run_id,
-                                )
-                                if child_job is not None
-                                else run_id[:8]
+                            "step": st.column_config.TextColumn(
+                                "Workflow stage", width="large"
                             ),
-                            "depends_on": ", ".join(
-                                item.get("depends_on") or []
+                            "status": st.column_config.TextColumn("Status"),
+                            "task": st.column_config.TextColumn("Task"),
+                            "required": st.column_config.CheckboxColumn(
+                                "Required"
                             ),
-                        }
+                            "job": st.column_config.TextColumn("Job"),
+                            "depends_on": st.column_config.TextColumn(
+                                "Depends on", width="large"
+                            ),
+                        },
                     )
-                if hidden_history_count:
-                    st.caption(
-                        f"{hidden_history_count} failed/superseded historical "
-                        "attempt(s) hidden."
-                    )
+            st.markdown("#### Inputs and parameters")
+            input_path = run_dir / "input.json"
+            if input_path.is_file():
+                try:
+                    st.json(json.loads(input_path.read_text()))
+                except (OSError, ValueError):
+                    st.code(input_path.read_text(errors="replace")[-50000:])
+            else:
+                run_inputs = job.metadata.get("run_inputs") or job.metadata.get("parameters")
+                st.json(run_inputs if isinstance(run_inputs, dict) else job.metadata)
+
+    if artifacts_tab.open:
+        with artifacts_tab:
+            artifacts = job.artifact_manifest.artifacts if job.artifact_manifest else ()
+            if artifacts:
                 st.dataframe(
-                    child_rows,
+                    [
+                        {
+                            "type": item.artifact_type,
+                            "role": item.role,
+                            "path": item.path,
+                            "size_mb": round((item.size_bytes or 0) / (1024 * 1024), 3),
+                            "sha256": item.sha256,
+                        }
+                        for item in artifacts
+                    ],
                     hide_index=True,
                     width="stretch",
-                    column_config={
-                        "results": st.column_config.LinkColumn(
-                            "Results", display_text="Open"
-                        ),
-                        "step": st.column_config.TextColumn(
-                            "Workflow stage", width="large"
-                        ),
-                        "status": st.column_config.TextColumn("Status"),
-                        "task": st.column_config.TextColumn("Task"),
-                        "required": st.column_config.CheckboxColumn(
-                            "Required"
-                        ),
-                        "job": st.column_config.TextColumn("Job"),
-                        "depends_on": st.column_config.TextColumn(
-                            "Depends on", width="large"
-                        ),
-                    },
                 )
-        st.markdown("#### Inputs and parameters")
-        input_path = run_dir / "input.json"
-        if input_path.is_file():
-            try:
-                st.json(json.loads(input_path.read_text()))
-            except (OSError, ValueError):
-                st.code(input_path.read_text(errors="replace")[-50000:])
-        else:
-            run_inputs = job.metadata.get("run_inputs") or job.metadata.get("parameters")
-            st.json(run_inputs if isinstance(run_inputs, dict) else job.metadata)
+            else:
+                st.info("This legacy job has no typed artifacts yet.")
+            st.markdown("#### Run files")
+            inventory = _file_inventory(run_dir)
+            st.dataframe(inventory, hide_index=True, width="stretch")
 
-    with artifacts_tab:
-        artifacts = job.artifact_manifest.artifacts if job.artifact_manifest else ()
-        if artifacts:
-            st.dataframe(
-                [
-                    {
-                        "type": item.artifact_type,
-                        "role": item.role,
-                        "path": item.path,
-                        "size_mb": round((item.size_bytes or 0) / (1024 * 1024), 3),
-                        "sha256": item.sha256,
-                    }
-                    for item in artifacts
-                ],
-                hide_index=True,
-                width="stretch",
-            )
-        else:
-            st.info("This legacy job has no typed artifacts yet.")
-        st.markdown("#### Run files")
-        st.dataframe(inventory, hide_index=True, width="stretch")
-
-    with metrics_tab:
-        rendered_md_production = _render_md_production_metrics(job)
-        rendered_redocking = _render_redocking_metrics(job)
-        rendered_openvs = _render_openvs_scores(job)
-        rendered_docking = _render_docking_scores(job)
-        rendered_refolding = _render_refolding_metrics(job)
-        rendered_rescoring = _render_rescoring_metrics(job)
-        rendered_pose_validation = _render_pose_validation_metrics(job)
-        rendered_interactions = _render_interaction_analysis_metrics(job)
-        rendered_generation = _render_generation_metrics(job)
-        rendered_molecule_qualification = _render_molecule_qualification_metrics(job)
-        rendered_md_analysis = _render_md_replicate_metrics(job)
-        metrics = _flatten_scalars(job.result)
-        if metrics:
-            if (
-                rendered_redocking
-                or rendered_openvs
-                or rendered_docking
-                or rendered_refolding
-                or rendered_rescoring
-                or rendered_pose_validation
-                or rendered_interactions
-                or rendered_generation
-                or rendered_molecule_qualification
-                or rendered_mmgbsa
-                or rendered_md_production
-                or rendered_md_analysis
+    if metrics_tab.open:
+        with metrics_tab:
+            rendered_mmgbsa = _render_mmgbsa_metrics(job)
+            rendered_md_production = _render_md_production_metrics(job)
+            rendered_redocking = _render_redocking_metrics(job)
+            rendered_openvs = _render_openvs_scores(job)
+            rendered_docking = _render_docking_scores(job)
+            rendered_refolding = _render_refolding_metrics(job)
+            rendered_rescoring = _render_rescoring_metrics(job)
+            rendered_pose_validation = _render_pose_validation_metrics(job)
+            rendered_interactions = _render_interaction_analysis_metrics(job)
+            rendered_generation = _render_generation_metrics(job)
+            rendered_molecule_qualification = _render_molecule_qualification_metrics(job)
+            rendered_md_analysis = _render_md_replicate_metrics(job)
+            metrics = _flatten_scalars(job.result)
+            if metrics:
+                if (
+                    rendered_redocking
+                    or rendered_openvs
+                    or rendered_docking
+                    or rendered_refolding
+                    or rendered_rescoring
+                    or rendered_pose_validation
+                    or rendered_interactions
+                    or rendered_generation
+                    or rendered_molecule_qualification
+                    or rendered_mmgbsa
+                    or rendered_md_production
+                    or rendered_md_analysis
+                ):
+                    st.markdown("#### Result metadata")
+                st.dataframe(pd.DataFrame(metrics), hide_index=True, width="stretch")
+            elif not any(
+                (
+                    rendered_redocking,
+                    rendered_openvs,
+                    rendered_docking,
+                    rendered_refolding,
+                    rendered_rescoring,
+                    rendered_pose_validation,
+                    rendered_interactions,
+                    rendered_generation,
+                    rendered_molecule_qualification,
+                    rendered_mmgbsa,
+                    rendered_md_analysis,
+                )
             ):
-                st.markdown("#### Result metadata")
-            st.dataframe(pd.DataFrame(metrics), hide_index=True, width="stretch")
-        elif not any(
-            (
-                rendered_redocking,
-                rendered_openvs,
-                rendered_docking,
-                rendered_refolding,
-                rendered_rescoring,
-                rendered_pose_validation,
-                rendered_interactions,
-                rendered_generation,
-                rendered_molecule_qualification,
-                rendered_mmgbsa,
-                rendered_md_analysis,
-            )
-        ):
-            st.info("No scalar result metrics were found.")
+                st.info("No scalar result metrics were found.")
 
-    with viewer_tab:
-        candidates = [run_dir / row["path"] for row in inventory if Path(row["path"]).suffix.lower() in VIEWABLE_SUFFIXES]
-        rendered_pocket_context = _render_pocket_context(job)
-        rendered_docking_context = _render_docking_complex_viewer(job)
-        rendered_refolding_context = _render_refolding_complex_viewer(job)
-        rendered_rescoring_context = _render_rescoring_viewer(job)
-        rendered_pose_validation_context = _render_pose_validation_viewer(job)
-        rendered_interaction_context = _render_interaction_analysis_viewer(job)
-        rendered_generation_context = _render_generation_compound_viewer(job)
-        rendered_qualification_context = _render_molecule_qualification_viewer(job)
-        if job.task_group == "compound-import":
-            render_compound_dataset_report(job)
-        elif rendered_pocket_context:
-            pass
-        elif rendered_docking_context:
-            pass
-        elif rendered_refolding_context:
-            pass
-        elif rendered_rescoring_context:
-            pass
-        elif rendered_pose_validation_context:
-            pass
-        elif rendered_interaction_context:
-            pass
-        elif rendered_generation_context:
-            pass
-        elif rendered_qualification_context:
-            pass
-        elif candidates:
-            if job.workflow == "redocking_benchmark":
-                st.caption(
-                    "Redocking overlay SDF files contain the crystallographic reference followed "
-                    "by the top-ranked predicted pose for that engine replicate."
+    if viewer_tab.open:
+        with viewer_tab:
+            rendered_pocket_context = _render_pocket_context(job)
+            rendered_docking_context = _render_docking_complex_viewer(job)
+            rendered_refolding_context = _render_refolding_complex_viewer(job)
+            rendered_rescoring_context = _render_rescoring_viewer(job)
+            rendered_pose_validation_context = _render_pose_validation_viewer(job)
+            rendered_interaction_context = _render_interaction_analysis_viewer(job)
+            rendered_generation_context = _render_generation_compound_viewer(job)
+            rendered_qualification_context = _render_molecule_qualification_viewer(job)
+            if job.task_group == "compound-import":
+                render_compound_dataset_report(job)
+            elif rendered_pocket_context:
+                pass
+            elif rendered_docking_context:
+                pass
+            elif rendered_refolding_context:
+                pass
+            elif rendered_rescoring_context:
+                pass
+            elif rendered_pose_validation_context:
+                pass
+            elif rendered_interaction_context:
+                pass
+            elif rendered_generation_context:
+                pass
+            elif rendered_qualification_context:
+                pass
+            else:
+                candidates = [
+                    run_dir / row["path"]
+                    for row in _file_inventory(run_dir)
+                    if Path(row["path"]).suffix.lower() in VIEWABLE_SUFFIXES
+                ]
+                if candidates:
+                    if job.workflow == "redocking_benchmark":
+                        st.caption(
+                            "Redocking overlay SDF files contain the crystallographic reference followed "
+                            "by the top-ranked predicted pose for that engine replicate."
+                        )
+                    selected = st.selectbox(
+                        "Structure file",
+                        candidates,
+                        format_func=lambda path: path.relative_to(run_dir).as_posix(),
+                        key=f"generic_viewer_{task_group}_{run_id}",
+                    )
+                    if job.workflow == "redocking_benchmark" and selected.parent.name == "overlays":
+                        _render_redocking_overlay(selected)
+                    else:
+                        _render_viewer(selected)
+                else:
+                    st.info("No supported structure file is available for preview.")
+
+    if lineage_tab.open:
+        with lineage_tab:
+            all_jobs = iter_job_records(runs_root())
+            st.dataframe(_lineage_rows(job, all_jobs), hide_index=True, width="stretch")
+
+    if logs_tab.open:
+        with logs_tab:
+            log_paths = sorted(path for path in run_dir.rglob("*.log") if path.is_file())
+            if log_paths:
+                selected_log = st.selectbox(
+                    "Log file",
+                    log_paths,
+                    format_func=lambda path: path.relative_to(run_dir).as_posix(),
+                    key=f"generic_log_{task_group}_{run_id}",
                 )
-            selected = st.selectbox(
-                "Structure file",
-                candidates,
-                format_func=lambda path: path.relative_to(run_dir).as_posix(),
-                key=f"generic_viewer_{task_group}_{run_id}",
-            )
-            if job.workflow == "redocking_benchmark" and selected.parent.name == "overlays":
-                _render_redocking_overlay(selected)
+                st.code(selected_log.read_text(errors="replace")[-100000:])
             else:
-                _render_viewer(selected)
-        else:
-            st.info("No supported structure file is available for preview.")
-
-    with lineage_tab:
-        all_jobs = iter_job_records(runs_root())
-        st.dataframe(_lineage_rows(job, all_jobs), hide_index=True, width="stretch")
-
-    with logs_tab:
-        log_paths = sorted(path for path in run_dir.rglob("*.log") if path.is_file())
-        if log_paths:
-            selected_log = st.selectbox(
-                "Log file",
-                log_paths,
-                format_func=lambda path: path.relative_to(run_dir).as_posix(),
-                key=f"generic_log_{task_group}_{run_id}",
-            )
-            st.code(selected_log.read_text(errors="replace")[-100000:])
-        else:
-            tails = {
-                key: value
-                for payload in (job.metadata, job.result)
-                for key, value in payload.items()
-                if key in {"stdout", "stderr", "stdout_tail", "stderr_tail", "error"} and value
-            }
-            if tails:
-                for key, value in tails.items():
-                    st.markdown(f"#### {key}")
-                    st.code(str(value)[-100000:])
-            else:
-                st.info("No logs were recorded for this job.")
+                tails = {
+                    key: value
+                    for payload in (job.metadata, job.result)
+                    for key, value in payload.items()
+                    if key in {"stdout", "stderr", "stdout_tail", "stderr_tail", "error"} and value
+                }
+                if tails:
+                    for key, value in tails.items():
+                        st.markdown(f"#### {key}")
+                        st.code(str(value)[-100000:])
+                else:
+                    st.info("No logs were recorded for this job.")
 
 
 if __name__ == "__main__":

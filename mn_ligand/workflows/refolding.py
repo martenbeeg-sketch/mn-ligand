@@ -26,13 +26,17 @@ from mn_ligand.core.docker_runner import (
 )
 from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, short_job_code
 from mn_ligand.core.portable_paths import portable_path, resolve_stored_path
-from mn_ligand.runtime import reference_root, runs_root
+from mn_ligand.runtime import (
+    alphafold3_cpu_msa_fallback_enabled,
+    reference_root,
+    runs_root,
+)
 
 
 REFOLDING_TASK_GROUP = "refolding"
-DEFAULT_ALPHAFOLD3_IMAGE = os.getenv("MN_AF3_IMAGE", "alphafast:latest")
-DEFAULT_BOLTZ2_IMAGE = os.getenv("MN_BOLTZ2_IMAGE", "ovoex-boltz2:latest")
-DEFAULT_NESSO_IMAGE = os.getenv("MN_NESSO_IMAGE", "ovolig-nesso-cu128:latest")
+DEFAULT_ALPHAFOLD3_IMAGE = os.getenv("MN_AF3_IMAGE", "mn-alphafast:cu128")
+DEFAULT_BOLTZ2_IMAGE = os.getenv("MN_BOLTZ2_IMAGE", "mn-boltz2:cu128")
+DEFAULT_NESSO_IMAGE = os.getenv("MN_NESSO_IMAGE", "mn-nesso:1.0.0-cu128")
 NESSO_ESM_MODEL = "models--facebook--esm2_t33_650M_UR50D"
 DEFAULT_MSA_CPU_THREADS = max(1, int(os.getenv("MN_AF3_MSA_CPU_THREADS", "32")))
 DEFAULT_MSA_CPU_RAM_GB = max(1, int(os.getenv("MN_AF3_MSA_CPU_RAM_GB", "400")))
@@ -712,44 +716,50 @@ def finalize_alphafold3_msa_job(run_dir: Path, *, returncode: int) -> JobRecord:
         and "out of memory" in error.lower()
         and not metadata.get("cpu_fallback_run_id")
     ):
-        input_payload = json.loads((run_dir / "input.json").read_text())
-        replacement = queue_alphafold3_msa_job(
-            protein_sequences=sequences,
-            target_artifact=ArtifactRef.from_dict(input_payload["target"]),
-            msa_repository_dir=repository,
-            batch_size=max(1, len(sequences)),
-            launch_campaign_id=str(metadata.get("launch_campaign_id") or ""),
-            launch_campaign_label=str(metadata.get("launch_campaign_label") or ""),
-            campaign_purpose=str(metadata.get("campaign_purpose") or ""),
-            use_gpu=False,
-        )
-        fallback_run_id = replacement.run_id
-        old_run_id = str(metadata.get("run_id") or run_dir.name)
-        for dependent_path in runs_root().glob("**/metadata.json"):
-            dependent = json.loads(dependent_path.read_text())
-            dependencies = [
-                str(value) for value in (dependent.get("depends_on_run_ids") or ())
-            ]
-            if old_run_id not in dependencies:
-                continue
-            dependent["depends_on_run_ids"] = [
-                fallback_run_id if value == old_run_id else value
-                for value in dependencies
-            ]
-            dependent.setdefault("msa_cpu_fallback_run_ids", []).append(
-                fallback_run_id
+        if alphafold3_cpu_msa_fallback_enabled():
+            input_payload = json.loads((run_dir / "input.json").read_text())
+            replacement = queue_alphafold3_msa_job(
+                protein_sequences=sequences,
+                target_artifact=ArtifactRef.from_dict(input_payload["target"]),
+                msa_repository_dir=repository,
+                batch_size=max(1, len(sequences)),
+                launch_campaign_id=str(metadata.get("launch_campaign_id") or ""),
+                launch_campaign_label=str(metadata.get("launch_campaign_label") or ""),
+                campaign_purpose=str(metadata.get("campaign_purpose") or ""),
+                use_gpu=False,
             )
-            if dependent.get("status") == "blocked":
-                dependent["status"] = "queued"
-                dependent.pop("completed_at", None)
-                dependent.pop("blocked_by_run_ids", None)
-                dependent.pop("error", None)
-            _write_json(dependent_path, dependent)
-        error = (
-            error
-            + "\nGPU MMseqs exhausted VRAM; queued automatic CPU/RAM MSA fallback "
-            + fallback_run_id
-        )
+            fallback_run_id = replacement.run_id
+            old_run_id = str(metadata.get("run_id") or run_dir.name)
+            for dependent_path in runs_root().glob("**/metadata.json"):
+                dependent = json.loads(dependent_path.read_text())
+                dependencies = [
+                    str(value) for value in (dependent.get("depends_on_run_ids") or ())
+                ]
+                if old_run_id not in dependencies:
+                    continue
+                dependent["depends_on_run_ids"] = [
+                    fallback_run_id if value == old_run_id else value
+                    for value in dependencies
+                ]
+                dependent.setdefault("msa_cpu_fallback_run_ids", []).append(
+                    fallback_run_id
+                )
+                if dependent.get("status") == "blocked":
+                    dependent["status"] = "queued"
+                    dependent.pop("completed_at", None)
+                    dependent.pop("blocked_by_run_ids", None)
+                    dependent.pop("error", None)
+                _write_json(dependent_path, dependent)
+            error = (
+                error
+                + "\nGPU MMseqs exhausted VRAM; queued automatic CPU/RAM MSA fallback "
+                + fallback_run_id
+            )
+        else:
+            error += (
+                "\nAutomatic CPU MSA fallback is disabled in machine-local settings; "
+                "no replacement MSA job was queued."
+            )
     _write_json(
         run_dir / "result.json",
         {

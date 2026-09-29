@@ -2,215 +2,223 @@ name: mn-ligand
 
 services:
   alphafast:
-    image: alphafast:latest
+    image: mn-alphafast:cu128
     build:
       context: ./containers/alphafast
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/shared/alphafast/Dockerfile
       platforms: ["linux/x86_64"]
 
   structure:
-    image: ovolig-structure:latest
+    image: mn-structure:latest
     build:
       context: ./containers/structure
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/structure/Dockerfile
       platforms: ["linux/x86_64"]
 
   docking:
-    image: ovolig-docking:latest
+    image: mn-docking:latest
     build:
       context: ./containers/docking
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/docking/Dockerfile
       platforms: ["linux/x86_64"]
 
   docking-suite:
-    image: avgu-docking-suite-cuda:latest
+    image: mn-docking-suite:cu128
     build:
       context: ./containers/docking-suite
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/docking-suite/Dockerfile
       platforms: ["linux/x86_64"]
 
   openvs:
-    image: openvs:local
+    image: mn-openvs:local
     build:
       context: ./containers/openvs
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/openvs/Dockerfile
       platforms: ["linux/x86_64"]
 
   fpocket:
-    image: ovolig-fpocket:latest
+    image: mn-fpocket:4bb0d84
     build:
       context: ./containers/fpocket
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/fpocket/Dockerfile
       platforms: ["linux/x86_64"]
 
   p2rank:
-    image: ovolig-p2rank:latest
+    image: mn-p2rank:d8c8e0d
     build:
       context: ./tools_to_implement/p2rank
-      dockerfile: ../../containers/p2rank/Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/p2rank/Dockerfile
       platforms: ["linux/x86_64"]
 
   pesto:
-    image: mnprot-pesto-cu128:latest
+    image: mn-pesto:cu128
     build:
       context: .
-      dockerfile: containers/pesto/Dockerfile
+      dockerfile: ../mn-tool-containers/shared/pesto/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
 
   md:
-    image: ovolig-md-cu128:latest
+    image: mn-md:cu128
     build:
       context: ./containers/md
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/md/Dockerfile
       platforms: ["linux/x86_64"]
 
   gromacs:
-    image: ovolig-gromacs-cu128:latest
+    image: mn-gromacs:2026.3-cu128
     build:
       context: ./containers/gromacs-md
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/gromacs-md/Dockerfile
       platforms: ["linux/x86_64"]
 
   admet:
-    image: ovolig-admet:latest
+    image: mn-admet:latest
     build:
       context: ./containers/admet
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/admet/Dockerfile
       platforms: ["linux/x86_64"]
 
   boltz2:
-    image: ovoex-boltz2:latest
+    image: mn-boltz2:cu128
     build:
       context: ./containers/boltz2
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/shared/boltz2/Dockerfile
       platforms: ["linux/x86_64"]
 
   boltzina:
-    image: ovolig-boltzina-cu128:latest
+    image: mn-boltzina:cu128
     build:
       context: ./containers/boltzina
-      dockerfile: Dockerfile.cu128
+      dockerfile: ../../../mn-tool-containers/mn-ligand/boltzina/Dockerfile.cu128
       platforms: ["linux/x86_64"]
 
   nesso:
-    image: ovolig-nesso-cu128:latest
+    image: mn-nesso:1.0.0-cu128
     build:
       context: ./tools_to_implement/nesso
-      dockerfile: ../../containers/nesso/Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/nesso/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
 
   omtra:
-    image: ovolig-omtra-cu128:latest
+    image: mn-omtra:cu128-745127d
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.omtra
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.omtra
       args: {SOURCE_COMMIT: 745127dabfa1}
     gpus: all
 
   pocketxmol:
-    image: ovolig-pocketxmol-cu128:latest
+    image: mn-pocketxmol:cu128-65488cf
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.pocketxmol
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pocketxmol
       args: {SOURCE_COMMIT: 65488cf635c8}
     gpus: all
 
   flowr-root:
-    image: ovolig-flowr-root-cu128:latest
+    image: mn-flowr-root:cu128-b2263e2
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.flowr_root
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.flowr_root
       args: {SOURCE_COMMIT: b2263e2516ad}
     gpus: all
 
   conditar:
-    image: ovolig-conditar-cu128:latest
+    image: mn-conditar:cu128-4294d286
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.conditar
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.conditar
       args: {SOURCE_COMMIT: 4294d2863751}
     gpus: all
 
   paopt:
-    image: ovolig-paopt-cu128:latest
+    image: mn-paopt:cu128-4294d286
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.paopt
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.paopt
       args: {SOURCE_COMMIT: 4294d2863751}
     gpus: all
 
   drugrpg:
-    image: ovolig-drugrpg-cu128:latest
+    image: mn-drugrpg:cu128-6fa0e41
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.drugrpg
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.drugrpg
       args: {SOURCE_COMMIT: 6fa0e417a523}
     gpus: all
 
   pfm:
-    image: ovolig-pfm-cu128:latest
+    image: mn-pfm:cu128-33be6c1
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.pfm
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pfm
       args: {SOURCE_COMMIT: 33be6c1f3dc9}
     gpus: all
 
   pocketflow:
-    image: ovolig-pocketflow-cu128:latest
+    image: mn-pocketflow:cu128-a31a5a0
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.pocketflow
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pocketflow
       args: {SOURCE_COMMIT: a31a5a03f7d1}
     gpus: all
 
-  pgmg:
-    image: ovolig-pgmg-cu128:latest
+  lddm:
+    image: mn-lddm:cu128-f254fb4
     build:
       context: .
-      dockerfile: containers/generation/Dockerfile.pgmg
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.lddm
+      args: {SOURCE_COMMIT: f254fb4f8525b3803e79eb95e9f1a163fe8b2459}
+    gpus: all
+
+  pgmg:
+    image: mn-pgmg:cu128-85fb712
+    build:
+      context: .
+      dockerfile: ../mn-tool-containers/mn-ligand/generation/Dockerfile.pgmg
       args: {SOURCE_COMMIT: 85fb7120022d}
     gpus: all
 
   posebusters:
-    image: ovolig-posebusters:latest
+    image: mn-posebusters:1a5f26a
     build:
       context: ./tools_to_implement/posebusters
-      dockerfile: ../../containers/posebusters/Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/posebusters/Dockerfile
       platforms: ["linux/x86_64"]
 
   plip:
-    image: ovolig-plip:latest
+    image: mn-plip:latest
     build:
       context: ./tools_to_implement/plip
-      dockerfile: ../../containers/plip/Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/plip/Dockerfile
       platforms: ["linux/x86_64"]
 
   pandamap:
-    image: ovolig-pandamap:latest
+    image: mn-pandamap:0007347
     build:
       context: ./tools_to_implement/PandaMap
-      dockerfile: ../../containers/pandamap/Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/pandamap/Dockerfile
       platforms: ["linux/x86_64"]
 
   qc:
-    image: ovolig-qc:latest
+    image: mn-qc:latest
     build:
       context: ./containers/qc
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/qc/Dockerfile
       platforms: ["linux/x86_64"]
 
   abfe:
-    image: ovolig-abfe-cu128:latest
+    image: mn-abfe:cu128
     build:
       context: ./containers/abfe
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/abfe/Dockerfile
       platforms: ["linux/x86_64"]
 
   rbfe:
-    image: ovolig-rbfe-cu128:latest
+    image: mn-rbfe:cu128
     build:
       context: ./containers/rbfe
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/mn-ligand/rbfe/Dockerfile
       platforms: ["linux/x86_64"]

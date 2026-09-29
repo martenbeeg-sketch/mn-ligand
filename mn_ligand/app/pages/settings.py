@@ -17,6 +17,7 @@ from mn_ligand.core.manifests import load_tool_registry
 from mn_ligand.core.worker_health import inspect_worker_health
 from mn_ligand.runtime import (
     app_home,
+    alphafold3_cpu_msa_fallback_enabled,
     cpu_process_limit,
     cpu_process_limit_setting,
     installation_is_configured,
@@ -115,7 +116,7 @@ def render() -> None:
         st.markdown("#### Compute resources")
         process_limit_value = int(
             st.number_input(
-                "Default CPU process/worker limit",
+                "Default CPU process limit",
                 min_value=0,
                 max_value=1024,
                 value=cpu_process_limit_setting(),
@@ -123,14 +124,24 @@ def render() -> None:
                 help=(
                     "Set 0 for automatic host CPU discovery. This limit is used "
                     "by parallel CPU analyses and preparation tasks, including "
-                    "AmberTools MMPBSA.py MPI. Effective values are captured in "
-                    "immutable job provenance."
+                    "AmberTools MMPBSA.py MPI. Shared worker services use the "
+                    "MN_COMPUTE_SCHEDULER_CPU_SLOTS pool setting instead. Effective "
+                    "task-level values are captured in immutable job provenance."
                 ),
             )
         )
         st.caption(
             f"Current effective limit: {cpu_process_limit()} "
             f"({'automatic' if cpu_process_limit_setting() == 0 else 'configured'})."
+        )
+        cpu_msa_fallback_value = st.checkbox(
+            "Allow CPU MSA fallback after AlphaFast GPU out-of-memory",
+            value=alphafold3_cpu_msa_fallback_enabled(),
+            help=(
+                "When disabled, a GPU MSA out-of-memory failure stays failed and "
+                "dependent jobs remain blocked; no automatic CPU MSA job is queued. "
+                "This setting is local to this installation."
+            ),
         )
         unidock_limit_value = int(
             st.number_input(
@@ -174,6 +185,7 @@ def render() -> None:
                 library_dir=libraries_value,
                 tmp_dir=tmp_value,
                 cpu_process_limit=process_limit_value,
+                cpu_msa_fallback_enabled=cpu_msa_fallback_value,
                 unidock_pro_batch_limit=unidock_limit_value,
                 vina_compound_timeout=vina_timeout_value,
             )

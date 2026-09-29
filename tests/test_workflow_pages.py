@@ -70,6 +70,10 @@ def _controllable_job(runs_dir: Path, run_id: str, status: str) -> Path:
     return run_dir
 
 
+def _open_job_results_tab(page: AppTest, run_id: str, label: str) -> None:
+    page.session_state[f"job-results-tabs-{run_id}"] = label
+
+
 def test_workflow_parent_renders_in_jobs_and_results(tmp_path: Path, monkeypatch) -> None:
     runs_dir = tmp_path / "runs"
     monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(runs_dir))
@@ -108,20 +112,26 @@ def test_md_simulation_page_renders_without_sources(tmp_path: Path, monkeypatch)
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/md_simulation.py").run(timeout=20)
 
     assert not page.exception
-    assert any("No prepared complexes" in item.value for item in page.info)
-    assert [tab.label for tab in page.tabs] == [
-        "Target / Input", "Tool / Engine", "Run", "Results"
-    ]
+    assert any("No curated MD complexes" in item.value for item in page.info)
+    sections = next(
+        control
+        for control in page.segmented_control
+        if control.label == "MD Simulation section"
+    )
+    assert sections.options == ["Target / Input", "Tool / Engine", "Run", "Results"]
+    assert sections.value == "Target / Input"
+    sections.set_value("Tool / Engine").run(timeout=20)
+    assert not page.exception
     assert next(
         control
         for control in page.segmented_control
         if control.label == "Production protocol"
-    ).value == "Standard"
+    ).value == "Stability"
     assert next(
         control
         for control in page.selectbox
         if control.label == "System-preparation protocol"
-    ).value == "Roe–Brooks 2020 inspired OpenMM"
+    ).value == "Roe–Brooks 2020"
     assert next(
         control
         for control in page.checkbox
@@ -135,6 +145,13 @@ def test_md_simulation_page_renders_without_sources(tmp_path: Path, monkeypatch)
         control.label == "Legacy preparation preset"
         for control in page.segmented_control
     )
+    sections = next(
+        control
+        for control in page.segmented_control
+        if control.label == "MD Simulation section"
+    )
+    sections.set_value("Run").run(timeout=20)
+    assert not page.exception
     assert {metric.label for metric in page.metric} >= {
         "CPU threads", "Free GPUs", "Queued jobs", "Active GPU leases"
     }
@@ -196,9 +213,30 @@ def test_md_results_groups_workflow_children_and_separates_legacy_runs(
         )
     )
 
+    from mn_ligand.app.pages.md_simulation import _md_result_rows
+
+    workflow_rows, legacy_rows, workflow_children = _md_result_rows()
+    assert len(workflow_rows) == 1
+    assert workflow_rows[0]["description"] == "Grouped MD campaign"
+    assert [child["stage"] for child in workflow_children[workflow.workflow_id]] == [
+        "Production replica 1"
+    ]
+    assert len(legacy_rows) == 1
+    assert legacy_rows[0]["description"] == "4LNW · LIG"
+
     page = AppTest.from_file(
         PROJECT_DIR / "mn_ligand/app/pages/md_simulation.py"
     ).run(timeout=20)
+    section = next(
+        control
+        for control in page.segmented_control
+        if control.label == "MD Simulation section"
+    )
+    section.set_value("Results").run(timeout=20)
+    assert any(
+        item.label == "Legacy standalone production trajectories (1)"
+        for item in page.expander
+    )
 
     assert not page.exception
     workflow_tables = [
@@ -206,28 +244,13 @@ def test_md_results_groups_workflow_children_and_separates_legacy_runs(
         for table in page.dataframe
         if "stages" in table.value.columns
     ]
-    legacy_tables = [
-        table.value
-        for table in page.dataframe
-        if {"results", "job", "description", "replicas", "status", "created"}
-        == set(table.value.columns)
-    ]
-    stage_tables = [
-        table.value
-        for table in page.dataframe
-        if {"results", "stage", "job", "status", "detail"}
-        == set(table.value.columns)
-    ]
     assert len(workflow_tables) == 1
     assert len(workflow_tables[0]) == 1
     assert workflow_tables[0].iloc[0]["description"] == "Grouped MD campaign"
-    assert len(stage_tables) == 1
-    assert len(stage_tables[0]) == 1
-    assert stage_tables[0].iloc[0]["stage"] == "Production replica 1"
-    assert "./md-results?" in stage_tables[0].iloc[0]["results"]
-    assert len(legacy_tables) == 1
-    assert len(legacy_tables[0]) == 1
-    assert legacy_tables[0].iloc[0]["description"] == "4LNW · LIG"
+    assert "Preparation" in workflow_tables[0].iloc[0]["stages"]
+    assert "Production ×1" in workflow_tables[0].iloc[0]["stages"]
+    assert "Aggregate analysis" in workflow_tables[0].iloc[0]["stages"]
+    assert "task_group=workflows" in workflow_tables[0].iloc[0]["results"]
 
 
 def test_shared_discover_and_direct_pages_use_run_stage_resources(
@@ -241,9 +264,11 @@ def test_shared_discover_and_direct_pages_use_run_stage_resources(
     )
 
     for filename, run_label in pages:
-        page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages" / filename).run(
-            timeout=20
-        )
+        page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages" / filename)
+        page.session_state[
+            f"{filename.removesuffix('.py')}_workflow_tabs"
+        ] = "Run"
+        page.run(timeout=20)
         assert not page.exception
         assert [tab.label for tab in page.tabs] == [
             "Target / Input", "Tool / Engine", "Run", "Results"
@@ -861,6 +886,7 @@ def test_job_results_shows_pocket_in_full_target_context(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "pocket-detection"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Viewer")
     page.run(timeout=20)
 
     assert not page.exception
@@ -1346,29 +1372,24 @@ def test_structure_import_exposes_af3_promotion_and_trimming_workflow(
     )
 
 
-def test_sequence_modification_combines_trimming_and_repair_pages() -> None:
+def test_sequence_modification_combines_trimming_and_repair_pages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(tmp_path / "runs"))
     page = AppTest.from_file(
         PROJECT_DIR / "mn_ligand/app/pages/sequence_modification.py"
-    ).run(timeout=20)
+    )
+    page.run(timeout=60)
 
     assert not page.exception
     assert [title.value for title in page.title] == ["Target Sequence Modification"]
-    assert [tab.label for tab in page.tabs] == [
-        "Trimming",
-        "Target",
-        "Trim",
-        "Run",
-        "Results",
-        "C-terminal Repair",
-        "Target",
-        "Repair",
-        "Run",
-        "Results",
-    ]
-    assert {heading.value for heading in page.subheader} == {
-        "Target Trimming",
-        "C-terminal Repair",
+    assert {tab.label for tab in page.tabs} >= {
+        "Trimming", "C-terminal Repair", "Target", "Trim", "Run", "Results"
     }
+    assert any(heading.value == "Target Trimming" for heading in page.subheader)
+    page.session_state["sequence_modification_tabs"] = "C-terminal Repair"
+    page.run(timeout=60)
+    assert any(heading.value == "C-terminal Repair" for heading in page.subheader)
 
 
 def test_protein_cleaning_exposes_hiqbind_safety_and_assembly_controls(
@@ -1828,6 +1849,7 @@ def test_job_results_renders_redocking_summary_and_rmsd_method(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "workflows"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Metrics")
     page.run(timeout=20)
 
     assert not page.exception
@@ -1886,6 +1908,7 @@ def test_job_results_renders_general_docking_replicate_summary(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "docking"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Metrics")
     page.run(timeout=20)
 
     assert not page.exception
@@ -1970,6 +1993,7 @@ def test_job_results_renders_docked_pose_in_receptor_with_reference(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "docking"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Viewer")
     page.run(timeout=20)
 
     assert not page.exception
@@ -2059,6 +2083,7 @@ def test_job_results_renders_nesso_repetition_summary_with_micromolar_units(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "refolding"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Metrics")
     page.run(timeout=20)
 
     assert not page.exception
@@ -2105,6 +2130,7 @@ def test_job_results_renders_alphafold3_interface_confidence_without_affinity_cl
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "refolding"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Metrics")
     page.run(timeout=20)
 
     assert not page.exception
@@ -2121,6 +2147,11 @@ def test_job_results_renders_alphafold3_interface_confidence_without_affinity_cl
 def test_campaign_comparison_filters_targets_and_combines_native_metrics(
     tmp_path: Path, monkeypatch
 ) -> None:
+    from mn_ligand.workflows.pose_validation import (
+        POSE_VALIDATION_INVENTORY_SCHEMA_VERSION,
+        POSE_VALIDATION_SELECTION_POLICY,
+    )
+
     runs_dir = tmp_path / "runs"
     monkeypatch.setenv("MN_LIGAND_RUN_DIR", str(runs_dir))
     target_structure = (
@@ -2351,8 +2382,8 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
                 "operation": "pose_validation",
                 "tool": "posebusters",
                 "parent_run_id": "vina-compare-1",
-                "selection_schema_version": 2,
-                "selection_policy": "best-scientific-poses-v1",
+                "selection_schema_version": POSE_VALIDATION_INVENTORY_SCHEMA_VERSION,
+                "selection_policy": POSE_VALIDATION_SELECTION_POLICY,
                 "created_at": "2026-07-26T00:00:00+00:00",
             }
         )
@@ -2381,7 +2412,10 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
 
     page = AppTest.from_file(
         PROJECT_DIR / "mn_ligand/app/pages/campaign_comparison.py"
-    ).run(timeout=20)
+    )
+    page.session_state["campaign-comparison-main-tabs"] = "Structural evidence"
+    page.session_state["campaign-comparison-structural-tabs"] = "Pose validity"
+    page.run(timeout=20)
 
     assert not page.exception
     tab_labels = [tab.label for tab in page.tabs]
@@ -2391,15 +2425,13 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
         "Structural evidence",
         "Target × compound explorer",
         "Data & Analysis Sets",
-        "Native metrics",
-        "Correlations",
-        "Rescoring",
-        "Consensus",
         "Pose validity",
         "Interactions",
-        "Data",
-        "Analysis Sets",
     }.issubset(tab_labels)
+    assert not any(
+        item.value in {"## Native engine metrics", "## Result data", "## Analysis Sets"}
+        for item in page.markdown
+    )
     assert any(
         item.value == "#### Compound physical-validity map"
         for item in page.markdown
@@ -2439,9 +2471,18 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
     )
     assert set(engines.value) == set(engines.options)
     assert "AutoDock Vina" in engines.value
+    page.session_state["campaign-comparison-structural-tabs"] = "Interactions"
+    page.run(timeout=20)
+    assert not page.exception
+    assert any(
+        item.value == "## Protein–ligand interactions" for item in page.markdown
+    )
     page = AppTest.from_file(
         PROJECT_DIR / "mn_ligand/app/pages/campaign_comparison.py"
-    ).run(timeout=20)
+    )
+    page.session_state["campaign-comparison-main-tabs"] = "Scores & ranking"
+    page.session_state["campaign-comparison-score-tabs"] = "Native metrics"
+    page.run(timeout=20)
     assert not page.exception
     native_scores = {
         control.label: control.value
@@ -2464,14 +2505,39 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
         native_scores["Boltz-2 score"]
         == "affinity_probability_binary"
     )
-    assert native_scores["GNINA score"] == "cnn_ranked_cnn_affinity"
+    assert native_scores["CNN-ranked pose score"] == "cnn_ranked_cnn_affinity"
+    assert (
+        native_scores["Vina-ranked pose score"]
+        == "empirical_ranked_score_kcal_mol"
+    )
     assert native_scores["AutoDock Vina score"] == "best_score_kcal_mol"
+    page.session_state["campaign-comparison-score-tabs"] = "Rescoring"
+    page.run(timeout=20)
+    assert not page.exception
+    assert any(item.value == "## Rescoring" for item in page.markdown)
+    page.session_state["campaign-comparison-score-tabs"] = "Consensus"
+    page.run(timeout=20)
+    assert not page.exception
+    assert any(item.value == "## Consensus ranking" for item in page.markdown)
+    page = AppTest.from_file(
+        PROJECT_DIR / "mn_ligand/app/pages/campaign_comparison.py"
+    )
+    page.session_state["campaign-comparison-main-tabs"] = "Target × compound explorer"
+    page.run(timeout=20)
+    assert not page.exception
     explorer_view = next(
         control
         for control in page.segmented_control
         if control.label == "Explore selected results"
     )
     explorer_view.set_value("RMSD & pose agreement").run(timeout=20)
+    assert not page.exception
+    target_presentation = next(
+        control
+        for control in page.segmented_control
+        if control.label == "Target presentation"
+    )
+    target_presentation.set_value("Single-target drill-down").run(timeout=20)
     assert not page.exception
     assert any(
         control.label == "Poses to compare"
@@ -2493,7 +2559,8 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
     assert {
         "AlphaFold 3",
         "Boltz-2",
-        "GNINA",
+        "GNINA · CNN-ranked",
+        "GNINA · Vina-ranked",
         "AutoDock Vina",
     }.issubset(set(rmsd_coverage["Engine"]))
     cofolded = rmsd_coverage.loc[
@@ -2503,21 +2570,29 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
     assert cofolded["Included in RMSD"].all()
     excluded = rmsd_coverage.loc[~rmsd_coverage["Included in RMSD"]]
     assert excluded["Exclusion reason"].astype(str).str.strip().ne("").all()
-    rmsd_mode = next(
+    rmsd_result = next(
         control
         for control in page.segmented_control
-        if control.label == "RMSD comparison"
+        if control.label == "RMSD result"
     )
-    assert rmsd_mode.options == [
-        "Recovery from input pose",
-        "Prediction agreement",
+    assert rmsd_result.options == [
+        "Engine agreement matrix",
+        "Individual-pose matrix",
+        "Recovery to input",
     ]
-    assert rmsd_mode.value == "Recovery from input pose"
+    assert rmsd_result.value == "Engine agreement matrix"
+    rmsd_result.set_value("Recovery to input").run(timeout=20)
+    assert not page.exception
     assert any(
         "Input-pose RMSD (Å)" in frame.value.columns
         for frame in page.dataframe
     )
-    rmsd_mode.set_value("Prediction agreement").run(timeout=20)
+    rmsd_result = next(
+        control
+        for control in page.segmented_control
+        if control.label == "RMSD result"
+    )
+    rmsd_result.set_value("Individual-pose matrix").run(timeout=20)
     assert not page.exception
     assert any(
         "matrix lists all" in caption.value for caption in page.caption
@@ -2552,7 +2627,8 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
     expected_engine_order = [
         "AlphaFold 3",
         "Boltz-2",
-        "GNINA",
+        "GNINA · CNN-ranked",
+        "GNINA · Vina-ranked",
         "Uni-Dock Pro",
         "AutoDock Vina",
         "RosettaLigand",
@@ -2613,10 +2689,20 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
             for engine in expected_engine_order
             if engine in compound_engines
         ]
-    assert len(page.get("vega_lite_chart")) >= 2
-    assert any(
-        "not pooled" in caption.value for caption in page.caption
+    explorer_view = next(
+        control
+        for control in page.segmented_control
+        if control.label == "Explore selected results"
     )
+    explorer_view.set_value("Target × compound matrix").run(timeout=20)
+    assert not page.exception
+    page = AppTest.from_file(
+        PROJECT_DIR / "mn_ligand/app/pages/campaign_comparison.py"
+    )
+    page.session_state["campaign-comparison-main-tabs"] = "Scores & ranking"
+    page.session_state["campaign-comparison-score-tabs"] = "Correlations"
+    page.run(timeout=20)
+    assert not page.exception
     correlation_view = next(
         control
         for control in page.segmented_control
@@ -2628,6 +2714,14 @@ def test_campaign_comparison_filters_targets_and_combines_native_metrics(
         control.label == "Scatterplot-matrix metrics"
         for control in page.multiselect
     )
+    page = AppTest.from_file(
+        PROJECT_DIR / "mn_ligand/app/pages/campaign_comparison.py"
+    )
+    page.session_state["campaign-comparison-main-tabs"] = "Data & Analysis Sets"
+    page.session_state["campaign-comparison-workspace-tabs"] = "Analysis Sets"
+    page.run(timeout=20)
+    assert not page.exception
+    assert any(item.value == "## Analysis Sets" for item in page.markdown)
     collection_name = next(
         control
         for control in page.text_input
@@ -2733,6 +2827,7 @@ def test_job_results_renders_openvs_reu_scores_and_md_handoff(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "docking"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Metrics")
     page.run(timeout=20)
 
     assert not page.exception
@@ -2944,6 +3039,7 @@ def test_generation_results_navigate_normalized_and_native_sdf_records(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "molecule-generation"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Viewer")
     page.run(timeout=20)
 
     assert not page.exception
@@ -3069,6 +3165,7 @@ def test_molecule_qualification_results_show_gates_and_qualified_3d(
     page = AppTest.from_file(PROJECT_DIR / "mn_ligand/app/pages/job_results.py")
     page.query_params["task_group"] = "molecule-qualification"
     page.query_params["run_id"] = run_dir.name
+    _open_job_results_tab(page, run_dir.name, "Metrics")
     page.run(timeout=20)
 
     assert not page.exception
@@ -3079,6 +3176,10 @@ def test_molecule_qualification_results_show_gates_and_qualified_3d(
     assert metrics["PB strict pass"] == "1"
     assert metrics["Review warnings"] == "0"
     assert metrics["Accepted for docking"] == "1"
+    page.session_state[f"job-results-tabs-{run_dir.name}"] = "Viewer"
+    page.run(timeout=20)
+    assert not page.exception
+    metrics = {item.label: item.value for item in page.metric}
     compound = next(
         item for item in page.selectbox if item.label == "3D candidate"
     )

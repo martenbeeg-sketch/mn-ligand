@@ -105,6 +105,7 @@ def test_persisted_runtime_paths_are_loaded_and_created(tmp_path: Path) -> None:
             library_dir=tmp_path / "saved-libraries",
             input_dir=tmp_path / "saved-inputs",
             cpu_process_limit=12,
+            cpu_msa_fallback_enabled=False,
             unidock_pro_batch_limit=15_000,
             apply_to_process=False,
         )
@@ -114,6 +115,7 @@ def test_persisted_runtime_paths_are_loaded_and_created(tmp_path: Path) -> None:
         assert runtime.load_runtime_settings()["schema_version"] == 1
         assert runtime.cpu_process_limit_setting() == 12
         assert runtime.cpu_process_limit() == 12
+        assert runtime.alphafold3_cpu_msa_fallback_enabled() is False
         assert runtime.unidock_pro_max_compounds() == 15_000
         assert runtime.temporary_root() == (tmp_path / "home" / "tmp").resolve()
 
@@ -156,6 +158,15 @@ def test_cpu_process_limit_supports_automatic_and_environment_override(
     with patch.dict(os.environ, env, clear=True):
         assert runtime.cpu_process_limit_setting() == 6
         assert runtime.cpu_process_limit() == 6
+
+
+def test_msa_cpu_fallback_setting_defaults_to_enabled_for_existing_installs(
+    tmp_path: Path,
+) -> None:
+    env = _without_runtime_environment()
+    env["MN_LIGAND_CONFIG"] = str(tmp_path / "missing-runtime.json")
+    with patch.dict(os.environ, env, clear=True):
+        assert runtime.alphafold3_cpu_msa_fallback_enabled() is True
 
 
 def test_unidock_batch_limit_defaults_and_supports_environment_override(

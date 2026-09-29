@@ -37,7 +37,7 @@ from mn_ligand.workflows.bound_ligand_md import (
 )
 
 
-DEFAULT_PROTEIN_CLEANING_IMAGE = "ovolig-md-cu128:latest"
+DEFAULT_PROTEIN_CLEANING_IMAGE = "mn-md:cu128"
 CANONICAL_AMINO_ACIDS = {
     "ALA": "A",
     "ARG": "R",
@@ -1538,7 +1538,7 @@ def _cleaning_command(
     native_result: Path,
     use_gpu: bool,
 ) -> list[str]:
-    structure_image = image.startswith("ovolig-structure:")
+    structure_image = image.startswith("mn-structure:")
     shm_size = os.getenv("MN_MD_DOCKER_SHM_SIZE", "64g").strip()
     python_command = ["micromamba", "run", "-n", "base", "python"] if structure_image else ["python"]
     tool_id = "openmm_md" if use_gpu else "protein_cleaning"

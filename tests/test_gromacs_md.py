@@ -565,7 +565,7 @@ def test_gromacs_workflow_uses_native_tool_and_restart_artifacts(
         },
         replicas=1,
         analysis_enabled=True,
-        image="ovolig-gromacs-cu128:latest",
+        image="mn-gromacs:2026.3-cu128",
         use_gpu=False,
         engine=GROMACS_ENGINE,
     )
@@ -700,7 +700,7 @@ def test_gromacs_endpoint_job_uses_g_mmpbsa_and_native_artifacts(
             "run_id": run_dir.name,
             "status": "completed",
             "md_engine": GROMACS_ENGINE,
-            "docker_image": "ovolig-gromacs-cu128:latest",
+            "docker_image": "mn-gromacs:2026.3-cu128",
             "use_gpu": False,
         },
     )

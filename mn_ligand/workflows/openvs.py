@@ -28,7 +28,7 @@ from mn_ligand.runtime import cpu_process_limit, runs_root
 from mn_ligand.workflows.docking import _RDKIT_3D_SCRIPT, load_compound_records
 
 
-DEFAULT_OPENVS_IMAGE = "openvs:local"
+DEFAULT_OPENVS_IMAGE = "mn-openvs:local"
 OPENVS_PROTOCOLS = ("vsh", "vsx", "convergence")
 REFERENCE_MODES = ("reference_guided", "pocket_center")
 REFERENCE_SUFFIXES = {".sdf", ".mol", ".mol2", ".pdb"}

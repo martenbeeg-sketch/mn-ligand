@@ -1461,7 +1461,7 @@ def _run_docking_from_prepared_structure(
     scrub_skip_tautomer: bool,
     extra_udp_args: str = "",
     extra_vina_args: str = "",
-    docker_image: str = "avgu-docking-suite-cuda:latest",
+    docker_image: str = "mn-docking-suite:cu128",
 ) -> dict:
     run_id = str(uuid4())
     # Docking run itself is a structure job folder so downstream MD/FEP can consume it directly.

@@ -26,9 +26,9 @@ from mn_ligand.core.jobs import JOB_SCHEMA_VERSION, JobRecord, iter_job_records,
 from mn_ligand.core.pockets import PocketRecord, PocketSet, ResidueRef
 from mn_ligand.runtime import PROJECT_DIR, reference_root, resolve_run_dir, runs_root
 from mn_ligand.workflows.bound_ligand_md import extract_ligand_pdb, parse_bound_ligands
-DEFAULT_FPOCKET_IMAGE = "ovolig-fpocket:latest"
-DEFAULT_PESTO_IMAGE = "mnprot-pesto-cu128:latest"
-DEFAULT_P2RANK_IMAGE = "ovolig-p2rank:latest"
+DEFAULT_FPOCKET_IMAGE = "mn-fpocket:4bb0d84"
+DEFAULT_PESTO_IMAGE = "mn-pesto:cu128"
+DEFAULT_P2RANK_IMAGE = "mn-p2rank:d8c8e0d"
 POCKET_TASK_GROUP = "pocket-detection"
 BOUND_LIGAND_METHOD = "bound_ligand"
 

@@ -621,6 +621,7 @@ def test_compound_import_job_page_renders_dataset_report(
         )
         page.query_params["task_group"] = "compound-import"
         page.query_params["run_id"] = job.run_id
+        page.session_state[f"job-results-tabs-{job.run_id}"] = "Dataset"
         page.run(timeout=20)
 
     assert not page.exception
